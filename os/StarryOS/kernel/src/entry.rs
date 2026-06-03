@@ -77,8 +77,9 @@ pub fn init(args: &[String], envs: &[String]) {
         Arc::default(),
         None,
         false,
-        crate::cgroup::root_id(),
-    );
+        crate::task::ProcessCgroupInit::Root,
+    )
+    .expect("Failed to create init process data");
 
     {
         let mut scope = proc.scope.write();
