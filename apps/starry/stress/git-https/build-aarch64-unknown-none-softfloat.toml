@@ -8,6 +8,7 @@ features = [
   "ax-driver/virtio-socket",
   "starry-kernel/input",
   "starry-kernel/vsock",
+  "ax-feat/sched-cfs",
 ]
 log = "Warn"
 target = "aarch64-unknown-none-softfloat"
