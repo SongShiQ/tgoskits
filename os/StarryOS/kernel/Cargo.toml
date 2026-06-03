@@ -48,7 +48,7 @@ ax-feat = { workspace = true, features = [
     "multitask",
     "task-ext",
     "tracepoint-hooks",
-    "sched-rr",
+    "sched-cfs",
 
     "rtc",
 
