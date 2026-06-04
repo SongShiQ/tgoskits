@@ -192,6 +192,9 @@ pub fn register_process(id: CgroupId) -> AxResult<()> {
         .live_processes
         .checked_add(1)
         .ok_or_else(|| AxError::from(LinuxError::EINVAL))?;
+    node.pids
+        .current
+        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 
@@ -206,10 +209,22 @@ pub fn register_fork_child(parent: &crate::task::ProcessData) -> AxResult<Cgroup
         .nodes
         .get_mut(&id)
         .ok_or_else(|| AxError::from(LinuxError::ESRCH))?;
+    // Check pids limit before allowing fork
+    let max = node.pids.max.load(core::sync::atomic::Ordering::Relaxed);
+    let current = node
+        .pids
+        .current
+        .load(core::sync::atomic::Ordering::Relaxed);
+    if max >= 0 && current >= max {
+        return Err(AxError::from(LinuxError::EAGAIN));
+    }
     node.live_processes = node
         .live_processes
         .checked_add(1)
         .ok_or_else(|| AxError::from(LinuxError::EINVAL))?;
+    node.pids
+        .current
+        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     Ok(id)
 }
 
@@ -220,6 +235,9 @@ fn unregister_process_locked(tree: &mut CgroupTree, id: CgroupId) {
         } else {
             debug_assert!(false, "cgroup live_processes underflow during unregister");
         }
+        node.pids
+            .current
+            .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -268,14 +286,24 @@ pub fn attach_process(target: CgroupId, pid: Pid) -> AxResult<()> {
         .live_processes
         .checked_sub(1)
         .ok_or_else(|| AxError::from(LinuxError::EINVAL))?;
-    tree.nodes
+    let old_node = tree
+        .nodes
         .get_mut(&old)
-        .expect("old cgroup was checked above")
-        .live_processes = old_live_processes;
-    tree.nodes
+        .expect("old cgroup was checked above");
+    old_node.live_processes = old_live_processes;
+    old_node
+        .pids
+        .current
+        .fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+    let target_node = tree
+        .nodes
         .get_mut(&target)
-        .expect("target was checked above")
-        .live_processes = target_live_processes;
+        .expect("target was checked above");
+    target_node.live_processes = target_live_processes;
+    target_node
+        .pids
+        .current
+        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     proc_data.set_cgroup_id(target);
     Ok(())
 }
@@ -345,7 +373,7 @@ pub fn proc_cgroup_text(proc_data: &crate::task::ProcessData) -> AxResult<String
 
 pub fn controllers_text(id: CgroupId) -> AxResult<&'static str> {
     ensure_node_exists(id)?;
-    Ok("")
+    Ok("pids cpu")
 }
 
 pub fn subtree_control_text(id: CgroupId) -> AxResult<&'static str> {

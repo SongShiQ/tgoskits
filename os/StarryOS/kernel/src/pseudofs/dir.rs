@@ -31,6 +31,16 @@ pub trait SimpleDirOps: Send + Sync + 'static {
         true
     }
 
+    /// Create a child directory. Default returns OperationNotPermitted.
+    fn create_dir(&self, _name: &str) -> VfsResult<()> {
+        Err(VfsError::OperationNotPermitted)
+    }
+
+    /// Remove a child directory. Default returns OperationNotPermitted.
+    fn remove_dir(&self, _name: &str) -> VfsResult<()> {
+        Err(VfsError::OperationNotPermitted)
+    }
+
     /// Combines two directories into one.
     fn chain<N: SimpleDirOps>(self, other: N) -> ChainedDirOps<Self, N>
     where
@@ -222,19 +232,33 @@ impl<O: SimpleDirOps> DirNodeOps for SimpleDir<O> {
 
     fn create(
         &self,
-        _name: &str,
-        _node_type: NodeType,
+        name: &str,
+        node_type: NodeType,
         _permission: NodePermission,
     ) -> VfsResult<DirEntry> {
-        Err(VfsError::OperationNotPermitted)
+        match node_type {
+            NodeType::Directory => {
+                self.ops.create_dir(name)?;
+                let reference = Reference::new(self.this.upgrade(), name.to_owned());
+                let ops = self.ops.lookup_child(name)?;
+                match ops {
+                    NodeOpsMux::Dir(maker) => Ok(DirEntry::new_dir(
+                        |this| DirNode::new(maker(this)),
+                        reference,
+                    )),
+                    _ => Err(VfsError::NotADirectory),
+                }
+            }
+            _ => Err(VfsError::OperationNotPermitted),
+        }
     }
 
     fn link(&self, _name: &str, _node: &DirEntry) -> VfsResult<DirEntry> {
         Err(VfsError::OperationNotPermitted)
     }
 
-    fn unlink(&self, _name: &str) -> VfsResult<()> {
-        Err(VfsError::OperationNotPermitted)
+    fn unlink(&self, name: &str) -> VfsResult<()> {
+        self.ops.remove_dir(name)
     }
 
     fn rename(&self, _src_name: &str, _dst_dir: &DirNode, _dst_name: &str) -> VfsResult<()> {

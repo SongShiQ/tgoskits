@@ -224,4 +224,14 @@ impl SimpleDirOps for CgroupDirOps {
     fn is_cacheable(&self) -> bool {
         false
     }
+
+    fn create_dir(&self, name: &str) -> VfsResult<()> {
+        crate::cgroup::create_child(self.cgroup_id, name)?;
+        Ok(())
+    }
+
+    fn remove_dir(&self, name: &str) -> VfsResult<()> {
+        crate::cgroup::remove_child(self.cgroup_id, name)?;
+        Ok(())
+    }
 }

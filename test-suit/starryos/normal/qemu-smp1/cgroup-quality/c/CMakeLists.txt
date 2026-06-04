@@ -1,0 +1,10 @@
+cmake_minimum_required(VERSION 3.20)
+project(cgroup-quality C)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
+
+add_executable(cgroup-quality src/main.c)
+target_include_directories(cgroup-quality PRIVATE src)
+target_compile_options(cgroup-quality PRIVATE -Wall -Wextra -Werror)
+install(TARGETS cgroup-quality RUNTIME DESTINATION usr/bin)
