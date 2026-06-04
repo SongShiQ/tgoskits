@@ -1,6 +1,7 @@
 //! Basic virtual filesystem support
 
 pub(crate) mod cgroup;
+pub(crate) mod cgroupfs;
 pub mod debug;
 pub mod dev;
 mod device;

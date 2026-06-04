@@ -3,6 +3,7 @@
 //! Provides file interfaces for cpu.weight and cpu.max, and enforces
 //! CFS bandwidth control via per-period quota tracking.
 
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use crate::task::AsThread;
@@ -36,7 +37,7 @@ pub struct CpuState {
     pub cfs_quota: AtomicI64,
     pub cfs_period: AtomicI64,
     pub weight: AtomicI64,
-    pub bandwidth: BandwidthState,
+    pub bandwidth: Arc<BandwidthState>,
 }
 
 impl CpuState {
@@ -45,7 +46,7 @@ impl CpuState {
             cfs_quota: AtomicI64::new(-1),
             cfs_period: AtomicI64::new(100_000),
             weight: AtomicI64::new(100),
-            bandwidth: BandwidthState::new(),
+            bandwidth: Arc::new(BandwidthState::new()),
         }
     }
 }
@@ -57,8 +58,10 @@ pub fn bandwidth_tick() {
         return;
     };
     let proc_data = thread.proc_data.clone();
-    let cgroup = proc_data.cgroup.read().clone();
-    let bw = &cgroup.cpu.bandwidth;
+    let cgroup_id = proc_data.cgroup_id();
+    let Some(bw) = super::get_bandwidth_state(cgroup_id) else {
+        return;
+    };
 
     let quota = bw.quota.load(Ordering::Relaxed);
     if quota < 0 {

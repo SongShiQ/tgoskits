@@ -11,17 +11,29 @@ use ax_kspin::SpinNoIrq;
 use spin::LazyLock;
 use starry_process::Pid;
 
-pub mod core;
+pub mod cgroup_core;
 pub mod cpu;
 pub mod pids;
 
-use super::{cpu::CpuState, pids::PidsState};
+use self::{cpu::CpuState, pids::PidsState};
 
 /// Initialize cgroup subsystem. Called once during boot.
 pub fn init() {
     // Register bandwidth tick hook with ax-task scheduler
     ax_task::set_tick_hook(cpu::bandwidth_tick);
     info!("cgroup: initialized");
+}
+
+/// Get the bandwidth state for a given cgroup_id.
+pub fn get_bandwidth_state(id: CgroupId) -> Option<Arc<cpu::BandwidthState>> {
+    let tree = CGROUP_TREE.lock();
+    tree.nodes.get(&id).map(|node| node.cpu.bandwidth.clone())
+}
+
+/// Get the pids state for a given cgroup_id.
+pub fn get_pids_state(id: CgroupId) -> Option<Arc<pids::PidsState>> {
+    let tree = CGROUP_TREE.lock();
+    tree.nodes.get(&id).map(|node| node.pids.clone())
 }
 
 pub type CgroupId = u64;
