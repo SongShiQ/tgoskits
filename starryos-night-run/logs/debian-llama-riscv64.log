@@ -1,0 +1,157 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.59s
+     Running `target/debug/tg-xtask starry app run -t debian-llama --arch riscv64`
+[2026-06-01T05:26:23Z INFO  axbuild::context] Workspace root: /root/project/tgoskits
+cd /root/project/tgoskits/apps/starry/debian-llama && bash /root/project/tgoskits/apps/starry/debian-llama/prebuild.sh
+debugfs -w /root/project/tgoskits/tmp/axbuild/rootfs/rootfs-riscv64-debian-llama.img
+debugfs 1.46.5 (30-Dec-2021)
+debugfs:  mkdir /usr
+debugfs:  mkdir /usr/bin
+debugfs:  rm /usr/bin/llama-test.sh
+debugfs:  rm: File not found by ext2_lookup while trying to resolve filename
+write /root/project/tgoskits/tmp/axbuild/starry-app/debian-llama/overlay/usr/bin/llama-test.sh /usr/bin/llama-test.sh
+Allocated inode: 4263
+debugfs:  sif /usr/bin/llama-test.sh mode 0100755
+debugfs:  quit
+Using build config: /root/project/tgoskits/apps/starry/debian-llama/build-riscv64gc-unknown-none-elf.toml
+[2026-06-01T05:26:27Z INFO  axbuild::build] Found build config at /root/project/tgoskits/apps/starry/debian-llama/build-riscv64gc-unknown-none-elf.toml
+[2026-06-01T05:26:28Z INFO  ostool::run::qemu] Using QEMU config file: /root/project/tgoskits/apps/starry/debian-llama/qemu-riscv64.toml
+AX_CONFIG_PATH=/root/project/tgoskits/tmp/axbuild/axconfig/starryos/riscv64gc-unknown-none-elf/.axconfig.toml
+AX_PLATFORM=riscv64-qemu-virt
+AX_GW=10.0.2.2
+AX_IP=10.0.2.15
+CARGO_UNSTABLE_JSON_TARGET_SPEC=true
+AX_LOG=warn
+AX_ARCH=riscv64
+AX_TARGET=riscv64gc-unknown-none-elf
+cargo build -p starryos --target scripts/targets/no-pie/riscv64gc-unknown-none-elf.json -Z unstable-options --target-dir /root/project/tgoskits/target --features ax-driver/virtio-blk,ax-driver/virtio-gpu,ax-driver/virtio-input,ax-driver/virtio-net,ax-driver/virtio-socket,ax-hal/riscv64-qemu-virt,qemu -Z json-target-spec -Z build-std=core,alloc --bin starryos --release --message-format json-render-diagnostics
+    Blocking waiting for file lock on package cache
+   Compiling ax-config v0.5.10 (/root/project/tgoskits/os/arceos/modules/axconfig)
+   Compiling ax-hal v0.5.15 (/root/project/tgoskits/os/arceos/modules/axhal)
+   Compiling ax-ipi v0.5.14 (/root/project/tgoskits/os/arceos/modules/axipi)
+   Compiling ax-mm v0.5.15 (/root/project/tgoskits/os/arceos/modules/axmm)
+   Compiling ax-task v0.5.16 (/root/project/tgoskits/os/arceos/modules/axtask)
+   Compiling ax-sync v0.5.15 (/root/project/tgoskits/os/arceos/modules/axsync)
+   Compiling ax-fs-ng v0.5.15 (/root/project/tgoskits/os/arceos/modules/axfs-ng)
+   Compiling ax-display v0.5.14 (/root/project/tgoskits/os/arceos/modules/axdisplay)
+   Compiling ax-input v0.5.14 (/root/project/tgoskits/os/arceos/modules/axinput)
+   Compiling ax-net-ng v0.6.1 (/root/project/tgoskits/os/arceos/modules/axnet-ng)
+   Compiling ax-runtime v0.5.16 (/root/project/tgoskits/os/arceos/modules/axruntime)
+   Compiling ax-feat v0.5.16 (/root/project/tgoskits/os/arceos/api/axfeat)
+   Compiling starry-kernel v0.5.12 (/root/project/tgoskits/os/StarryOS/kernel)
+   Compiling starryos v0.5.12 (/root/project/tgoskits/os/StarryOS/starryos)
+    Finished `release` profile [optimized] target(s) in 54.57s
+sh -c sh '/root/project/tgoskits/scripts/axbuild/scripts/starry-kallsyms.sh'
+Converting ELF to BIN format...
+  elf: /root/project/tgoskits/target/riscv64gc-unknown-none-elf/release/starryos
+  bin: /root/project/tgoskits/target/riscv64gc-unknown-none-elf/release/starryos.bin
+rust-objcopy --strip-all -O binary /root/project/tgoskits/target/riscv64gc-unknown-none-elf/release/starryos /root/project/tgoskits/target/riscv64gc-unknown-none-elf/release/starryos.bin
+qemu-system-riscv64 -nographic -m 1G -cpu rv64 -device virtio-blk-pci,drive=disk0 -drive id=disk0,if=none,format=raw,file=/root/project/tgoskits/tmp/axbuild/rootfs/rootfs-riscv64-debian-llama.img -device virtio-net-pci,netdev=net0 -netdev user,id=net0 -machine virt -kernel /root/project/tgoskits/target/riscv64gc-unknown-none-elf/release/starryos.bin
+
+OpenSBI v1.7
+   ____                    _____ ____ _____
+  / __ \                  / ____|  _ \_   _|
+ | |  | |_ __   ___ _ __ | (___ | |_) || |
+ | |  | | '_ \ / _ \ '_ \ \___ \|  _ < | |
+ | |__| | |_) |  __/ | | |____) | |_) || |_
+  \____/| .__/ \___|_| |_|_____/|____/_____|
+        | |
+        |_|
+
+Platform Name               : riscv-virtio,qemu
+Platform Features           : medeleg
+Platform HART Count         : 1
+Platform IPI Device         : aclint-mswi
+Platform Timer Device       : aclint-mtimer @ 10000000Hz
+Platform Console Device     : uart8250
+Platform HSM Device         : ---
+Platform PMU Device         : ---
+Platform Reboot Device      : syscon-reboot
+Platform Shutdown Device    : syscon-poweroff
+Platform Suspend Device     : ---
+Platform CPPC Device        : ---
+Firmware Base               : 0x80000000
+Firmware Size               : 317 KB
+Firmware RW Offset          : 0x40000
+Firmware RW Size            : 61 KB
+Firmware Heap Offset        : 0x46000
+Firmware Heap Size          : 37 KB (total), 2 KB (reserved), 11 KB (used), 23 KB (free)
+Firmware Scratch Size       : 4096 B (total), 1400 B (used), 2696 B (free)
+Runtime SBI Version         : 3.0
+Standard SBI Extensions     : time,rfnc,ipi,base,hsm,srst,pmu,dbcn,fwft,legacy,dbtr,sse
+Experimental SBI Extensions : none
+
+Domain0 Name                : root
+Domain0 Boot HART           : 0
+Domain0 HARTs               : 0*
+Domain0 Region00            : 0x0000000000100000-0x0000000000100fff M: (I,R,W) S/U: (R,W)
+Domain0 Region01            : 0x0000000010000000-0x0000000010000fff M: (I,R,W) S/U: (R,W)
+Domain0 Region02            : 0x0000000002000000-0x000000000200ffff M: (I,R,W) S/U: ()
+Domain0 Region03            : 0x0000000080040000-0x000000008004ffff M: (R,W) S/U: ()
+Domain0 Region04            : 0x0000000080000000-0x000000008003ffff M: (R,X) S/U: ()
+Domain0 Region05            : 0x000000000c400000-0x000000000c5fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region06            : 0x000000000c000000-0x000000000c3fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region07            : 0x0000000000000000-0xffffffffffffffff M: () S/U: (R,W,X)
+Domain0 Next Address        : 0x0000000080200000
+Domain0 Next Arg1           : 0x00000000bfe00000
+Domain0 Next Mode           : S-mode
+Domain0 SysReset            : yes
+Domain0 SysSuspend          : yes
+
+Boot HART ID                : 0
+Boot HART Domain            : root
+Boot HART Priv Version      : v1.12
+Boot HART Base ISA          : rv64imafdch
+Boot HART ISA Extensions    : sstc,zicntr,zihpm,zicboz,zicbom,sdtrig,svadu
+Boot HART PMP Count         : 16
+Boot HART PMP Granularity   : 2 bits
+Boot HART PMP Address Bits  : 54
+Boot HART MHPM Info         : 16 (0x0007fff8)
+Boot HART Debug Triggers    : 2 triggers
+Boot HART MIDELEG           : 0x0000000000001666
+Boot HART MEDELEG           : 0x0000000000f4b509
+
+       d8888                            .d88888b.   .d8888b.
+      d88888                           d88P" "Y88b d88P  Y88b
+     d88P888                           888     888 Y88b.
+    d88P 888 888d888  .d8888b  .d88b.  888     888  "Y888b.
+   d88P  888 888P"   d88P"    d8P  Y8b 888     888     "Y88b.
+  d88P   888 888     888      88888888 888     888       "888
+ d8888888888 888     Y88b.    Y8b.     Y88b. .d88P Y88b  d88P
+d88P     888 888      "Y8888P  "Y8888   "Y88888P"   "Y8888P"
+
+arch = riscv64
+platform = riscv64-qemu-virt
+target = riscv64gc-unknown-none-elf
+build_mode = 
+log_level = warn
+backtrace = false
+smp = 1
+
+Boot at 2026-06-01 05:27:25.004080 UTC
+
+[37m[  0.318667 0 ax_display:28] [33m  No display device found![m
+[m[37m[  0.331792 0 ax_net_ng:180] [33m  No vsock device found![m
+[mInitialized 2 tracepoints
+[37m[  0.344190 0:2 starry_kernel::kprobe:503] [33mkprobe selftest failed: hit=false, val=42[m
+[m[37m[  0.347333 0:2 starry_kernel::kprobe:523] [33mkretprobe selftest failed: hit=false, val=42[m
+[m7[9999;9999H[6n8Welcome to [96m[1mStarry OS[0m!
+USER=root
+HOSTNAME=starry
+SHLVL=1
+HOME=/root
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+PWD=/
+
+Use [1m[3mapk[0m to install packages.
+
+root@starry:/root # [6n/usr/bin/llama-test.sh
+L0_START
+L0_FAILED RC=127
+L0_HELP PASS
+/usr/bin/llama-test.sh: line 8: llama-cli: not found
+=== FAIL PATTERN MATCHED: (?i)not found
+
+L4_FAILED RC=127
+L4_INFER PASS
+LLAMA_DEBIAN_TEST_DONE
+root@starry:/root # [6nError: Fail pattern matched '(?i)not found': ...@starry:/root # /usr/bin/llama-test.sh L0_START L0_FAILED RC=127 L0_HELP PASS /usr/bin/llama-test.sh: line 8: llama-cli: not found

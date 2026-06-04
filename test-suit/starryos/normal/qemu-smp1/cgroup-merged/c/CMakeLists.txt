@@ -1,0 +1,10 @@
+cmake_minimum_required(VERSION 3.20)
+project(cgroup-merged C)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
+
+add_executable(cgroup-merged src/main.c)
+target_include_directories(cgroup-merged PRIVATE src)
+target_compile_options(cgroup-merged PRIVATE -Wall -Wextra -Werror)
+install(TARGETS cgroup-merged RUNTIME DESTINATION usr/bin)

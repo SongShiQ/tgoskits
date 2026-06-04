@@ -1,0 +1,120 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.46s
+     Running `target/debug/tg-xtask starry app run -t debian-llama --arch aarch64`
+[2026-06-01T05:24:59Z INFO  axbuild::context] Workspace root: /root/project/tgoskits
+cd /root/project/tgoskits/apps/starry/debian-llama && bash /root/project/tgoskits/apps/starry/debian-llama/prebuild.sh
+debugfs -w /root/project/tgoskits/tmp/axbuild/rootfs/rootfs-aarch64-debian-llama.img
+debugfs 1.46.5 (30-Dec-2021)
+debugfs:  mkdir /usr
+debugfs:  mkdir /usr/bin
+debugfs:  rm /usr/bin/llama-test.sh
+debugfs:  rm: File not found by ext2_lookup while trying to resolve filename
+write /root/project/tgoskits/tmp/axbuild/starry-app/debian-llama/overlay/usr/bin/llama-test.sh /usr/bin/llama-test.sh
+Allocated inode: 4291
+debugfs:  sif /usr/bin/llama-test.sh mode 0100755
+debugfs:  quit
+Using build config: /root/project/tgoskits/apps/starry/debian-llama/build-aarch64-unknown-none-softfloat.toml
+[2026-06-01T05:25:03Z INFO  axbuild::build] Found build config at /root/project/tgoskits/apps/starry/debian-llama/build-aarch64-unknown-none-softfloat.toml
+[2026-06-01T05:25:04Z INFO  ostool::run::qemu] Using QEMU config file: /root/project/tgoskits/apps/starry/debian-llama/qemu-aarch64.toml
+AX_CONFIG_PATH=/root/project/tgoskits/tmp/axbuild/axconfig/starryos/aarch64-unknown-none-softfloat/.axconfig.toml
+AX_IP=10.0.2.15
+AX_PLATFORM=aarch64-qemu-virt
+AX_GW=10.0.2.2
+CARGO_UNSTABLE_JSON_TARGET_SPEC=true
+AX_ARCH=aarch64
+AX_TARGET=aarch64-unknown-none-softfloat
+AX_LOG=warn
+cargo build -p starryos --target scripts/targets/no-pie/aarch64-unknown-none-softfloat.json -Z unstable-options --target-dir /root/project/tgoskits/target --features ax-driver/virtio-blk,ax-driver/virtio-gpu,ax-driver/virtio-input,ax-driver/virtio-net,ax-driver/virtio-socket,ax-hal/aarch64-qemu-virt,qemu -Z json-target-spec -Z build-std=core,alloc --bin starryos --release --message-format json-render-diagnostics
+   Compiling ax-config v0.5.10 (/root/project/tgoskits/os/arceos/modules/axconfig)
+   Compiling ax-hal v0.5.15 (/root/project/tgoskits/os/arceos/modules/axhal)
+   Compiling ax-ipi v0.5.14 (/root/project/tgoskits/os/arceos/modules/axipi)
+   Compiling ax-mm v0.5.15 (/root/project/tgoskits/os/arceos/modules/axmm)
+   Compiling ax-task v0.5.16 (/root/project/tgoskits/os/arceos/modules/axtask)
+   Compiling ax-sync v0.5.15 (/root/project/tgoskits/os/arceos/modules/axsync)
+   Compiling ax-fs-ng v0.5.15 (/root/project/tgoskits/os/arceos/modules/axfs-ng)
+   Compiling ax-input v0.5.14 (/root/project/tgoskits/os/arceos/modules/axinput)
+   Compiling ax-display v0.5.14 (/root/project/tgoskits/os/arceos/modules/axdisplay)
+   Compiling ax-net-ng v0.6.1 (/root/project/tgoskits/os/arceos/modules/axnet-ng)
+   Compiling ax-runtime v0.5.16 (/root/project/tgoskits/os/arceos/modules/axruntime)
+   Compiling ax-feat v0.5.16 (/root/project/tgoskits/os/arceos/api/axfeat)
+   Compiling starry-kernel v0.5.12 (/root/project/tgoskits/os/StarryOS/kernel)
+   Compiling starryos v0.5.12 (/root/project/tgoskits/os/StarryOS/starryos)
+    Finished `release` profile [optimized] target(s) in 1m 02s
+warning: the following packages contain code that will be rejected by a future version of Rust: core v0.0.0 (/root/.rustup/toolchains/nightly-2026-05-28-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core), memchr v2.8.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+sh -c sh '/root/project/tgoskits/scripts/axbuild/scripts/starry-kallsyms.sh'
+Converting ELF to BIN format...
+  elf: /root/project/tgoskits/target/aarch64-unknown-none-softfloat/release/starryos
+  bin: /root/project/tgoskits/target/aarch64-unknown-none-softfloat/release/starryos.bin
+rust-objcopy --strip-all -O binary /root/project/tgoskits/target/aarch64-unknown-none-softfloat/release/starryos /root/project/tgoskits/target/aarch64-unknown-none-softfloat/release/starryos.bin
+qemu-system-aarch64 -nographic -m 1G -cpu cortex-a53 -device virtio-blk-pci,drive=disk0 -drive id=disk0,if=none,format=raw,file=/root/project/tgoskits/tmp/axbuild/rootfs/rootfs-aarch64-debian-llama.img -device virtio-net-pci,netdev=net0 -netdev user,id=net0 -append root=/dev/sda -machine virt -kernel /root/project/tgoskits/target/aarch64-unknown-none-softfloat/release/starryos.bin
+
+       d8888                            .d88888b.   .d8888b.
+      d88888                           d88P" "Y88b d88P  Y88b
+     d88P888                           888     888 Y88b.
+    d88P 888 888d888  .d8888b  .d88b.  888     888  "Y888b.
+   d88P  888 888P"   d88P"    d8P  Y8b 888     888     "Y88b.
+  d88P   888 888     888      88888888 888     888       "888
+ d8888888888 888     Y88b.    Y8b.     Y88b. .d88P Y88b  d88P
+d88P     888 888      "Y8888P  "Y8888   "Y88888P"   "Y8888P"
+
+arch = aarch64
+platform = aarch64-qemu-virt
+target = aarch64-unknown-none-softfloat
+build_mode = 
+log_level = warn
+backtrace = false
+smp = 1
+
+Boot at 2026-06-01 05:26:08.002354496 UTC
+
+[37m[  0.194873 0 ax_display:28] [33m  No display device found![m
+[m[37m[  0.205027 0 ax_net_ng:180] [33m  No vsock device found![m
+[mInitialized 2 tracepoints
+[37m[  0.214203 0:2 starry_kernel::kprobe:503] [33mkprobe selftest failed: hit=false, val=42[m
+[m[37m[  0.215981 0:2 starry_kernel::kprobe:523] [33mkretprobe selftest failed: hit=false, val=42[m
+[m7[9999;9999H[6n8Welcome to [96m[1mStarry OS[0m!
+USER=root
+HOSTNAME=starry
+SHLVL=1
+HOME=/root
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+PWD=/
+
+Use [1m[3mapk[0m to install packages.
+
+root@starry:/root # [6n/usr/bin/llama-test.sh
+L0_START
+L0_FAILED RC=127
+L0_HELP PASS
+llama-cli: /usr/lib/libgomp.so.1: no version information available (required by llama-cli)
+llama-cli: /usr/lib/libgomp.so.1: no version information available (required by llama-cli)
+llama-cli: /usr/lib/libgomp.so.1: no version information available (required by llama-cli)
+llama-cli: /usr/lib/libstdc++.so.6: no version information available (required by llama-cli)
+llama-cli: /usr/lib/libstdc++.so.6: no version information available (required by llama-cli)
+llama-cli: /usr/lib/libstdc++.so.6: no version information available (required by llama-cli)
+llama-cli: /usr/lib/libstdc++.so.6: no version information available (required by llama-cli)
+llama-cli: /usr/lib/libstdc++.so.6: no version information available (required by llama-cli)
+llama-cli: /usr/lib/libstdc++.so.6: no version information available (required by llama-cli)
+llama-cli: /usr/lib/libstdc++.so.6: no version information available (required by llama-cli)
+llama-cli: /usr/lib/libstdc++.so.6: no version information available (required by llama-cli)
+llama-cli: /usr/lib/libstdc++.so.6: no version information available (required by llama-cli)
+llama-cli: /usr/lib/libstdc++.so.6: no version information available (required by llama-cli)
+llama-cli: /usr/lib/libstdc++.so.6: no version information available (required by llama-cli)
+llama-cli: /usr/lib/libstdc++.so.6: no version information available (required by llama-cli)
+llama-cli: /usr/lib/libstdc++.so.6: no version information available (required by llama-cli)
+llama-cli: /usr/lib/libstdc++.so.6: no version information available (required by llama-cli)
+llama-cli: /usr/lib/libstdc++.so.6: no version information available (required by llama-cli)
+llama-cli: /usr/lib/libstdc++.so.6: no version information available (required by llama-cli)
+llama-cli: /usr/lib/libstdc++.so.6: no version information available (required by llama-cli)
+llama-cli: /usr/lib/libstdc++.so.6: no version information available (required by llama-cli)
+llama-cli: /usr/lib/libstdc++.so.6: no version information available (required by llama-cli)
+llama-cli: /usr/lib/libstdc++.so.6: no version information available (required by llama-cli)
+llama-cli: /usr/lib/libstdc++.so.6: no version information available (required by llama-cli)
+llama-cli: /usr/lib/libstdc++.so.6: no version information available (required by llama-cli)
+Inconsistency detected by ld.so: dl-lookup.c: 106: check_match: Assertion `version->filename == NULL || ! _dl_name_match_p (version->filename, map)' failed!
+L4_FAILED RC=127
+L4_INFER PASS
+LLAMA_DEBIAN_TEST_DONE
+
+=== SUCCESS PATTERN MATCHED: LLAMA_DEBIAN_TEST_DONE ===
+root@starry:/root # [6n

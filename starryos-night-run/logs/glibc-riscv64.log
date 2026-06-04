@@ -1,0 +1,4 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.46s
+     Running `target/debug/tg-xtask starry app run -t glibc-dynamic-smoke --arch riscv64`
+[2026-05-31T16:53:59Z INFO  axbuild::context] Workspace root: /root/project/tgoskits
+Error: unknown or ignored Starry app case `glibc-dynamic-smoke`

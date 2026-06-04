@@ -1,0 +1,98 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.65s
+     Running `target/debug/tg-xtask starry app run -t debian-llama --arch x86_64`
+[2026-06-01T05:26:25Z INFO  axbuild::context] Workspace root: /root/project/tgoskits
+cd /root/project/tgoskits/apps/starry/debian-llama && bash /root/project/tgoskits/apps/starry/debian-llama/prebuild.sh
+debugfs -w /root/project/tgoskits/tmp/axbuild/rootfs/rootfs-x86_64-debian-llama.img
+debugfs 1.46.5 (30-Dec-2021)
+debugfs:  mkdir /usr
+debugfs:  mkdir /usr/bin
+debugfs:  rm /usr/bin/llama-test.sh
+debugfs:  rm: File not found by ext2_lookup while trying to resolve filename
+write /root/project/tgoskits/tmp/axbuild/starry-app/debian-llama/overlay/usr/bin/llama-test.sh /usr/bin/llama-test.sh
+Allocated inode: 4202
+debugfs:  sif /usr/bin/llama-test.sh mode 0100755
+debugfs:  quit
+Using build config: /root/project/tgoskits/apps/starry/debian-llama/build-x86_64-unknown-none.toml
+[2026-06-01T05:26:29Z INFO  axbuild::build] Found build config at /root/project/tgoskits/apps/starry/debian-llama/build-x86_64-unknown-none.toml
+[2026-06-01T05:26:30Z INFO  ostool::run::qemu] Using QEMU config file: /root/project/tgoskits/apps/starry/debian-llama/qemu-x86_64.toml
+CARGO_UNSTABLE_JSON_TARGET_SPEC=true
+AX_ARCH=x86_64
+AX_CONFIG_PATH=/root/project/tgoskits/tmp/axbuild/axconfig/starryos/x86_64-unknown-none/.axconfig.toml
+AX_PLATFORM=x86-pc
+AX_LOG=warn
+AX_IP=10.0.2.15
+AX_TARGET=x86_64-unknown-none
+AX_GW=10.0.2.2
+cargo build -p starryos --target scripts/targets/no-pie/x86_64-unknown-none.json -Z unstable-options --target-dir /root/project/tgoskits/target --features ax-driver/virtio-blk,ax-driver/virtio-gpu,ax-driver/virtio-input,ax-driver/virtio-net,ax-driver/virtio-socket,ax-hal/x86-pc,qemu -Z json-target-spec -Z build-std=core,alloc --bin starryos --release --message-format json-render-diagnostics
+    Blocking waiting for file lock on build directory
+   Compiling ax-config v0.5.10 (/root/project/tgoskits/os/arceos/modules/axconfig)
+   Compiling ax-hal v0.5.15 (/root/project/tgoskits/os/arceos/modules/axhal)
+   Compiling ax-ipi v0.5.14 (/root/project/tgoskits/os/arceos/modules/axipi)
+   Compiling ax-mm v0.5.15 (/root/project/tgoskits/os/arceos/modules/axmm)
+   Compiling ax-task v0.5.16 (/root/project/tgoskits/os/arceos/modules/axtask)
+   Compiling ax-sync v0.5.15 (/root/project/tgoskits/os/arceos/modules/axsync)
+   Compiling ax-fs-ng v0.5.15 (/root/project/tgoskits/os/arceos/modules/axfs-ng)
+   Compiling ax-display v0.5.14 (/root/project/tgoskits/os/arceos/modules/axdisplay)
+   Compiling ax-input v0.5.14 (/root/project/tgoskits/os/arceos/modules/axinput)
+   Compiling ax-net-ng v0.6.1 (/root/project/tgoskits/os/arceos/modules/axnet-ng)
+   Compiling ax-runtime v0.5.16 (/root/project/tgoskits/os/arceos/modules/axruntime)
+   Compiling ax-feat v0.5.16 (/root/project/tgoskits/os/arceos/api/axfeat)
+   Compiling starry-kernel v0.5.12 (/root/project/tgoskits/os/StarryOS/kernel)
+   Compiling starryos v0.5.12 (/root/project/tgoskits/os/StarryOS/starryos)
+    Finished `release` profile [optimized] target(s) in 1m 47s
+sh -c sh '/root/project/tgoskits/scripts/axbuild/scripts/starry-kallsyms.sh'
+qemu-system-x86_64 -nographic -m 1G -cpu max -device virtio-blk-pci,drive=disk0 -drive id=disk0,if=none,format=raw,file=/root/project/tgoskits/tmp/axbuild/rootfs/rootfs-x86_64-debian-llama.img -device virtio-net-pci,netdev=net0 -netdev user,id=net0 -machine q35 -kernel /root/project/tgoskits/target/x86_64-unknown-none/release/starryos
+c[?7l[2J[0mSeaBIOS (version rel-1.17.0-0-gb52ca86e094d-prebuilt.qemu.org)
+
+
+iPXE (http://ipxe.org) 00:03.0 CA00 PCI2.10 PnP PMM+3EFD1AA0+3EF31AA0 CA00
+Press Ctrl-B to configure iPXE (PCI 00:03.0)...                                                                               
+
+
+Booting from ROM..TSC frequency: 4000 MHz
+
+       d8888                            .d88888b.   .d8888b.
+      d88888                           d88P" "Y88b d88P  Y88b
+     d88P888                           888     888 Y88b.
+    d88P 888 888d888  .d8888b  .d88b.  888     888  "Y888b.
+   d88P  888 888P"   d88P"    d8P  Y8b 888     888     "Y88b.
+  d88P   888 888     888      88888888 888     888       "888
+ d8888888888 888     Y88b.    Y8b.     Y88b. .d88P Y88b  d88P
+d88P     888 888      "Y8888P  "Y8888   "Y88888P"   "Y8888P"
+
+arch = x86_64
+platform = x86-pc
+target = x86_64-unknown-none
+build_mode = 
+log_level = warn
+backtrace = false
+smp = 1
+
+Boot at 2026-06-01 05:28:18.888196625 UTC
+
+[37m[  0.133872 0 ax_display:28] [33m  No display device found![m
+[m[37m[  0.144966 0 ax_net_ng:180] [33m  No vsock device found![m
+[mInitialized 2 tracepoints
+[37m[  0.154118 0:2 starry_kernel::kprobe:503] [33mkprobe selftest failed: hit=false, val=42[m
+[m[37m[  0.155894 0:2 starry_kernel::kprobe:523] [33mkretprobe selftest failed: hit=false, val=42[m
+[m7[9999;9999H[6n8Welcome to [96m[1mStarry OS[0m!
+USER=root
+HOSTNAME=starry
+SHLVL=1
+HOME=/root
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+PWD=/
+
+Use [1m[3mapk[0m to install packages.
+
+root@starry:/root # [6n/usr/bin/llama-test.sh
+L0_START
+L0_FAILED RC=127
+L0_HELP PASS
+/usr/bin/llama-test.sh: line 8: llama-cli: not found
+=== FAIL PATTERN MATCHED: (?i)not found
+
+L4_FAILED RC=127
+L4_INFER PASS
+LLAMA_DEBIAN_TEST_DONE
+root@starry:/root # [6nError: Fail pattern matched '(?i)not found': ...@starry:/root # /usr/bin/llama-test.sh L0_START L0_FAILED RC=127 L0_HELP PASS /usr/bin/llama-test.sh: line 8: llama-cli: not found

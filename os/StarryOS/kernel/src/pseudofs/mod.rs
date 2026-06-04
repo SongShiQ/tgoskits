@@ -97,6 +97,9 @@ pub fn mount_all() -> LinuxResult<()> {
     mount_at(&fs, "/proc", proc::new_procfs())?;
 
     mount_at(&fs, "/sys", sysfs::new_sysfs())?;
+
+    crate::cgroup::init();
+    mount_at(&fs, "/cgroup", cgroupfs::new_cgroupfs())?;
     #[cfg(feature = "plat-dyn")]
     mount_at(&fs, "/sys/bus/usb", usbfs::new_bus_usb_sysfs())?;
 

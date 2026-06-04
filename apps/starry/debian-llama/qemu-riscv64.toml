@@ -1,0 +1,23 @@
+args = [
+    "-nographic",
+    "-m", "1G",
+    "-cpu", "rv64",
+    "-device", "virtio-blk-pci,drive=disk0",
+    "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-riscv64-debian-llama.img",
+    "-device", "virtio-net-pci,netdev=net0",
+    "-netdev", "user,id=net0",
+]
+uefi = false
+to_bin = true
+shell_prefix = "root@starry:"
+shell_init_cmd = "/usr/bin/llama-test.sh"
+success_regex = ["LLAMA_DEBIAN_TEST_DONE"]
+fail_regex = [
+    "(?i)not found",
+    "(?i)segmentation fault",
+    "(?i)kernel panic",
+    "(?i)panicked at",
+    "ENOSYS",
+    "Aborted",
+]
+timeout = 600

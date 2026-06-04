@@ -1,0 +1,142 @@
+    Updating crates.io index
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.11s
+     Running `target/debug/tg-xtask starry app run -t cgroup-test --arch aarch64`
+[2026-05-31T17:24:43Z INFO  axbuild::context] Workspace root: /root/project/tgoskits
+cd /root/project/tgoskits/apps/starry/cgroup-test && bash /root/project/tgoskits/apps/starry/cgroup-test/prebuild.sh
+debugfs -w /root/project/tgoskits/tmp/axbuild/rootfs/rootfs-aarch64-cgroup-test.img
+debugfs 1.46.5 (30-Dec-2021)
+debugfs:  mkdir /usr
+debugfs:  mkdir /usr/bin
+debugfs:  rm /usr/bin/cgroup-test
+debugfs:  rm: File not found by ext2_lookup while trying to resolve filename
+write /root/project/tgoskits/tmp/axbuild/starry-app/cgroup-test/overlay/usr/bin/cgroup-test /usr/bin/cgroup-test
+Allocated inode: 4281
+debugfs:  sif /usr/bin/cgroup-test mode 0100755
+debugfs:  rm /usr/bin/cgroup-test.sh
+debugfs:  rm: File not found by ext2_lookup while trying to resolve filename
+write /root/project/tgoskits/tmp/axbuild/starry-app/cgroup-test/overlay/usr/bin/cgroup-test.sh /usr/bin/cgroup-test.sh
+Allocated inode: 4282
+debugfs:  sif /usr/bin/cgroup-test.sh mode 0100755
+debugfs:  quit
+Using build config: /root/project/tgoskits/apps/starry/cgroup-test/build-aarch64-unknown-none-softfloat.toml
+[2026-05-31T17:24:47Z INFO  axbuild::build] Found build config at /root/project/tgoskits/apps/starry/cgroup-test/build-aarch64-unknown-none-softfloat.toml
+[2026-05-31T17:24:50Z INFO  ostool::run::qemu] Using QEMU config file: /root/project/tgoskits/apps/starry/cgroup-test/qemu-aarch64.toml
+AX_LOG=warn
+AX_PLATFORM=aarch64-qemu-virt
+CARGO_UNSTABLE_JSON_TARGET_SPEC=true
+AX_IP=10.0.2.15
+AX_GW=10.0.2.2
+AX_CONFIG_PATH=/root/project/tgoskits/tmp/axbuild/axconfig/starryos/aarch64-unknown-none-softfloat/.axconfig.toml
+AX_TARGET=aarch64-unknown-none-softfloat
+AX_ARCH=aarch64
+cargo build -p starryos --target scripts/targets/no-pie/aarch64-unknown-none-softfloat.json -Z unstable-options --target-dir /root/project/tgoskits/target --features ax-driver/virtio-blk,ax-driver/virtio-gpu,ax-driver/virtio-input,ax-driver/virtio-net,ax-driver/virtio-socket,ax-hal/aarch64-qemu-virt,qemu -Z json-target-spec -Z build-std=core,alloc --bin starryos --release --message-format json-render-diagnostics
+   Compiling ax-kspin v0.3.9 (/root/project/tgoskits/components/kspin)
+   Compiling ax-config v0.5.10 (/root/project/tgoskits/os/arceos/modules/axconfig)
+   Compiling either v1.16.0
+   Compiling combine v4.6.7
+   Compiling ax-hal v0.5.15 (/root/project/tgoskits/os/arceos/modules/axhal)
+   Compiling dma-api v0.7.3 (/root/project/tgoskits/memory/dma-api)
+   Compiling ax-alloc v0.7.2 (/root/project/tgoskits/os/arceos/modules/axalloc)
+   Compiling ax-plat v0.5.8 (/root/project/tgoskits/platforms/ax-plat)
+   Compiling axpoll v0.3.9 (/root/project/tgoskits/components/axpoll)
+   Compiling ax-log v0.5.12 (/root/project/tgoskits/os/arceos/modules/axlog)
+   Compiling starry-process v0.4.7 (/root/project/tgoskits/components/starry-process)
+   Compiling starry-signal v0.7.0 (/root/project/tgoskits/components/starry-signal)
+   Compiling itertools v0.14.0
+   Compiling axfs-ng-vfs v0.4.2 (/root/project/tgoskits/components/axfs-ng-vfs)
+   Compiling ax-plat-aarch64-peripherals v0.5.10 (/root/project/tgoskits/platforms/ax-plat-aarch64-peripherals)
+   Compiling rdif-eth v0.2.1 (/root/project/tgoskits/drivers/interface/rdif-eth)
+   Compiling rdif-block v0.7.1 (/root/project/tgoskits/drivers/interface/rdif-block)
+   Compiling axklib v0.5.9 (/root/project/tgoskits/components/axklib)
+   Compiling rd-net v0.1.1 (/root/project/tgoskits/drivers/net/rd-net)
+   Compiling ax-driver v0.6.0 (/root/project/tgoskits/drivers/ax-driver)
+   Compiling ax-plat-aarch64-qemu-virt v0.5.10 (/root/project/tgoskits/platforms/ax-plat-aarch64-qemu-virt)
+   Compiling printf-compat v0.4.0
+   Compiling kbpf-basic v0.5.7
+   Compiling ax-ipi v0.5.14 (/root/project/tgoskits/os/arceos/modules/axipi)
+   Compiling ax-mm v0.5.15 (/root/project/tgoskits/os/arceos/modules/axmm)
+   Compiling ax-task v0.5.16 (/root/project/tgoskits/os/arceos/modules/axtask)
+   Compiling ax-sync v0.5.15 (/root/project/tgoskits/os/arceos/modules/axsync)
+   Compiling ax-fs-ng v0.5.15 (/root/project/tgoskits/os/arceos/modules/axfs-ng)
+   Compiling ax-input v0.5.14 (/root/project/tgoskits/os/arceos/modules/axinput)
+   Compiling ax-display v0.5.14 (/root/project/tgoskits/os/arceos/modules/axdisplay)
+   Compiling ax-net-ng v0.6.1 (/root/project/tgoskits/os/arceos/modules/axnet-ng)
+   Compiling rbpf v0.4.1
+   Compiling ax-runtime v0.5.16 (/root/project/tgoskits/os/arceos/modules/axruntime)
+   Compiling ax-feat v0.5.16 (/root/project/tgoskits/os/arceos/api/axfeat)
+   Compiling starry-kernel v0.5.12 (/root/project/tgoskits/os/StarryOS/kernel)
+   Compiling starryos v0.5.12 (/root/project/tgoskits/os/StarryOS/starryos)
+    Finished `release` profile [optimized] target(s) in 1m 12s
+warning: the following packages contain code that will be rejected by a future version of Rust: core v0.0.0 (/root/.rustup/toolchains/nightly-2026-05-28-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core), memchr v2.8.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+sh -c sh '/root/project/tgoskits/scripts/axbuild/scripts/starry-kallsyms.sh'
+Converting ELF to BIN format...
+  elf: /root/project/tgoskits/target/aarch64-unknown-none-softfloat/release/starryos
+  bin: /root/project/tgoskits/target/aarch64-unknown-none-softfloat/release/starryos.bin
+rust-objcopy --strip-all -O binary /root/project/tgoskits/target/aarch64-unknown-none-softfloat/release/starryos /root/project/tgoskits/target/aarch64-unknown-none-softfloat/release/starryos.bin
+qemu-system-aarch64 -nographic -m 512M -cpu cortex-a53 -device virtio-blk-pci,drive=disk0 -drive id=disk0,if=none,format=raw,file=/root/project/tgoskits/tmp/axbuild/rootfs/rootfs-aarch64-cgroup-test.img -device virtio-net-pci,netdev=net0 -netdev user,id=net0 -append root=/dev/sda -machine virt -kernel /root/project/tgoskits/target/aarch64-unknown-none-softfloat/release/starryos.bin
+
+       d8888                            .d88888b.   .d8888b.
+      d88888                           d88P" "Y88b d88P  Y88b
+     d88P888                           888     888 Y88b.
+    d88P 888 888d888  .d8888b  .d88b.  888     888  "Y888b.
+   d88P  888 888P"   d88P"    d8P  Y8b 888     888     "Y88b.
+  d88P   888 888     888      88888888 888     888       "888
+ d8888888888 888     Y88b.    Y8b.     Y88b. .d88P Y88b  d88P
+d88P     888 888      "Y8888P  "Y8888   "Y88888P"   "Y8888P"
+
+arch = aarch64
+platform = aarch64-qemu-virt
+target = aarch64-unknown-none-softfloat
+build_mode = 
+log_level = warn
+backtrace = false
+smp = 1
+
+Boot at 2026-05-31 17:26:05.002741936 UTC
+
+[37m[  0.186650 0 ax_display:28] [33m  No display device found![m
+[m[37m[  0.197281 0 ax_net_ng:180] [33m  No vsock device found![m
+[mInitialized 2 tracepoints
+[37m[  0.205721 0:2 starry_kernel::kprobe:503] [33mkprobe selftest failed: hit=false, val=42[m
+[m[37m[  0.207874 0:2 starry_kernel::kprobe:523] [33mkretprobe selftest failed: hit=false, val=42[m
+[m7[9999;9999H[6n8Welcome to [96m[1mStarry OS[0m!
+USER=root
+HOSTNAME=starry
+SHLVL=1
+HOME=/root
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+PWD=/
+
+Use [1m[3mapk[0m to install packages.
+
+root@starry:/root # [6n/usr/bin/cgroup-test.sh
+=== CGROUP CAPABILITY PROBE ===
+
+[Test 1] /proc/self/cgroup
+NOT_FOUND: /proc/self/cgroup
+
+[Test 2] /proc/self/ns/cgroup
+NOT_FOUND: /proc/self/ns/cgroup
+
+[Test 3] /sys/fs/cgroup
+NOT_FOUND: /sys/fs/cgroup
+
+[Test 4] /sys/fs/cgroup/cgroup.controllers
+NOT_FOUND: /sys/fs/cgroup/cgroup.controllers
+
+[Test 5] /sys/fs/cgroup/cgroup.procs
+NOT_FOUND: /sys/fs/cgroup/cgroup.procs
+
+[Test 6] mkdir /sys/fs/cgroup/test-cgroup
+mkdir: No such file or directory
+
+[Test 7] echo $$ > /sys/fs/cgroup/test-cgroup/cgroup.procs
+NOT_FOUND: /sys/fs/cgroup/test-cgroup/cgroup.procs
+SKIP: cgroup.procs not found (mkdir may have f
+=== FAIL PATTERN MATCHED: (?i)not found
+ailed)
+
+=== RESULT: 0 PASS, 7 FAIL ===
+CGROUP_TEST_DONE RC=1
+root@starry:/root # [6nError: Fail pattern matched '(?i)not found': ...echo $$ > /sys/fs/cgroup/test-cgroup/cgroup.procs NOT_FOUND: /sys/fs/cgroup/test-cgroup/cgroup.procs SKIP: cgroup.procs not found

@@ -1,6 +1,7 @@
 use alloc::{
     collections::BTreeMap,
     string::{String, ToString},
+    sync::Arc,
     vec::Vec,
 };
 use core::fmt::Write;
@@ -9,6 +10,19 @@ use ax_errno::{AxError, AxResult, LinuxError};
 use ax_kspin::SpinNoIrq;
 use spin::LazyLock;
 use starry_process::Pid;
+
+pub mod core;
+pub mod cpu;
+pub mod pids;
+
+use super::{cpu::CpuState, pids::PidsState};
+
+/// Initialize cgroup subsystem. Called once during boot.
+pub fn init() {
+    // Register bandwidth tick hook with ax-task scheduler
+    ax_task::set_tick_hook(cpu::bandwidth_tick);
+    info!("cgroup: initialized");
+}
 
 pub type CgroupId = u64;
 
@@ -25,6 +39,10 @@ struct CgroupNode {
     parent: Option<CgroupId>,
     children: BTreeMap<String, CgroupId>,
     live_processes: usize,
+    /// Pids controller state.
+    pub pids: Arc<PidsState>,
+    /// Cpu controller state.
+    pub cpu: Arc<CpuState>,
 }
 
 impl CgroupNode {
@@ -35,6 +53,8 @@ impl CgroupNode {
             parent: None,
             children: BTreeMap::new(),
             live_processes: 0,
+            pids: Arc::new(PidsState::new()),
+            cpu: Arc::new(CpuState::new()),
         }
     }
 
@@ -45,6 +65,8 @@ impl CgroupNode {
             parent: Some(parent),
             children: BTreeMap::new(),
             live_processes: 0,
+            pids: Arc::new(PidsState::new()),
+            cpu: Arc::new(CpuState::new()),
         }
     }
 }

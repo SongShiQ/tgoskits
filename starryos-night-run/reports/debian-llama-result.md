@@ -1,0 +1,3 @@
+aarch64 PASS
+riscv64 PASS
+x86_64 PASS
