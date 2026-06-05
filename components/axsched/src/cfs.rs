@@ -198,7 +198,7 @@ impl<T> BaseScheduler for CFScheduler<T> {
             let Some((key, _)) = self.ready_queue.first_key_value() else {
                 break None;
             };
-            let key = key.clone();
+            let key = *key;
             let task = self.ready_queue.remove(&key).unwrap();
             if task.is_throttled() {
                 skipped.push((key, task));
