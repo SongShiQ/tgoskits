@@ -1,11 +1,8 @@
 //! cgroup v2 cpu controller.
 //!
-//! Provides file interfaces for cpu.weight and cpu.max, and enforces
-//! CFS bandwidth control via per-period quota tracking.
+//! Provides file interfaces for cpu.weight and cpu.max.
 
-use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-
-use crate::task::AsThread;
+use core::sync::atomic::{AtomicI64, AtomicU64};
 
 /// Per-cgroup cpu.max bandwidth state.
 pub struct BandwidthState {
@@ -48,57 +45,4 @@ impl CpuState {
             bandwidth: BandwidthState::new(),
         }
     }
-}
-
-/// Called on every scheduler timer tick to consume quota and throttle.
-pub fn bandwidth_tick() {
-    let curr = ax_task::current();
-    let Some(thread) = curr.try_as_thread() else {
-        return;
-    };
-    let proc_data = thread.proc_data.clone();
-    let cgroup = proc_data.cgroup.read().clone();
-    let bw = &cgroup.cpu.bandwidth;
-
-    let quota = bw.quota.load(Ordering::Relaxed);
-    if quota < 0 {
-        return;
-    }
-
-    let tick_usec: i64 = 1_000;
-    let tick_usec_u64: u64 = tick_usec as u64;
-
-    // Check period FIRST — if the period advanced, reset consumed
-    // and start a fresh period.  This must happen before consuming
-    // quota so that the quota check sees accumulated time within
-    // a single period.
-    let now_us = now_usec();
-    let period_start = bw.period_start.load(Ordering::Relaxed);
-    if period_start == 0 {
-        bw.period_start.store(now_us, Ordering::Relaxed);
-        return;
-    }
-
-    let period = bw.period.load(Ordering::Relaxed);
-    if now_us.saturating_sub(period_start) >= period as u64 {
-        bw.consumed.store(0, Ordering::Relaxed);
-        bw.period_start.store(now_us, Ordering::Relaxed);
-        bw.nr_periods.fetch_add(1, Ordering::Relaxed);
-        ax_task::set_current_throttled(false);
-        return;
-    }
-
-    // Consume quota AFTER period check
-    let consumed = bw.consumed.fetch_add(tick_usec, Ordering::Relaxed) + tick_usec;
-
-    if consumed >= quota {
-        ax_task::set_current_throttled(true);
-        bw.nr_throttled.fetch_add(1, Ordering::Relaxed);
-        bw.throttled_usec
-            .fetch_add(tick_usec_u64, Ordering::Relaxed);
-    }
-}
-
-fn now_usec() -> u64 {
-    ax_runtime::hal::time::monotonic_time().as_micros() as u64
 }
