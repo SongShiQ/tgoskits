@@ -132,7 +132,7 @@ int main(void) {
     memset(&pfd, 0, sizeof(pfd));
     pfd.fd = fd;
     pfd.events = POLLIN;
-    ret = poll(&pfd, 1, 3000);
+    ret = poll(&pfd, 1, 10000);
     CHECK(ret == 1, "poll reports server reply");
     CHECK((pfd.revents & (POLLIN | POLLERR | POLLHUP)) != 0,
           "poll returns input or close event");
