@@ -20,22 +20,39 @@ impl PidsState {
         }
     }
 
-    /// Check if a new process can be created.
-    pub fn can_fork(&self) -> bool {
-        let max = self.max.load(Ordering::Relaxed);
+    /// Atomically check if a new process can be created and increment the counter.
+    ///
+    /// This uses a CAS loop to eliminate the TOCTOU race between `can_fork()`
+    /// and `fork()` on SMP systems where two CPUs could both pass the check
+    /// and exceed `pids.max`.
+    ///
+    /// Returns `true` if the fork was allowed (counter incremented),
+    /// `false` if the limit would be exceeded.
+    pub fn try_fork(&self) -> bool {
+        let max = self.max.load(Ordering::Acquire);
         if max < 0 {
+            // Unlimited: just increment
+            self.current.fetch_add(1, Ordering::AcqRel);
             return true;
         }
-        self.current.load(Ordering::Relaxed) < max
-    }
-
-    /// Called when a process is created.
-    pub fn fork(&self) {
-        self.current.fetch_add(1, Ordering::Relaxed);
+        loop {
+            let current = self.current.load(Ordering::Acquire);
+            if current >= max {
+                return false;
+            }
+            if self
+                .current
+                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return true;
+            }
+            // CAS failed, retry
+        }
     }
 
     /// Called when a process exits.
     pub fn exit(&self) {
-        self.current.fetch_sub(1, Ordering::Relaxed);
+        self.current.fetch_sub(1, Ordering::AcqRel);
     }
 }
