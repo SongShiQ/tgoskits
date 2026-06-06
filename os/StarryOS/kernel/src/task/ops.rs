@@ -521,18 +521,23 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
 
     let process = &thr.proc_data.proc;
 
-    // Update cgroup: remove process and decrement pids counter
-    {
-        let pid = process.pid();
-        let cgroup = thr.proc_data.cgroup.read().clone();
-        cgroup.procs.lock().retain(|&p| p != pid);
-        cgroup.pids.exit();
-    }
-
     // Use the user-visible TID (`thr.tid()`), not the scheduler ID. After
     // a non-leader `execve`'s de_thread the two differ, and the thread
     // group is keyed by the user-visible TID.
     if process.exit_thread(thr.tid(), exit_code) {
+        // Update cgroup: remove process and decrement pids counter.
+        // Only execute on the last thread exit (inside exit_thread block)
+        // to avoid double-decrement in multi-threaded processes where all
+        // threads share the same ProcessData and cgroup reference.
+        // Reference: Linux kernel/cgroup/cgroup.c cgroup_exit() only runs
+        // for task == leader.
+        {
+            let pid = process.pid();
+            let cgroup = thr.proc_data.cgroup.read().clone();
+            cgroup.procs.lock().retain(|&p| p != pid);
+            cgroup.pids.exit();
+        }
+
         // Close all file descriptors before marking the process as exited.
         // This ensures pipe write ends and other resources are properly released,
         // so parent processes blocking on pipe reads will receive EOF.
