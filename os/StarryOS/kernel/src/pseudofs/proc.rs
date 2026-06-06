@@ -1040,8 +1040,9 @@ impl SimpleDirOps for ThreadDir {
             "cgroup" => {
                 let task = self.task.clone();
                 SimpleFile::new_regular(fs, move || {
-                    let pd = task.upgrade().ok_or(VfsError::NotFound)?;
-                    let cgroup = pd.cgroup.read();
+                    let task = task.upgrade().ok_or(VfsError::NotFound)?;
+                    let proc_data = &task.as_thread().proc_data;
+                    let cgroup = proc_data.cgroup.read();
                     let path = cgroup.path.clone();
                     Ok(format!("0::{}\n", path).into_bytes())
                 })

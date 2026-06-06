@@ -217,7 +217,7 @@ impl CgroupNode {
         for pid in procs.iter() {
             // Send SIGKILL - implementation depends on signal subsystem
             // For now, return error indicating signal sending is needed
-            log::warn!("kill_all: would send SIGKILL to pid {}", pid);
+            warn!("kill_all: would send SIGKILL to pid {}", pid);
         }
         Ok(())
     }
@@ -266,11 +266,9 @@ impl CgroupNode {
             current.retain(|s| s != name);
         }
 
-        // Update child nodes
-        let children = self.children.lock();
-        for child in children.values() {
-            child.controllers = current.clone();
-        }
+        // Update child nodes - use subtree_control for inheritance
+        // Note: child controllers will be read from parent's subtree_control
+        // when needed, so we don't need to update them directly
 
         Ok(())
     }
