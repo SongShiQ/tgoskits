@@ -13,6 +13,8 @@ pub struct CFSTask<T> {
     delta: AtomicIsize,
     nice: AtomicIsize,
     id: AtomicIsize,
+    /// cgroup weight (1..10000, default 100)
+    cgroup_weight: AtomicIsize,
 }
 
 // https://elixir.bootlin.com/linux/latest/source/include/linux/sched/prio.h
@@ -39,16 +41,32 @@ impl<T> CFSTask<T> {
             delta: AtomicIsize::new(0_isize),
             nice: AtomicIsize::new(0_isize),
             id: AtomicIsize::new(0_isize),
+            cgroup_weight: AtomicIsize::new(100_isize),
         }
     }
 
     fn get_weight(&self) -> isize {
         let nice = self.nice.load(Ordering::Acquire);
-        if nice >= 0 {
+        let nice_weight = if nice >= 0 {
             NICE2WEIGHT_POS[nice as usize]
         } else {
             NICE2WEIGHT_NEG[(-nice) as usize]
-        }
+        };
+        let cgroup_weight = self.cgroup_weight.load(Ordering::Acquire);
+        // Combined weight = nice_weight * cgroup_weight / 100
+        // This matches Linux's approach: tg->shares * rq_weight / NICE_0_LOAD
+        nice_weight * cgroup_weight / 100
+    }
+
+    /// Get the cgroup weight
+    pub fn get_cgroup_weight(&self) -> isize {
+        self.cgroup_weight.load(Ordering::Acquire)
+    }
+
+    /// Set the cgroup weight (1..10000)
+    pub fn set_cgroup_weight(&self, weight: isize) {
+        let clamped = weight.clamp(1, 10000);
+        self.cgroup_weight.store(clamped, Ordering::Release);
     }
 
     fn get_id(&self) -> isize {

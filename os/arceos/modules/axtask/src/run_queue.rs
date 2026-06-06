@@ -16,6 +16,22 @@ use crate::{
     wait_queue::WaitQueueGuard,
 };
 
+/// Tick hook function type for cgroup bandwidth accounting.
+#[cfg(feature = "irq")]
+type TickHookFn = fn();
+
+/// Global tick hook for cgroup bandwidth accounting.
+/// Called on each scheduler timer tick before the scheduler's task_tick.
+#[cfg(feature = "irq")]
+static TICK_HOOK: spin::Mutex<Option<TickHookFn>> = spin::Mutex::new(None);
+
+/// Register a tick hook function that will be called on each scheduler timer tick.
+/// This is used for cgroup bandwidth accounting.
+#[cfg(feature = "irq")]
+pub fn set_tick_hook(hook: TickHookFn) {
+    *TICK_HOOK.lock() = Some(hook);
+}
+
 macro_rules! percpu_static {
     ($(
         $(#[$comment:meta])*
@@ -359,6 +375,15 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
 
     #[cfg(feature = "irq")]
     pub fn scheduler_timer_tick(&mut self) {
+        // Call tick hook for cgroup bandwidth accounting (if registered)
+        #[cfg(feature = "irq")]
+        {
+            let hook = TICK_HOOK.lock();
+            if let Some(f) = *hook {
+                f();
+            }
+        }
+
         let curr = &self.current_task;
         if !curr.is_idle() && self.inner.scheduler.lock().task_tick(curr) {
             #[cfg(feature = "preempt")]

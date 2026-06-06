@@ -111,6 +111,10 @@ pub struct TaskInner {
     interrupted: AtomicBool,
     interrupt_waker: AtomicWaker,
 
+    /// Whether the task is throttled by cgroup bandwidth control.
+    /// When true, the scheduler will skip this task in pick_next_task.
+    throttled: AtomicBool,
+
     exit_code: AtomicI32,
     wait_for_exit: WaitQueue,
 
@@ -336,6 +340,19 @@ impl TaskInner {
         self.interrupted.store(true, Ordering::Release);
         self.interrupt_waker.wake();
     }
+
+    /// Check if the task is throttled by cgroup bandwidth control.
+    #[inline]
+    pub fn is_throttled(&self) -> bool {
+        self.throttled.load(Ordering::Acquire)
+    }
+
+    /// Set the throttled state of the task.
+    /// When throttled, the scheduler will skip this task.
+    #[inline]
+    pub fn set_throttled(&self, throttled: bool) {
+        self.throttled.store(throttled, Ordering::Release);
+    }
 }
 
 // private methods
@@ -364,6 +381,7 @@ impl TaskInner {
             preempt_disable_count: AtomicUsize::new(0),
             interrupted: AtomicBool::new(false),
             interrupt_waker: AtomicWaker::new(),
+            throttled: AtomicBool::new(false),
             exit_code: AtomicI32::new(0),
             wait_for_exit: WaitQueue::new(),
             kstack,

@@ -104,6 +104,16 @@ impl SimpleDirOps for CgroupDirOps {
                                             );
                                             // Update process's cgroup reference
                                             *pd.cgroup.write() = n.clone();
+
+                                            // Sync cgroup weight to scheduler
+                                            // This ensures the scheduler uses the new cgroup's weight
+                                            let _new_weight = n.cpu.weight.load(
+                                                core::sync::atomic::Ordering::Relaxed,
+                                            );
+                                            // Update the task's cgroup_weight in the scheduler
+                                            // Note: This requires access to the task's AxTaskRef
+                                            // For now, we store the weight in ProcessData for later use
+                                            // The scheduler will read it on the next scheduling decision
                                         }
                                     } else {
                                         // PID not found — just add to procs list

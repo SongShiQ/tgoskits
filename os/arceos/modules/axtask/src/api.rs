@@ -19,6 +19,9 @@ pub use crate::task::{AxTaskExt, TaskExt};
 #[cfg_attr(doc, doc(cfg(all(feature = "multitask", feature = "irq"))))]
 #[cfg(feature = "irq")]
 pub use crate::timers::register_timer_callback;
+#[cfg_attr(doc, doc(cfg(all(feature = "multitask", feature = "irq"))))]
+#[cfg(feature = "irq")]
+pub use crate::run_queue::set_tick_hook;
 #[cfg_attr(doc, doc(cfg(feature = "multitask")))]
 pub use crate::{
     task::{CurrentTask, TaskId, TaskInner, TaskState},
