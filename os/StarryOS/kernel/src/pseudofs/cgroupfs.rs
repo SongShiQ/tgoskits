@@ -2,6 +2,7 @@
 
 use alloc::{borrow::Cow, boxed::Box, format, string::String, sync::Arc, vec::Vec};
 
+use ax_errno::AxError;
 use axfs_ng_vfs::{Filesystem, VfsResult};
 
 use super::{
@@ -205,35 +206,40 @@ impl SimpleDirOps for CgroupDirOps {
                         SimpleFileOperation::Write(data) => {
                             let s = core::str::from_utf8(data).unwrap_or("").trim();
                             let parts: Vec<&str> = s.split_whitespace().collect();
-                            if !parts.is_empty() {
-                                if parts[0] == "max" {
-                                    n.cpu
-                                        .cfs_quota
-                                        .store(-1, core::sync::atomic::Ordering::Relaxed);
-                                    n.cpu
-                                        .bandwidth
-                                        .quota
-                                        .store(-1, core::sync::atomic::Ordering::Relaxed);
-                                } else if let Ok(quota) = parts[0].parse::<i64>() {
-                                    n.cpu
-                                        .cfs_quota
-                                        .store(quota, core::sync::atomic::Ordering::Relaxed);
-                                    n.cpu
-                                        .bandwidth
-                                        .quota
-                                        .store(quota, core::sync::atomic::Ordering::Relaxed);
-                                }
+                            if parts.is_empty() {
+                                return Err(AxError::InvalidInput);
                             }
-                            if parts.len() > 1
-                                && let Ok(period) = parts[1].parse::<i64>()
-                            {
+                            if parts[0] == "max" {
                                 n.cpu
-                                    .cfs_period
-                                    .store(period, core::sync::atomic::Ordering::Relaxed);
+                                    .cfs_quota
+                                    .store(-1, core::sync::atomic::Ordering::Relaxed);
                                 n.cpu
                                     .bandwidth
-                                    .period
-                                    .store(period, core::sync::atomic::Ordering::Relaxed);
+                                    .quota
+                                    .store(-1, core::sync::atomic::Ordering::Relaxed);
+                            } else if let Ok(quota) = parts[0].parse::<i64>() {
+                                n.cpu
+                                    .cfs_quota
+                                    .store(quota, core::sync::atomic::Ordering::Relaxed);
+                                n.cpu
+                                    .bandwidth
+                                    .quota
+                                    .store(quota, core::sync::atomic::Ordering::Relaxed);
+                            } else {
+                                return Err(AxError::InvalidInput);
+                            }
+                            if parts.len() > 1 {
+                                if let Ok(period) = parts[1].parse::<i64>() {
+                                    n.cpu
+                                        .cfs_period
+                                        .store(period, core::sync::atomic::Ordering::Relaxed);
+                                    n.cpu
+                                        .bandwidth
+                                        .period
+                                        .store(period, core::sync::atomic::Ordering::Relaxed);
+                                } else {
+                                    return Err(AxError::InvalidInput);
+                                }
                             }
                             // Reset consumed on quota/period change
                             n.cpu
