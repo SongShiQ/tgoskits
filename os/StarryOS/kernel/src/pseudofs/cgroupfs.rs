@@ -8,7 +8,7 @@ use super::{
     DirMaker, NodeOpsMux, RwFile, SimpleDir, SimpleDirOps, SimpleFile, SimpleFileOperation,
     SimpleFs,
 };
-use crate::cgroup::GLOBAL_CGROUP_ROOT;
+use crate::cgroup::{GLOBAL_CGROUP_ROOT, CgroupType};
 
 const CGROUP2_MAGIC: u32 = 0x63677270;
 
@@ -43,6 +43,9 @@ impl SimpleDirOps for CgroupDirOps {
             "cgroup.controllers",
             "cgroup.subtree_control",
             "cgroup.type",
+            "cgroup.events",
+            "cgroup.kill",
+            "cgroup.freeze",
             "cgroup.procs",
             "pids.max",
             "pids.current",
@@ -67,8 +70,110 @@ impl SimpleDirOps for CgroupDirOps {
                 let n = self.node.clone();
                 SimpleFile::new_regular(fs, move || Ok(n.controller_list().into_bytes())).into()
             }
-            "cgroup.subtree_control" => SimpleFile::new_regular(fs, || Ok(b"".to_vec())).into(),
-            "cgroup.type" => SimpleFile::new_regular(fs, || Ok(b"domain\n".to_vec())).into(),
+            "cgroup.subtree_control" => {
+                let n = self.node.clone();
+                SimpleFile::new_regular(
+                    fs,
+                    RwFile::new(move |req| match req {
+                        SimpleFileOperation::Read => {
+                            let control = n.subtree_control.lock();
+                            Ok(Some(control.join(" ").into_bytes()))
+                        }
+                        SimpleFileOperation::Write(data) => {
+                            let s = core::str::from_utf8(data).unwrap_or("");
+                            let mut enable = Vec::new();
+                            let mut disable = Vec::new();
+                            
+                            for part in s.split_whitespace() {
+                                if let Some(name) = part.strip_prefix('+') {
+                                    enable.push(name);
+                                } else if let Some(name) = part.strip_prefix('-') {
+                                    disable.push(name);
+                                }
+                            }
+                            
+                            n.set_subtree_control(&enable, &disable)
+                                .map_err(|e| axfs_ng_vfs::VfsError::from(ax_errno::LinuxError::EINVAL))?;
+                            Ok(None)
+                        }
+                    }),
+                )
+                .into()
+            }
+            "cgroup.type" => {
+                let n = self.node.clone();
+                SimpleFile::new_regular(
+                    fs,
+                    RwFile::new(move |req| match req {
+                        SimpleFileOperation::Read => {
+                            let cgroup_type = n.cgroup_type();
+                            Ok(Some(format!("{}\n", cgroup_type.as_str()).into_bytes()))
+                        }
+                        SimpleFileOperation::Write(data) => {
+                            let s = core::str::from_utf8(data).unwrap_or("");
+                            let new_type = CgroupType::from_str(s)
+                                .ok_or(axfs_ng_vfs::VfsError::from(ax_errno::LinuxError::EINVAL))?;
+                            n.set_cgroup_type(new_type)
+                                .map_err(|e| axfs_ng_vfs::VfsError::from(ax_errno::LinuxError::EINVAL))?;
+                            Ok(None)
+                        }
+                    }),
+                )
+                .into()
+            }
+            "cgroup.events" => {
+                let n = self.node.clone();
+                SimpleFile::new_regular(fs, move || {
+                    Ok(n.events.format().into_bytes())
+                })
+                .into()
+            }
+            "cgroup.kill" => {
+                let n = self.node.clone();
+                SimpleFile::new_regular(
+                    fs,
+                    RwFile::new(move |req| match req {
+                        SimpleFileOperation::Read => {
+                            Ok(Some(b"".to_vec()))
+                        }
+                        SimpleFileOperation::Write(data) => {
+                            let s = core::str::from_utf8(data).unwrap_or("").trim();
+                            if s == "1" {
+                                n.kill_all()
+                                    .map_err(|e| axfs_ng_vfs::VfsError::from(ax_errno::LinuxError::EINVAL))?;
+                                Ok(None)
+                            } else {
+                                Err(axfs_ng_vfs::VfsError::from(ax_errno::LinuxError::EINVAL))
+                            }
+                        }
+                    }),
+                )
+                .into()
+            }
+            "cgroup.freeze" => {
+                let n = self.node.clone();
+                SimpleFile::new_regular(
+                    fs,
+                    RwFile::new(move |req| match req {
+                        SimpleFileOperation::Read => {
+                            let frozen = n.freezer.frozen.load(core::sync::atomic::Ordering::Relaxed);
+                            Ok(Some(format!("{}\n", frozen as i32).into_bytes()))
+                        }
+                        SimpleFileOperation::Write(data) => {
+                            let s = core::str::from_utf8(data).unwrap_or("").trim();
+                            match s {
+                                "1" => n.freeze()
+                                    .map_err(|e| axfs_ng_vfs::VfsError::from(ax_errno::LinuxError::EINVAL))?,
+                                "0" => n.thaw()
+                                    .map_err(|e| axfs_ng_vfs::VfsError::from(ax_errno::LinuxError::EINVAL))?,
+                                _ => return Err(axfs_ng_vfs::VfsError::from(ax_errno::LinuxError::EINVAL)),
+                            }
+                            Ok(None)
+                        }
+                    }),
+                )
+                .into()
+            }
             "cgroup.procs" => {
                 let n = self.node.clone();
                 SimpleFile::new_regular(
@@ -120,6 +225,7 @@ impl SimpleDirOps for CgroupDirOps {
                                     }
                                 }
                                 old_cgroup.pids.exit();
+                                old_cgroup.update_populated();
                                 // Add to new cgroup (already counted by try_fork)
                                 {
                                     let mut procs = n.procs.lock();
@@ -127,6 +233,7 @@ impl SimpleDirOps for CgroupDirOps {
                                         procs.push(pid);
                                     }
                                 }
+                                n.update_populated();
                                 // Update process cgroup reference
                                 *pd.cgroup.write() = n.clone();
                             }

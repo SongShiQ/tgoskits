@@ -4,7 +4,7 @@ mod core;
 pub mod cpu;
 pub mod pids;
 
-pub use core::{CgroupNode, GLOBAL_CGROUP_ROOT};
+pub use core::{CgroupNode, CgroupType, CgroupEvents, FreezerState, GLOBAL_CGROUP_ROOT};
 
 /// Initialize the cgroup subsystem. Called once during boot.
 pub fn init() {
