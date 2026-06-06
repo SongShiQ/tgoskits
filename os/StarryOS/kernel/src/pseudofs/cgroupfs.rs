@@ -93,7 +93,7 @@ impl SimpleDirOps for CgroupDirOps {
                             }
                             
                             n.set_subtree_control(&enable, &disable)
-                                .map_err(|e| axfs_ng_vfs::VfsError::from(ax_errno::LinuxError::EINVAL))?;
+                                .map_err(|_e| axfs_ng_vfs::VfsError::from(ax_errno::LinuxError::EINVAL))?;
                             Ok(None)
                         }
                     }),
@@ -114,7 +114,7 @@ impl SimpleDirOps for CgroupDirOps {
                             let new_type = CgroupType::from_str(s)
                                 .ok_or(axfs_ng_vfs::VfsError::from(ax_errno::LinuxError::EINVAL))?;
                             n.set_cgroup_type(new_type)
-                                .map_err(|e| axfs_ng_vfs::VfsError::from(ax_errno::LinuxError::EINVAL))?;
+                                .map_err(|_e| axfs_ng_vfs::VfsError::from(ax_errno::LinuxError::EINVAL))?;
                             Ok(None)
                         }
                     }),
@@ -140,7 +140,7 @@ impl SimpleDirOps for CgroupDirOps {
                             let s = core::str::from_utf8(data).unwrap_or("").trim();
                             if s == "1" {
                                 n.kill_all()
-                                    .map_err(|e| axfs_ng_vfs::VfsError::from(ax_errno::LinuxError::EINVAL))?;
+                                    .map_err(|_e| axfs_ng_vfs::VfsError::from(ax_errno::LinuxError::EINVAL))?;
                                 Ok(None)
                             } else {
                                 Err(axfs_ng_vfs::VfsError::from(ax_errno::LinuxError::EINVAL))
@@ -163,9 +163,9 @@ impl SimpleDirOps for CgroupDirOps {
                             let s = core::str::from_utf8(data).unwrap_or("").trim();
                             match s {
                                 "1" => n.freeze()
-                                    .map_err(|e| axfs_ng_vfs::VfsError::from(ax_errno::LinuxError::EINVAL))?,
+                                    .map_err(|_e| axfs_ng_vfs::VfsError::from(ax_errno::LinuxError::EINVAL))?,
                                 "0" => n.thaw()
-                                    .map_err(|e| axfs_ng_vfs::VfsError::from(ax_errno::LinuxError::EINVAL))?,
+                                    .map_err(|_e| axfs_ng_vfs::VfsError::from(ax_errno::LinuxError::EINVAL))?,
                                 _ => return Err(axfs_ng_vfs::VfsError::from(ax_errno::LinuxError::EINVAL)),
                             }
                             Ok(None)
