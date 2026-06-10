@@ -1,48 +1,47 @@
-//! cgroup v2 cpu controller.
+//! cgroup v2 cpu controller — kernel-side bandwidth tick.
 //!
-//! Provides file interfaces for cpu.weight and cpu.max.
+//! The core CpuState / BandwidthState live in `ax-cgroup`.
+//! This module provides the tick hook that accesses current task / cgroup / time.
 
-use core::sync::atomic::{AtomicI64, AtomicU64};
+use crate::task::AsThread;
 
-/// Per-cgroup cpu.max bandwidth state.
-pub struct BandwidthState {
-    pub quota: AtomicI64,
-    pub period: AtomicI64,
-    pub consumed: AtomicI64,
-    pub nr_periods: AtomicU64,
-    pub nr_throttled: AtomicU64,
-    pub throttled_usec: AtomicU64,
-    pub period_start: AtomicU64,
-}
+/// Tick hook for cgroup bandwidth accounting.
+/// Called on each scheduler timer tick.
+pub fn bandwidth_tick() {
+    let curr = match ax_task::current_may_uninit() {
+        Some(task) => task,
+        None => return,
+    };
 
-impl BandwidthState {
-    pub fn new() -> Self {
-        Self {
-            quota: AtomicI64::new(-1),
-            period: AtomicI64::new(100_000),
-            consumed: AtomicI64::new(0),
-            nr_periods: AtomicU64::new(0),
-            nr_throttled: AtomicU64::new(0),
-            throttled_usec: AtomicU64::new(0),
-            period_start: AtomicU64::new(0),
-        }
+    if curr.name() == "idle" {
+        return;
     }
-}
 
-pub struct CpuState {
-    pub cfs_quota: AtomicI64,
-    pub cfs_period: AtomicI64,
-    pub weight: AtomicI64,
-    pub bandwidth: BandwidthState,
-}
+    let proc_data = match curr.try_as_thread() {
+        Some(thr) => thr.proc_data.clone(),
+        None => return,
+    };
 
-impl CpuState {
-    pub fn new() -> Self {
-        Self {
-            cfs_quota: AtomicI64::new(-1),
-            cfs_period: AtomicI64::new(100_000),
-            weight: AtomicI64::new(100),
-            bandwidth: BandwidthState::new(),
-        }
+    let cgroup = proc_data.cgroup.read().clone();
+
+    if !cgroup.cpu.bandwidth.has_quota() {
+        return;
+    }
+
+    let now = ax_hal::time::monotonic_time_nanos() / 1000;
+    let period_start = cgroup.cpu.bandwidth.period_start.load(core::sync::atomic::Ordering::Acquire);
+    let period = cgroup.cpu.bandwidth.period.load(core::sync::atomic::Ordering::Acquire);
+
+    if now - period_start >= period as u64 {
+        cgroup.cpu.bandwidth.reset_period();
+        cgroup.cpu.bandwidth.period_start.store(now, core::sync::atomic::Ordering::Release);
+        curr.set_throttled(false);
+    }
+
+    let tick_usec = 1000;
+    let throttled = cgroup.cpu.bandwidth.consume(tick_usec);
+
+    if throttled {
+        curr.set_throttled(true);
     }
 }

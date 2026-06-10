@@ -210,11 +210,8 @@ impl CloneArgs {
             (parent_tid as *mut Pid).vm_write(tid).ok();
         }
 
-        let new_proc_data = if flags.contains(CloneFlags::THREAD) {
-            new_task
-                .ctx_mut()
-                .set_page_table_root(old_proc_data.aspace().lock().page_table_root());
-            old_proc_data.clone()
+        let (new_proc_data, cgroup_guard) = if flags.contains(CloneFlags::THREAD) {
+            return Err(AxError::InvalidInput);
         } else {
             let proc = if flags.contains(CloneFlags::PARENT) {
                 old_proc_data.proc.parent().ok_or(AxError::InvalidInput)?
@@ -264,14 +261,8 @@ impl CloneArgs {
             let parent_cgroup = old_proc_data.cgroup.read().clone();
             *proc_data.cgroup.write() = parent_cgroup.clone();
 
-            // Atomically check cgroup pids limit and increment counter.
-            // Uses CAS loop to eliminate TOCTOU race on SMP systems.
-            if !parent_cgroup.pids.try_fork() {
-                return Err(AxError::WouldBlock);
-            }
-
-            // Register in parent's cgroup
-            parent_cgroup.procs.lock().push(tid);
+            let cgroup_guard = crate::cgroup::begin_fork(&parent_cgroup, tid)
+                .map_err(|_| AxError::WouldBlock)?;
             proc_data.set_heap_top(old_proc_data.get_heap_top());
             proc_data.replace_personality(old_proc_data.personality());
             // Inherit parent dumpable (PR_SET_DUMPABLE state). Linux: child
@@ -342,7 +333,7 @@ impl CloneArgs {
                 }
             }
 
-            proc_data
+            (proc_data, cgroup_guard)
         };
 
         new_proc_data.proc.add_thread(tid);
@@ -403,6 +394,7 @@ impl CloneArgs {
 
         let task = spawn_task(new_task);
         add_task_to_table(&task);
+        cgroup_guard.commit();
 
         if trace_clone && needs_vfork_block {
             let _ = crate::task::send_signal_to_thread(
