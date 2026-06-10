@@ -533,9 +533,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) {
         // for task == leader.
         {
             let pid = process.pid();
-            let cgroup = thr.proc_data.cgroup.read().clone();
-            cgroup.procs.lock().retain(|&p| p != pid);
-            cgroup.pids.exit();
+            let _ = crate::cgroup::exit_process(&thr.proc_data, pid);
         }
 
         // Close all file descriptors before marking the process as exited.
