@@ -19,7 +19,6 @@ pub use ax_cgroup::{
 };
 
 mod cpu;
-pub use cpu::bandwidth_tick;
 
 struct KernelCgroupProvider;
 
@@ -48,8 +47,9 @@ pub fn init() {
     ax_cgroup::init();
     register_provider(&KernelCgroupProvider as &'static dyn ax_cgroup::CgroupProvider);
 
-    // Register bandwidth tick hook for CPU bandwidth accounting.
-    ax_task::set_tick_hook(bandwidth_tick);
+    // NOTE: CPU bandwidth tick hook deferred — ax_task::set_tick_hook and
+    // set_throttled APIs are not yet available on dev branch.
+    // ax_task::set_tick_hook(bandwidth_tick);
 
     info!("cgroup: initialized");
 }
