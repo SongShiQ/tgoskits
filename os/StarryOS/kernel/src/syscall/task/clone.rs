@@ -261,8 +261,8 @@ impl CloneArgs {
             let parent_cgroup = old_proc_data.cgroup.read().clone();
             *proc_data.cgroup.write() = parent_cgroup.clone();
 
-            let cgroup_guard = crate::cgroup::begin_fork(&parent_cgroup, tid)
-                .map_err(|_| AxError::WouldBlock)?;
+            let cgroup_guard =
+                crate::cgroup::begin_fork(&parent_cgroup, tid).map_err(|_| AxError::WouldBlock)?;
             proc_data.set_heap_top(old_proc_data.get_heap_top());
             proc_data.replace_personality(old_proc_data.personality());
             // Inherit parent dumpable (PR_SET_DUMPABLE state). Linux: child

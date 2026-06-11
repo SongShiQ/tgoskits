@@ -1,4 +1,8 @@
-use alloc::{string::{String, ToString}, sync::Arc, vec::Vec};
+use alloc::{
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 use core::any::Any;
 
 use ax_errno::LinuxError;
@@ -170,7 +174,10 @@ impl CgroupDir {
         let mode = if read_only { 0o444 } else { 0o644 };
         let file = SpecialFsFile::new_regular_with_perm(
             self.fs.clone(),
-            ControllerAttrFile { id: self.id, name: name.to_string() },
+            ControllerAttrFile {
+                id: self.id,
+                name: name.to_string(),
+            },
             NodePermission::from_bits_truncate(mode),
         );
         let reference = Reference::new(self.this.upgrade(), name.to_string());

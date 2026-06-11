@@ -8,13 +8,12 @@ use alloc::{
     vec::Vec,
 };
 
+use ::core::sync::atomic::{AtomicU64, Ordering};
 use ax_kspin::SpinNoIrq;
 use ax_lazyinit::LazyInit;
 use axfs_ng_vfs::{VfsError, VfsResult};
 
-use super::{cpu::CpuState, pids::PidsState, CgroupId, ROOT_ID};
-
-use ::core::sync::atomic::{AtomicU64, Ordering};
+use super::{CgroupId, ROOT_ID, cpu::CpuState, pids::PidsState};
 
 static NEXT_CGROUP_ID: AtomicU64 = AtomicU64::new(ROOT_ID + 1);
 static CGROUP_REGISTRY: LazyInit<SpinNoIrq<BTreeMap<CgroupId, Weak<CgroupNode>>>> = LazyInit::new();
@@ -51,7 +50,10 @@ impl CgroupNode {
             path: "/".to_string(),
             children: SpinNoIrq::new(BTreeMap::new()),
             procs: SpinNoIrq::new(Vec::new()),
-            controllers: ["pids", "cpu"].iter().map(|name| name.to_string()).collect(),
+            controllers: ["pids", "cpu"]
+                .iter()
+                .map(|name| name.to_string())
+                .collect(),
             subtree_control: SpinNoIrq::new(Vec::new()),
             parent: None,
             pids: Arc::new(PidsState::new()),

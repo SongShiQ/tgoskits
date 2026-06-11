@@ -2,8 +2,9 @@
 //!
 //! Limits the number of processes in a cgroup.
 
-use ax_errno::{AxError, AxResult};
 use core::sync::atomic::{AtomicI64, Ordering};
+
+use ax_errno::{AxError, AxResult};
 
 /// Per-cgroup pids state.
 pub struct PidsState {
@@ -11,6 +12,12 @@ pub struct PidsState {
     pub current: AtomicI64,
     /// Maximum allowed (-1 = unlimited).
     pub max: AtomicI64,
+}
+
+impl Default for PidsState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PidsState {
@@ -22,13 +29,6 @@ impl PidsState {
     }
 
     /// Atomically check if a new process can be created and increment the counter.
-    ///
-    /// This uses a CAS loop to eliminate the TOCTOU race between `can_fork()`
-    /// and `fork()` on SMP systems where two CPUs could both pass the check
-    /// and exceed `pids.max`.
-    ///
-    /// Returns `true` if the fork was allowed (counter incremented),
-    /// `false` if the limit would be exceeded.
     pub fn try_fork(&self) -> bool {
         self.try_charge_local().is_ok()
     }
@@ -37,7 +37,6 @@ impl PidsState {
     pub fn try_charge_local(&self) -> AxResult<()> {
         let max = self.max.load(Ordering::Acquire);
         if max < 0 {
-            // Unlimited: just increment
             self.current.fetch_add(1, Ordering::AcqRel);
             return Ok(());
         }
@@ -53,7 +52,6 @@ impl PidsState {
             {
                 return Ok(());
             }
-            // CAS failed, retry
         }
     }
 
