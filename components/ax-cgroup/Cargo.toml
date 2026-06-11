@@ -8,6 +8,7 @@ description = "cgroup v2 subsystem for StarryOS"
 keywords = ["arceos", "cgroup", "starry"]
 categories = ["no-std", "os"]
 license = "Apache-2.0"
+readme = "README.md"
 
 [dependencies]
 ax-errno = { workspace = true }
