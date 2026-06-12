@@ -2,11 +2,11 @@
  * cgroup-cpu — Verify cgroup v2 cpu controller enforcement.
  *
  * Tests:
- *   1. cpu.weight: file I/O, range clamping, default value
+ *   1. cpu.weight: file I/O, range validation, default value
  *   2. cpu.max:   file I/O, quota/period parsing, default value
  *   3. cpu.stat:  file I/O, initial zero values
  *   4. Child cgroup cpu files: independent per-cgroup settings
- *   5. cpu.weight clamping:   values outside 1..10000 are clamped
+ *   5. cpu.weight reject: values outside 1..10000 are rejected (EINVAL)
  *   6. cpu.weight scheduling: higher weight → more CPU time (TDD)
  *   7. cpu.max:   quota/period I/O (enforcement deferred)
  *   8. cpu.max "max" means unlimited
@@ -158,17 +158,29 @@ static void test_cpu_weight_io(void)
 /* ================================================================
  * Test 2: cpu.weight clamping (1..10000)
  * ================================================================ */
-static void test_cpu_weight_clamping(void)
+static void test_cpu_weight_reject_out_of_range(void)
 {
-    expect_write_ok(CGROUP_ROOT "/cpu.weight", "0", "write cpu.weight = 0");
-    expect_int(CGROUP_ROOT "/cpu.weight", 1, "cpu.weight clamps 0 to 1");
+    /* Save original value */
+    int original = read_int(CGROUP_ROOT "/cpu.weight");
+    CHECK(original == 100, "cpu.weight default is 100 before out-of-range test");
 
-    expect_write_ok(CGROUP_ROOT "/cpu.weight", "-100", "write cpu.weight = -100");
-    expect_int(CGROUP_ROOT "/cpu.weight", 1, "cpu.weight clamps -100 to 1");
+    /* Out-of-range writes should fail with EINVAL (Linux cgroup v2 semantics) */
+    errno = 0;
+    int ret = write_text(CGROUP_ROOT "/cpu.weight", "0");
+    CHECK(ret != 0 && errno == EINVAL, "cpu.weight rejects 0 (out of range 1..10000)");
+    expect_int(CGROUP_ROOT "/cpu.weight", original, "cpu.weight unchanged after reject 0");
 
-    expect_write_ok(CGROUP_ROOT "/cpu.weight", "99999", "write cpu.weight = 99999");
-    expect_int(CGROUP_ROOT "/cpu.weight", 10000, "cpu.weight clamps 99999 to 10000");
+    errno = 0;
+    ret = write_text(CGROUP_ROOT "/cpu.weight", "-100");
+    CHECK(ret != 0 && errno == EINVAL, "cpu.weight rejects -100 (out of range 1..10000)");
+    expect_int(CGROUP_ROOT "/cpu.weight", original, "cpu.weight unchanged after reject -100");
 
+    errno = 0;
+    ret = write_text(CGROUP_ROOT "/cpu.weight", "99999");
+    CHECK(ret != 0 && errno == EINVAL, "cpu.weight rejects 99999 (out of range 1..10000)");
+    expect_int(CGROUP_ROOT "/cpu.weight", original, "cpu.weight unchanged after reject 99999");
+
+    /* Restore default (should succeed) */
     expect_write_ok(CGROUP_ROOT "/cpu.weight", "100", "restore cpu.weight = 100");
 }
 
@@ -354,7 +366,7 @@ int main(void)
     TEST_START("cgroup-cpu");
 
     test_cpu_weight_io();
-    test_cpu_weight_clamping();
+    test_cpu_weight_reject_out_of_range();
     test_cpu_max_io();
     test_cpu_stat_io();
     test_child_cpu_independent();

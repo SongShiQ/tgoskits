@@ -12,6 +12,7 @@ use starry_signal::Signo;
 use starry_vm::VmMutPtr;
 
 use crate::{
+    cgroup::CgroupForkGuard,
     file::{FD_TABLE, FileLike, PidFd, close_file_like},
     mm::copy_from_kernel,
     task::{AsThread, ProcessData, ProcessImage, Thread, add_task_to_table, new_user_task},
@@ -211,7 +212,12 @@ impl CloneArgs {
         }
 
         let (new_proc_data, cgroup_guard) = if flags.contains(CloneFlags::THREAD) {
-            return Err(AxError::InvalidInput);
+            // CLONE_THREAD: share ProcessData/cgroup, no new process charge.
+            // Threads live in the same process and cgroup, so no begin_fork/commit needed.
+            new_task
+                .ctx_mut()
+                .set_page_table_root(old_proc_data.aspace().lock().page_table_root());
+            (old_proc_data.clone(), None)
         } else {
             let proc = if flags.contains(CloneFlags::PARENT) {
                 old_proc_data.proc.parent().ok_or(AxError::InvalidInput)?
@@ -333,7 +339,7 @@ impl CloneArgs {
                 }
             }
 
-            (proc_data, cgroup_guard)
+            (proc_data, Some(cgroup_guard))
         };
 
         new_proc_data.proc.add_thread(tid);
@@ -394,7 +400,9 @@ impl CloneArgs {
 
         let task = spawn_task(new_task);
         add_task_to_table(&task);
-        cgroup_guard.commit();
+        if let Some(guard) = cgroup_guard {
+            guard.commit();
+        }
 
         if trace_clone && needs_vfork_block {
             let _ = crate::task::send_signal_to_thread(
