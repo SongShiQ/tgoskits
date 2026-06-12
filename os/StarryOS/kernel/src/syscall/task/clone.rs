@@ -12,7 +12,6 @@ use starry_signal::Signo;
 use starry_vm::VmMutPtr;
 
 use crate::{
-    cgroup::CgroupForkGuard,
     file::{FD_TABLE, FileLike, PidFd, close_file_like},
     mm::copy_from_kernel,
     task::{AsThread, ProcessData, ProcessImage, Thread, add_task_to_table, new_user_task},
