@@ -12,6 +12,9 @@ use ax_memory_addr::VirtAddr;
 
 #[cfg(feature = "lockdep")]
 pub use crate::lockdep::{HeldLock, HeldLockStack};
+#[cfg_attr(doc, doc(cfg(all(feature = "multitask", feature = "irq"))))]
+#[cfg(feature = "irq")]
+pub use crate::run_queue::set_tick_hook;
 pub(crate) use crate::run_queue::{current_run_queue, select_run_queue, select_wake_run_queue};
 #[cfg_attr(doc, doc(cfg(all(feature = "multitask", feature = "task-ext"))))]
 #[cfg(feature = "task-ext")]
@@ -19,9 +22,6 @@ pub use crate::task::{AxTaskExt, TaskExt};
 #[cfg_attr(doc, doc(cfg(all(feature = "multitask", feature = "irq"))))]
 #[cfg(feature = "irq")]
 pub use crate::timers::register_timer_callback;
-#[cfg_attr(doc, doc(cfg(all(feature = "multitask", feature = "irq"))))]
-#[cfg(feature = "irq")]
-pub use crate::run_queue::set_tick_hook;
 #[cfg_attr(doc, doc(cfg(feature = "multitask")))]
 pub use crate::{
     task::{CurrentTask, TaskId, TaskInner, TaskState},

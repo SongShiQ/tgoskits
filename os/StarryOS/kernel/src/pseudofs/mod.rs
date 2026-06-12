@@ -1,6 +1,6 @@
 //! Basic virtual filesystem support
 
-pub(crate) mod cgroup;
+pub(crate) mod cgroupfs;
 pub mod debug;
 pub mod dev;
 mod device;
@@ -100,7 +100,7 @@ pub fn mount_all() -> LinuxResult<()> {
 
     mount_at(&fs, "/sys", sysfs::new_sysfs())?;
 
-    mount_at(&fs, "/cgroup", cgroup::new_cgroup2fs())?;
+    mount_at(&fs, "/cgroup", cgroupfs::new_cgroupfs())?;
     #[cfg(feature = "plat-dyn")]
     mount_at(&fs, "/sys/bus/usb", usbfs::new_bus_usb_sysfs())?;
 

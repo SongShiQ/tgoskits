@@ -79,7 +79,10 @@ pub fn init(args: &[String], envs: &[String]) {
         false,
     );
 
-    crate::cgroup::attach_initial_process(pid as u32).expect("Failed to attach init to cgroup");
+    // Register init process in cgroup root
+    if let Some(root) = crate::cgroup::GLOBAL_CGROUP_ROOT.get() {
+        root.procs.lock().push(pid as u32);
+    }
 
     {
         let mut scope = proc.scope.write();
