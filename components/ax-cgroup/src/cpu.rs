@@ -3,7 +3,12 @@
 //! Provides file interfaces for cpu.weight and cpu.max.
 //! Implements bandwidth throttling via tick hook.
 
+use alloc::{format, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+
+use axfs_ng_vfs::{VfsError, VfsResult};
+
+use super::controller::{AttrInfo, CgroupController, CgroupControllerFactory, write_to_buf};
 
 /// Per-cgroup cpu.max bandwidth state.
 pub struct BandwidthState {
@@ -104,4 +109,167 @@ pub fn bandwidth_tick() {
     // it needs access to ax_task::current_may_uninit, AsThread, and ax_hal::time.
     //
     // See kernel/src/cgroup/cpu.rs for the kernel-side implementation.
+}
+
+// ── Controller instance ──────────────────────────────────────────────
+
+const CPU_ATTRS: &[AttrInfo] = &[
+    AttrInfo {
+        name: "weight",
+        read_only: false,
+    },
+    AttrInfo {
+        name: "max",
+        read_only: false,
+    },
+    AttrInfo {
+        name: "stat",
+        read_only: true,
+    },
+];
+
+/// Per-node cpu controller instance.
+pub struct CpuController {
+    state: Arc<CpuState>,
+}
+
+impl CpuController {
+    pub fn new(state: Arc<CpuState>) -> Self {
+        Self { state }
+    }
+
+    /// Access the underlying cpu state (for bandwidth_tick hook).
+    pub fn state(&self) -> &Arc<CpuState> {
+        &self.state
+    }
+}
+
+impl CgroupController for CpuController {
+    fn name(&self) -> &str {
+        "cpu"
+    }
+
+    fn is_domain(&self) -> bool {
+        true
+    }
+
+    fn read_attr(&self, name: &str, offset: usize, buf: &mut [u8]) -> VfsResult<usize> {
+        let value = match name {
+            "weight" => format!("{}\n", self.state.weight.load(Ordering::Acquire)),
+            "max" => {
+                let quota = self.state.cfs_quota.load(Ordering::Acquire);
+                let period = self.state.cfs_period.load(Ordering::Acquire);
+                if quota < 0 {
+                    format!("max {}\n", period)
+                } else {
+                    format!("{} {}\n", quota, period)
+                }
+            }
+            "stat" => {
+                let bw = &self.state.bandwidth;
+                format!(
+                    "nr_periods {}\nnr_throttled {}\nthrottled_usec {}\n",
+                    bw.nr_periods.load(Ordering::Acquire),
+                    bw.nr_throttled.load(Ordering::Acquire),
+                    bw.throttled_usec.load(Ordering::Acquire),
+                )
+            }
+            _ => return Err(VfsError::NotFound),
+        };
+        write_to_buf(&value, offset, buf)
+    }
+
+    fn write_attr(&self, name: &str, data: &[u8]) -> VfsResult<usize> {
+        let text = core::str::from_utf8(data)
+            .map_err(|_| VfsError::InvalidInput)?
+            .trim();
+        match name {
+            "weight" => {
+                let value = text.parse::<i64>().map_err(|_| VfsError::InvalidInput)?;
+                if !(1..=10_000).contains(&value) {
+                    return Err(VfsError::InvalidInput);
+                }
+                self.state.weight.store(value, Ordering::Release);
+                Ok(data.len())
+            }
+            "max" => {
+                write_cpu_max(&self.state, text)?;
+                Ok(data.len())
+            }
+            "stat" => Err(VfsError::OperationNotPermitted),
+            _ => Err(VfsError::NotFound),
+        }
+    }
+
+    fn attr_names(&self) -> &[AttrInfo] {
+        CPU_ATTRS
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+/// Write cpu.max value with validation.
+/// Accepts 1 part (quota only, reuse period) or 2 parts (quota period).
+fn write_cpu_max(state: &CpuState, text: &str) -> VfsResult<()> {
+    let parts = text.split_whitespace().collect::<Vec<_>>();
+    if parts.is_empty() || parts.len() > 2 {
+        return Err(VfsError::InvalidInput);
+    }
+    let quota = if parts[0] == "max" {
+        -1
+    } else {
+        let quota = parts[0]
+            .parse::<i64>()
+            .map_err(|_| VfsError::InvalidInput)?;
+        if quota <= 0 {
+            return Err(VfsError::InvalidInput);
+        }
+        quota
+    };
+    let period = if parts.len() == 2 {
+        let period = parts[1]
+            .parse::<i64>()
+            .map_err(|_| VfsError::InvalidInput)?;
+        if !(1_000..=1_000_000).contains(&period) {
+            return Err(VfsError::InvalidInput);
+        }
+        period
+    } else {
+        state.cfs_period.load(Ordering::Acquire)
+    };
+
+    state.cfs_quota.store(quota, Ordering::Release);
+    state.cfs_period.store(period, Ordering::Release);
+    state.bandwidth.quota.store(quota, Ordering::Release);
+    state.bandwidth.period.store(period, Ordering::Release);
+    state.bandwidth.consumed.store(0, Ordering::Release);
+    state.bandwidth.period_start.store(0, Ordering::Release);
+    Ok(())
+}
+
+// ── Factory ──────────────────────────────────────────────────────────
+
+/// Global factory for cpu controllers.
+pub struct CpuControllerFactory;
+
+impl CgroupControllerFactory for CpuControllerFactory {
+    fn name(&self) -> &str {
+        "cpu"
+    }
+
+    fn is_domain(&self) -> bool {
+        true
+    }
+
+    fn attr_names(&self) -> &[AttrInfo] {
+        CPU_ATTRS
+    }
+
+    fn new_instance(&self) -> Arc<dyn CgroupController> {
+        Arc::new(CpuController {
+            state: Arc::new(CpuState::new()),
+        })
+    }
 }

@@ -13,13 +13,16 @@ use ax_kspin::SpinNoIrq;
 use ax_lazyinit::LazyInit;
 use axfs_ng_vfs::{VfsError, VfsResult};
 
-use super::{CgroupId, ROOT_ID, cpu::CpuState, pids::PidsState};
+use super::{
+    CgroupId, ROOT_ID,
+    controller::{self, CgroupController},
+    pids::{PidsController, PidsState},
+};
 
 static NEXT_CGROUP_ID: AtomicU64 = AtomicU64::new(ROOT_ID + 1);
 static CGROUP_REGISTRY: LazyInit<SpinNoIrq<BTreeMap<CgroupId, Weak<CgroupNode>>>> = LazyInit::new();
 
 /// A cgroup node in the hierarchy.
-#[allow(dead_code)]
 pub struct CgroupNode {
     /// Stable cgroup id used by cgroupfs VFS entries.
     pub id: CgroupId,
@@ -31,37 +34,54 @@ pub struct CgroupNode {
     pub children: SpinNoIrq<BTreeMap<String, Arc<CgroupNode>>>,
     /// PIDs in this cgroup.
     pub procs: SpinNoIrq<Vec<u32>>,
-    /// Controllers available for this cgroup to enable for children.
-    pub controllers: Vec<String>,
+    /// Controller instances (name → instance). Immutable after creation.
+    pub controllers: BTreeMap<String, Arc<dyn CgroupController>>,
     /// Controllers enabled for child cgroups via cgroup.subtree_control.
     pub subtree_control: SpinNoIrq<Vec<String>>,
     /// Parent (None for root).
     pub parent: Option<Weak<CgroupNode>>,
-    /// Pids controller state.
+    /// Pids controller state — direct reference for fork fast path.
+    /// This is the same `Arc<PidsState>` held inside the PidsController instance.
     pub pids: Arc<PidsState>,
-    pub cpu: Arc<CpuState>,
 }
 
 impl CgroupNode {
     pub fn new_root() -> Arc<Self> {
+        let mut controllers = BTreeMap::new();
+
+        // Create pids controller from factory
+        if let Some(factory) = controller::get_factory("pids") {
+            controllers.insert("pids".to_string(), factory.new_instance());
+        }
+
+        // Create cpu controller from factory
+        if let Some(factory) = controller::get_factory("cpu") {
+            controllers.insert("cpu".to_string(), factory.new_instance());
+        }
+
+        // Extract PidsState for fork fast path
+        let pids = controllers
+            .get("pids")
+            .and_then(|ctrl| ctrl.as_any().downcast_ref::<PidsController>())
+            .map(|ctrl| ctrl.state().clone())
+            .unwrap_or_else(|| Arc::new(PidsState::new()));
+
         Arc::new(Self {
             id: ROOT_ID,
             name: String::new(),
             path: "/".to_string(),
             children: SpinNoIrq::new(BTreeMap::new()),
             procs: SpinNoIrq::new(Vec::new()),
-            controllers: ["pids", "cpu"]
-                .iter()
-                .map(|name| name.to_string())
-                .collect(),
+            controllers,
             subtree_control: SpinNoIrq::new(Vec::new()),
             parent: None,
-            pids: Arc::new(PidsState::new()),
-            cpu: Arc::new(CpuState::new()),
+            pids,
         })
     }
 
     /// Create a child cgroup under this node.
+    ///
+    /// Controllers are created based on parent's `subtree_control` setting.
     pub fn create_child(self: &Arc<Self>, name: &str) -> VfsResult<Arc<CgroupNode>> {
         let mut children = self.children.lock();
         if children.contains_key(name) {
@@ -73,17 +93,32 @@ impl CgroupNode {
             format!("{}/{}", self.path, name)
         };
         let id = NEXT_CGROUP_ID.fetch_add(1, Ordering::AcqRel);
+
+        // Create controllers based on parent's subtree_control
+        let mut controllers = BTreeMap::new();
+        for ctrl_name in self.subtree_control.lock().iter() {
+            if let Some(factory) = controller::get_factory(ctrl_name) {
+                controllers.insert(ctrl_name.clone(), factory.new_instance());
+            }
+        }
+
+        // Extract PidsState for fork fast path
+        let pids = controllers
+            .get("pids")
+            .and_then(|ctrl| ctrl.as_any().downcast_ref::<PidsController>())
+            .map(|ctrl| ctrl.state().clone())
+            .unwrap_or_else(|| Arc::new(PidsState::new()));
+
         let child = Arc::new(CgroupNode {
             id,
             name: name.to_string(),
             path: child_path,
             children: SpinNoIrq::new(BTreeMap::new()),
             procs: SpinNoIrq::new(Vec::new()),
-            controllers: Vec::new(),
+            controllers,
             subtree_control: SpinNoIrq::new(Vec::new()),
             parent: Some(Arc::downgrade(self)),
-            pids: Arc::new(PidsState::new()),
-            cpu: Arc::new(CpuState::new()),
+            pids,
         });
         children.insert(name.to_string(), child.clone());
         register_node(&child);
@@ -93,7 +128,11 @@ impl CgroupNode {
     /// List controller names.
     pub fn controller_list(&self) -> String {
         if self.id == ROOT_ID {
-            self.controllers.join(" ")
+            self.controllers
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" ")
         } else {
             self.parent
                 .as_ref()
