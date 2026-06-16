@@ -6,6 +6,7 @@
 //! - Re-exports for backward compatibility
 
 use alloc::sync::Arc;
+use axfs_ng_vfs::{VfsError, VfsResult};
 
 pub use ax_cgroup::{
     CgroupId, CgroupNode, GLOBAL_CGROUP_ROOT, all_attr_names, attach_initial_process,
@@ -32,10 +33,11 @@ impl ax_cgroup::CgroupProvider for KernelCgroupProvider {
             .map(|pd| pd.cgroup.read().clone())
     }
 
-    fn set_cgroup(&self, pid: u32, cgroup: Arc<CgroupNode>) {
-        if let Ok(pd) = crate::task::get_process_data(pid as _) {
-            *pd.cgroup.write() = cgroup;
-        }
+    fn set_cgroup(&self, pid: u32, cgroup: Arc<CgroupNode>) -> VfsResult<()> {
+        let pd = crate::task::get_process_data(pid as _)
+            .map_err(|_| VfsError::NotFound)?;
+        *pd.cgroup.write() = cgroup;
+        Ok(())
     }
 }
 

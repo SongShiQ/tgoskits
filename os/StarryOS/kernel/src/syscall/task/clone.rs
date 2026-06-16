@@ -211,7 +211,10 @@ impl CloneArgs {
         }
 
         let (new_proc_data, cgroup_guard) = if flags.contains(CloneFlags::THREAD) {
-            return Err(AxError::InvalidInput);
+            // Thread: share parent's ProcessData, no cgroup pids charge.
+            // Threads belong to the same process and share cgroup membership;
+            // only the process leader's PID appears in cgroup.procs.
+            (old_proc_data.clone(), None)
         } else {
             let proc = if flags.contains(CloneFlags::PARENT) {
                 old_proc_data.proc.parent().ok_or(AxError::InvalidInput)?
@@ -252,6 +255,7 @@ impl CloneArgs {
                 aspace,
                 signal_actions,
                 exit_signal,
+                curr_thread.tid(),
                 flags.contains(CloneFlags::VM),
             );
             proc_data.set_umask(old_proc_data.umask());
@@ -333,7 +337,7 @@ impl CloneArgs {
                 }
             }
 
-            (proc_data, cgroup_guard)
+            (proc_data, Some(cgroup_guard))
         };
 
         new_proc_data.proc.add_thread(tid);
@@ -392,9 +396,15 @@ impl CloneArgs {
             new_proc_data.set_ptrace_stop(tid, starry_signal::Signo::SIGSTOP, &new_uctx);
         }
 
+        // Commit cgroup membership BEFORE making the child runnable.
+        // This prevents the SMP race where the child could exit before
+        // commit(), causing pids.current to leak.
+        if let Some(guard) = cgroup_guard {
+            guard.commit();
+        }
+
         let task = spawn_task(new_task);
         add_task_to_table(&task);
-        cgroup_guard.commit();
 
         if trace_clone && needs_vfork_block {
             let _ = crate::task::send_signal_to_thread(

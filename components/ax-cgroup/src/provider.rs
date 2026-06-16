@@ -5,6 +5,7 @@
 //! `crate::task::*` directly.
 
 use alloc::{boxed::Box, sync::Arc};
+use axfs_ng_vfs::{VfsError, VfsResult};
 
 use crate::CgroupNode;
 
@@ -21,7 +22,7 @@ pub trait CgroupProvider: Send + Sync {
     fn get_cgroup(&self, pid: u32) -> Option<Arc<CgroupNode>>;
 
     /// Set the cgroup assignment of a process.
-    fn set_cgroup(&self, pid: u32, cgroup: Arc<CgroupNode>);
+    fn set_cgroup(&self, pid: u32, cgroup: Arc<CgroupNode>) -> VfsResult<()>;
 }
 
 /// Internal cell for the provider singleton.
@@ -51,10 +52,21 @@ impl ProviderCell {
         }
     }
 
-    pub fn set(&self, provider: &'static dyn CgroupProvider) {
+    pub fn set(&self, provider: &'static dyn CgroupProvider) -> VfsResult<()> {
         let slot = Box::into_raw(Box::new(ProviderSlot { provider }));
-        self.inner
-            .store(slot, core::sync::atomic::Ordering::Release);
+        let old = self.inner.compare_exchange(
+            core::ptr::null_mut(),
+            slot,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        );
+        if old.is_err() {
+            unsafe {
+                drop(Box::from_raw(slot));
+            }
+            return Err(VfsError::AlreadyExists);
+        }
+        Ok(())
     }
 
     pub fn get(&self) -> Option<&'static dyn CgroupProvider> {

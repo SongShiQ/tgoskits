@@ -280,8 +280,13 @@ fn remove_process_from_node(node: &CgroupNode, pid: u32) -> bool {
 pub fn attach_initial_process(pid: u32) -> VfsResult<()> {
     let mut membership = MEMBERSHIP.get().ok_or(VfsError::BadState)?.lock();
     let root = core::get_node(root_id())?;
-    charge_path(&path_to_root(root.clone()))?;
-    add_process_to_node(&root, pid);
+
+    // Idempotency: if pid is already in root.procs, skip charge to
+    // avoid double-counting pids.current.
+    if !root.procs.lock().contains(&pid) {
+        charge_path(&path_to_root(root.clone()))?;
+        add_process_to_node(&root, pid);
+    }
     membership.detached_pids.remove(&pid);
     Ok(())
 }
@@ -381,7 +386,12 @@ pub fn migrate_process(pid: u32, target_id: CgroupId) -> VfsResult<()> {
             return Err(VfsError::NoSuchProcess);
         }
         add_process_to_node(&target, pid);
-        provider.set_cgroup(pid, target);
+        provider.set_cgroup(pid, target).map_err(|e| {
+            remove_process_from_node(&target, pid);
+            add_process_to_node(&old, pid);
+            uncharge_path(&target_path[..target_unique_len]);
+            e
+        })?;
         membership.detached_pids.remove(&pid);
         uncharge_path(&old_path[..old_unique_len]);
         Ok(())
