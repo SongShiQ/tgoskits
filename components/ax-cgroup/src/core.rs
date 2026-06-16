@@ -13,7 +13,7 @@ use ax_kspin::SpinNoIrq;
 use ax_lazyinit::LazyInit;
 use axfs_ng_vfs::{VfsError, VfsResult};
 
-use super::{CgroupId, ROOT_ID, cpu::CpuState, pids::PidsState};
+use super::{controller, CgroupId, ROOT_ID, cpu, pids::PidsState};
 
 static NEXT_CGROUP_ID: AtomicU64 = AtomicU64::new(ROOT_ID + 1);
 static CGROUP_REGISTRY: LazyInit<SpinNoIrq<BTreeMap<CgroupId, Weak<CgroupNode>>>> = LazyInit::new();
@@ -31,33 +31,43 @@ pub struct CgroupNode {
     pub children: SpinNoIrq<BTreeMap<String, Arc<CgroupNode>>>,
     /// PIDs in this cgroup.
     pub procs: SpinNoIrq<Vec<u32>>,
-    /// Controllers available for this cgroup to enable for children.
-    pub controllers: Vec<String>,
+    /// Dynamic controller instances (used for attribute dispatch).
+    pub controllers: BTreeMap<String, Arc<dyn controller::CgroupController>>,
     /// Controllers enabled for child cgroups via cgroup.subtree_control.
     pub subtree_control: SpinNoIrq<Vec<String>>,
     /// Parent (None for root).
     pub parent: Option<Weak<CgroupNode>>,
-    /// Pids controller state.
+    /// Pids controller state (fast path for fork).
     pub pids: Arc<PidsState>,
-    pub cpu: Arc<CpuState>,
 }
 
 impl CgroupNode {
     pub fn new_root() -> Arc<Self> {
+        // 创建所有已注册的控制器实例
+        let mut controllers = BTreeMap::new();
+        for factory_name in controller::all_factory_names() {
+            if let Some(factory) = controller::get_factory(&factory_name) {
+                controllers.insert(factory_name, factory.new_instance());
+            }
+        }
+
+        // 获取 pids 控制器的快速访问引用
+        let pids = controllers
+            .get("pids")
+            .and_then(|ctrl| ctrl.as_any().downcast_ref::<pids::PidsController>())
+            .map(|ctrl| ctrl.state().clone())
+            .unwrap_or_else(|| Arc::new(PidsState::new()));
+
         Arc::new(Self {
             id: ROOT_ID,
             name: String::new(),
             path: "/".to_string(),
             children: SpinNoIrq::new(BTreeMap::new()),
             procs: SpinNoIrq::new(Vec::new()),
-            controllers: ["pids", "cpu"]
-                .iter()
-                .map(|name| name.to_string())
-                .collect(),
+            controllers,
             subtree_control: SpinNoIrq::new(Vec::new()),
             parent: None,
-            pids: Arc::new(PidsState::new()),
-            cpu: Arc::new(CpuState::new()),
+            pids,
         })
     }
 
@@ -73,18 +83,72 @@ impl CgroupNode {
             format!("{}/{}", self.path, name)
         };
         let id = NEXT_CGROUP_ID.fetch_add(1, Ordering::AcqRel);
+
+        // 根据父节点的 subtree_control 创建子节点的控制器
+        let subtree_control = self.subtree_control.lock();
+        let mut controllers = BTreeMap::new();
+
+        for ctrl_name in subtree_control.iter() {
+            if let Some(factory) = controller::get_factory(ctrl_name) {
+                controllers.insert(ctrl_name.clone(), factory.new_instance());
+            }
+        }
+
+        // pids 控制器始终创建（用于 fork 计费）
+        if !controllers.contains_key("pids") {
+            if let Some(factory) = controller::get_factory("pids") {
+                controllers.insert("pids".to_string(), factory.new_instance());
+            }
+        }
+
+        // 获取 pids 快速访问引用
+        let pids = controllers
+            .get("pids")
+            .and_then(|ctrl| ctrl.as_any().downcast_ref::<pids::PidsController>())
+            .map(|ctrl| ctrl.state().clone())
+            .unwrap_or_else(|| Arc::new(PidsState::new()));
+
         let child = Arc::new(CgroupNode {
             id,
             name: name.to_string(),
             path: child_path,
             children: SpinNoIrq::new(BTreeMap::new()),
             procs: SpinNoIrq::new(Vec::new()),
-            controllers: Vec::new(),
+            controllers,
             subtree_control: SpinNoIrq::new(Vec::new()),
             parent: Some(Arc::downgrade(self)),
-            pids: Arc::new(PidsState::new()),
-            cpu: Arc::new(CpuState::new()),
+            pids,
         });
+
+        // 新增：继承 cpuset 掩码
+        if let Some(parent_cpuset) = self.controllers.get("cpuset") {
+            if let Some(parent_ctrl) = parent_cpuset
+                .as_any()
+                .downcast_ref::<super::cpuset::CpusetController>()
+            {
+                if let Some(child_cpuset) = child.controllers.get("cpuset") {
+                    if let Some(child_ctrl) = child_cpuset
+                        .as_any()
+                        .downcast_ref::<super::cpuset::CpusetController>()
+                    {
+                        // 继承父节点掩码（subset 约束）
+                        let parent_cpus = parent_ctrl.state().cpus.load(Ordering::Acquire);
+                        let parent_mems = parent_ctrl.state().mems.load(Ordering::Acquire);
+                        child_ctrl.state().cpus.store(parent_cpus, Ordering::Release);
+                        child_ctrl.state().mems.store(parent_mems, Ordering::Release);
+                        child_ctrl
+                            .state()
+                            .cpus_effective
+                            .store(parent_cpus, Ordering::Release);
+                        child_ctrl
+                            .state()
+                            .mems_effective
+                            .store(parent_mems, Ordering::Release);
+                    }
+                }
+            }
+        }
+
         children.insert(name.to_string(), child.clone());
         register_node(&child);
         Ok(child)
@@ -93,8 +157,14 @@ impl CgroupNode {
     /// List controller names.
     pub fn controller_list(&self) -> String {
         if self.id == ROOT_ID {
-            self.controllers.join(" ")
+            // 根节点：从 controllers map 获取
+            self.controllers
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" ")
         } else {
+            // 子节点：从父节点的 subtree_control 获取
             self.parent
                 .as_ref()
                 .and_then(Weak::upgrade)

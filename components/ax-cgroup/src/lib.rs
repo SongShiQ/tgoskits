@@ -9,8 +9,12 @@
 
 extern crate alloc;
 
+pub mod controller;
+pub mod cpuset;
 mod core;
 pub mod cpu;
+pub mod io;
+pub mod memory;
 pub mod pids;
 pub mod provider;
 
@@ -41,34 +45,6 @@ const BUILTIN_FILES: &[&str] = &[
     "cgroup.type",
 ];
 
-struct AttrInfo {
-    name: &'static str,
-    read_only: bool,
-}
-
-const CONTROLLER_ATTRS: &[AttrInfo] = &[
-    AttrInfo {
-        name: "pids.max",
-        read_only: false,
-    },
-    AttrInfo {
-        name: "pids.current",
-        read_only: true,
-    },
-    AttrInfo {
-        name: "cpu.weight",
-        read_only: false,
-    },
-    AttrInfo {
-        name: "cpu.max",
-        read_only: false,
-    },
-    AttrInfo {
-        name: "cpu.stat",
-        read_only: true,
-    },
-];
-
 struct MembershipState {
     detached_pids: BTreeSet<u32>,
     pending_pids: BTreeMap<u32, CgroupId>,
@@ -80,13 +56,24 @@ static PROVIDER: LazyInit<provider::ProviderCell> = LazyInit::new();
 
 /// Initialize the cgroup subsystem. Called once during boot.
 pub fn init() {
+    // 初始化全局工厂注册表
+    controller::init_registry();
+
     MEMBERSHIP.init_once(SpinNoIrq::new(MembershipState {
         detached_pids: BTreeSet::new(),
         pending_pids: BTreeMap::new(),
     }));
     core::init();
     PROVIDER.init_once(provider::ProviderCell::new());
-    info!("cgroup: initialized");
+
+    // 注册控制器工厂
+    controller::register_factory(Arc::new(pids::PidsControllerFactory));
+    controller::register_factory(Arc::new(cpu::CpuControllerFactory));
+    controller::register_factory(Arc::new(cpuset::CpusetControllerFactory));
+    controller::register_factory(Arc::new(memory::MemoryControllerFactory));
+    controller::register_factory(Arc::new(io::IoControllerFactory));
+
+    info!("cgroup: initialized with registry");
 }
 
 /// Register the kernel provider. Must be called after [`init`].
@@ -413,39 +400,71 @@ pub fn exit_process(pid: u32) -> VfsResult<()> {
 
 pub fn all_attr_names(id: CgroupId) -> VfsResult<Vec<String>> {
     let node = core::get_node(id)?;
-    Ok(CONTROLLER_ATTRS
-        .iter()
-        .filter(|attr| attr_available(&node, attr.name))
-        .map(|attr| attr.name.to_string())
-        .collect())
+    let mut names = Vec::new();
+
+    for (ctrl_name, ctrl) in node.controllers.iter() {
+        if controller_available(&node, ctrl_name) {
+            for attr in ctrl.attr_names() {
+                // 拼接完整属性名：控制器名.属性名
+                names.push(format!("{}.{}", ctrl_name, attr.name));
+            }
+        }
+    }
+
+    Ok(names)
 }
 
 pub fn is_controller_attr(id: CgroupId, name: &str) -> VfsResult<bool> {
     let node = core::get_node(id)?;
-    Ok(CONTROLLER_ATTRS
-        .iter()
-        .any(|attr| attr.name == name && attr_available(&node, name)))
+
+    // 解析属性名
+    let (ctrl_name, attr_name) = match controller::parse_attr_name(name) {
+        Some(pair) => pair,
+        None => return Ok(false),
+    };
+
+    // 检查控制器是否可用
+    if !controller_available(&node, ctrl_name) {
+        return Ok(false);
+    }
+
+    // 检查属性是否存在于该控制器
+    if let Some(ctrl) = node.controllers.get(ctrl_name) {
+        Ok(ctrl.attr_names().iter().any(|a| a.name == attr_name))
+    } else {
+        Ok(false)
+    }
 }
 
-pub fn attr_is_read_only(id: CgroupId, name: &str) -> VfsResult<Option<bool>> {
-    ensure_node_exists(id)?;
-    Ok(CONTROLLER_ATTRS
-        .iter()
-        .find(|attr| attr.name == name)
-        .map(|attr| attr.read_only))
+pub fn attr_is_read_only(id: CgroupId, name: &str) -> VfsResult<bool> {
+    let node = core::get_node(id)?;
+
+    let (ctrl_name, attr_name) = controller::parse_attr_name(name)
+        .ok_or(VfsError::NotFound)?;
+
+    if let Some(ctrl) = node.controllers.get(ctrl_name) {
+        Ok(ctrl
+            .attr_names()
+            .iter()
+            .any(|a| a.name == attr_name && a.read_only))
+    } else {
+        Err(VfsError::NotFound)
+    }
 }
 
 pub fn is_interface_file_name(name: &str) -> bool {
-    BUILTIN_FILES.contains(&name) || CONTROLLER_ATTRS.iter().any(|attr| attr.name == name)
-}
+    // 检查是否是内置文件
+    if BUILTIN_FILES.contains(&name) {
+        return true;
+    }
 
-fn attr_owner(name: &str) -> Option<&str> {
-    name.split_once('.').map(|(owner, _)| owner)
+    // 检查是否是控制器属性（简化版，不需要 node）
+    controller::parse_attr_name(name).is_some()
 }
 
 fn controller_available(node: &CgroupNode, name: &str) -> bool {
     if node.id == root_id() {
-        return node.controllers.iter().any(|controller| controller == name);
+        return node.controllers.contains_key(name);
     }
     node.parent
         .as_ref()
@@ -459,102 +478,62 @@ fn controller_available(node: &CgroupNode, name: &str) -> bool {
         })
 }
 
-fn attr_available(node: &CgroupNode, name: &str) -> bool {
-    let Some(owner) = attr_owner(name) else {
-        return false;
-    };
-    controller_available(node, owner)
-}
-
 pub fn read_attr_at(id: CgroupId, name: &str, offset: usize, buf: &mut [u8]) -> VfsResult<usize> {
+    let node = core::get_node(id)?;
+
+    // 检查是否是控制器属性
     if !is_controller_attr(id, name)? {
         return Err(VfsError::NotFound);
     }
-    let value = match name {
-        "pids.max" => {
-            let max = core::get_node(id)?.pids.max.load(Ordering::Acquire);
-            if max < 0 {
-                "max\n".to_string()
-            } else {
-                format!("{}\n", max)
-            }
-        }
-        "pids.current" => format!(
-            "{}\n",
-            core::get_node(id)?.pids.current.load(Ordering::Acquire)
-        ),
-        "cpu.weight" => format!(
-            "{}\n",
-            core::get_node(id)?.cpu.weight.load(Ordering::Acquire)
-        ),
-        "cpu.max" => {
-            let node = core::get_node(id)?;
-            let quota = node.cpu.cfs_quota.load(Ordering::Acquire);
-            let period = node.cpu.cfs_period.load(Ordering::Acquire);
-            if quota < 0 {
-                format!("max {}\n", period)
-            } else {
-                format!("{} {}\n", quota, period)
-            }
-        }
-        "cpu.stat" => {
-            let node = core::get_node(id)?;
-            let bw = &node.cpu.bandwidth;
-            format!(
-                "nr_periods {}\nnr_throttled {}\nthrottled_usec {}\n",
-                bw.nr_periods.load(Ordering::Acquire),
-                bw.nr_throttled.load(Ordering::Acquire),
-                bw.throttled_usec.load(Ordering::Acquire),
-            )
-        }
-        _ => return Err(VfsError::NotFound),
-    };
 
-    let bytes = value.as_bytes();
-    if offset >= bytes.len() {
-        return Ok(0);
+    // 解析属性名（支持多点格式，如 "cpu.stat.periods"）
+    let (ctrl_name, attr_name) = controller::parse_attr_name(name)
+        .ok_or(VfsError::NotFound)?;
+
+    // 检查控制器是否可用
+    if !controller_available(&node, ctrl_name) {
+        return Err(VfsError::NotFound);
     }
-    let remaining = &bytes[offset..];
-    let n = remaining.len().min(buf.len());
-    buf[..n].copy_from_slice(&remaining[..n]);
-    Ok(n)
+
+    // 从节点的控制器实例分发
+    let controller = node
+        .controllers
+        .get(ctrl_name)
+        .ok_or(VfsError::NotFound)?;
+    controller.read_attr(attr_name, offset, buf)
 }
 
 pub fn write_attr(id: CgroupId, name: &str, data: &[u8]) -> VfsResult<usize> {
     let node = core::get_node(id)?;
+
+    // 检查是否是控制器属性
     if !is_controller_attr(id, name)? {
         return Err(VfsError::NotFound);
     }
-    let text = str::from_utf8(data)
-        .map_err(|_| VfsError::InvalidInput)?
-        .trim();
-    match name {
-        "pids.max" => {
-            let value = if text == "max" {
-                -1
-            } else {
-                text.parse::<i64>().map_err(|_| VfsError::InvalidInput)?
-            };
-            if text != "max" && value < 0 {
-                return Err(VfsError::InvalidInput);
-            }
-            node.pids.max.store(value, Ordering::Release);
-        }
-        "pids.current" | "cpu.stat" => return Err(VfsError::OperationNotPermitted),
-        "cpu.weight" => {
-            let value = text.parse::<i64>().map_err(|_| VfsError::InvalidInput)?;
-            if !(1..=10_000).contains(&value) {
-                return Err(VfsError::InvalidInput);
-            }
-            node.cpu.weight.store(value, Ordering::Release);
-        }
-        "cpu.max" => write_cpu_max(&node, text)?,
-        _ => return Err(VfsError::NotFound),
+
+    // 检查是否只读
+    if attr_is_read_only(id, name)? {
+        return Err(VfsError::OperationNotPermitted);
     }
-    Ok(data.len())
+
+    // 解析属性名
+    let (ctrl_name, attr_name) = controller::parse_attr_name(name)
+        .ok_or(VfsError::NotFound)?;
+
+    // 检查控制器是否可用
+    if !controller_available(&node, ctrl_name) {
+        return Err(VfsError::NotFound);
+    }
+
+    // 从节点的控制器实例分发
+    let controller = node
+        .controllers
+        .get(ctrl_name)
+        .ok_or(VfsError::NotFound)?;
+    controller.write_attr(attr_name, data)
 }
 
-fn write_cpu_max(node: &CgroupNode, text: &str) -> VfsResult<()> {
+// 删除 write_cpu_max 辅助函数（已合并到 CpuController 内部）
     let parts = text.split_whitespace().collect::<Vec<_>>();
     if parts.is_empty() || parts.len() > 2 {
         return Err(VfsError::InvalidInput);

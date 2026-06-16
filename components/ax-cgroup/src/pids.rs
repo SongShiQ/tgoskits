@@ -2,9 +2,13 @@
 //!
 //! Limits the number of processes in a cgroup.
 
+use alloc::{format, sync::Arc};
 use core::sync::atomic::{AtomicI64, Ordering};
 
 use ax_errno::{AxError, AxResult};
+use axfs_ng_vfs::{VfsError, VfsResult};
+
+use super::controller::{AttrInfo, CgroupController, CgroupControllerFactory, write_to_buf};
 
 /// Per-cgroup pids state.
 pub struct PidsState {
@@ -80,5 +84,109 @@ impl PidsState {
                 return;
             }
         }
+    }
+}
+
+// ── Controller instance ──────────────────────────────────────────────
+
+/// Pids 控制器支持的属性
+const PIDS_ATTRS: &[AttrInfo] = &[
+    AttrInfo {
+        name: "max",
+        read_only: false,
+    },
+    AttrInfo {
+        name: "current",
+        read_only: true,
+    },
+];
+
+/// Pids 控制器实例（per-node）
+pub struct PidsController {
+    state: Arc<PidsState>,
+}
+
+impl PidsController {
+    /// 创建新实例
+    pub fn new(state: Arc<PidsState>) -> Self {
+        Self { state }
+    }
+
+    /// 获取内部状态（用于 fork 快速路径）
+    pub fn state(&self) -> &Arc<PidsState> {
+        &self.state
+    }
+}
+
+impl CgroupController for PidsController {
+    fn name(&self) -> &str {
+        "pids"
+    }
+
+    fn read_attr(&self, name: &str, offset: usize, buf: &mut [u8]) -> VfsResult<usize> {
+        let value = match name {
+            "max" => {
+                let max = self.state.max.load(Ordering::Acquire);
+                if max < 0 {
+                    "max\n".to_string()
+                } else {
+                    format!("{}\n", max)
+                }
+            }
+            "current" => format!("{}\n", self.state.current.load(Ordering::Acquire)),
+            _ => return Err(VfsError::NotFound),
+        };
+        write_to_buf(&value, offset, buf)
+    }
+
+    fn write_attr(&self, name: &str, data: &[u8]) -> VfsResult<usize> {
+        let text = core::str::from_utf8(data)
+            .map_err(|_| VfsError::InvalidInput)?
+            .trim();
+        match name {
+            "max" => {
+                let value = if text == "max" {
+                    -1
+                } else {
+                    text.parse::<i64>().map_err(|_| VfsError::InvalidInput)?
+                };
+                if text != "max" && value < 0 {
+                    return Err(VfsError::InvalidInput);
+                }
+                self.state.max.store(value, Ordering::Release);
+                Ok(data.len())
+            }
+            "current" => Err(VfsError::OperationNotPermitted),
+            _ => Err(VfsError::NotFound),
+        }
+    }
+
+    fn attr_names(&self) -> &[AttrInfo] {
+        PIDS_ATTRS
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+// ── Factory ──────────────────────────────────────────────────────────
+
+/// Pids 控制器工厂
+pub struct PidsControllerFactory;
+
+impl CgroupControllerFactory for PidsControllerFactory {
+    fn name(&self) -> &str {
+        "pids"
+    }
+
+    fn attr_names(&self) -> &[AttrInfo] {
+        PIDS_ATTRS
+    }
+
+    fn new_instance(&self) -> Arc<dyn CgroupController> {
+        Arc::new(PidsController {
+            state: Arc::new(PidsState::new()),
+        })
     }
 }
