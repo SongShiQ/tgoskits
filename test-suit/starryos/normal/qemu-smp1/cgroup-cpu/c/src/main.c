@@ -353,6 +353,11 @@ int main(void)
 {
     TEST_START("cgroup-cpu");
 
+    /* Enable +cpu in root subtree_control so child cgroups
+     * expose cpu.weight / cpu.max / cpu.stat files. */
+    expect_write_ok(CGROUP_ROOT "/cgroup.subtree_control", "+cpu",
+                    "enable +cpu in root subtree_control");
+
     test_cpu_weight_io();
     test_cpu_weight_clamping();
     test_cpu_max_io();

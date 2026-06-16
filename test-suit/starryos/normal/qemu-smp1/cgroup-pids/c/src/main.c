@@ -232,6 +232,11 @@ static void test_child_pids_limit(void)
     char path[256];
     char buf[64];
 
+    /* Enable +pids in root subtree_control so child cgroups
+     * expose pids.max / pids.current files. */
+    expect_write_ok(CGROUP_ROOT "/cgroup.subtree_control", "+pids",
+                    "enable +pids in root subtree_control");
+
     /* Create child cgroup */
     errno = 0;
     int ret = mkdir(CGROUP_CHILD, 0755);
@@ -526,6 +531,10 @@ static void test_nested_cgroup_isolation(void)
 {
     char path[256];
     char parent_path[256], child_path[256];
+
+    /* Enable +pids in root subtree_control for nested test */
+    expect_write_ok(CGROUP_ROOT "/cgroup.subtree_control", "+pids",
+                    "enable +pids in root subtree_control for nested test");
 
     /* Create parent and child cgroups */
     snprintf(parent_path, sizeof(parent_path), "%s/nest-parent", CGROUP_ROOT);
