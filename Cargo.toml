@@ -15,6 +15,7 @@ resolver = "3"
 members = [
     "apps/starry/orangepi-5-plus-uvc/uvc-fps",
 
+    "components/aic8800",
     "components/ax-cgroup",
     "components/ax-lazyinit",
     "components/axbacktrace",
@@ -135,7 +136,7 @@ arm_vgic = { version = "0.4.12", path = "virtualization/arm_vgic" }
 ax-alloc = { version = "0.8.3", path = "os/arceos/modules/axalloc", default-features = false }
 ax-allocator = { version = "0.5.3", path = "memory/axallocator" }
 ax-cgroup = { version = "0.1.0", path = "components/ax-cgroup" }
-ax-api = { version = "0.5.19", path = "os/arceos/api/arceos_api" }
+ax-api = { version = "0.6.0", path = "os/arceos/api/arceos_api" }
 ax-arm-pl031 = { version = "0.4.7", path = "drivers/rtc/arm_pl031" }
 ax-cap-access = { version = "0.3.5", path = "components/cap_access" }
 ax-config = { version = "0.5.13", path = "os/arceos/modules/axconfig" }

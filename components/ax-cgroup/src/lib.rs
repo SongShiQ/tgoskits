@@ -94,7 +94,8 @@ pub fn register_provider(provider: &'static dyn CgroupProvider) {
     PROVIDER
         .get()
         .expect("cgroup not initialized")
-        .set(provider);
+        .set(provider)
+        .expect("cgroup provider already registered");
 }
 
 fn with_provider<F, R>(f: F) -> VfsResult<R>
@@ -386,11 +387,10 @@ pub fn migrate_process(pid: u32, target_id: CgroupId) -> VfsResult<()> {
             return Err(VfsError::NoSuchProcess);
         }
         add_process_to_node(&target, pid);
-        provider.set_cgroup(pid, target).map_err(|e| {
+        provider.set_cgroup(pid, target.clone()).inspect_err(|_| {
             remove_process_from_node(&target, pid);
             add_process_to_node(&old, pid);
             uncharge_path(&target_path[..target_unique_len]);
-            e
         })?;
         membership.detached_pids.remove(&pid);
         uncharge_path(&old_path[..old_unique_len]);

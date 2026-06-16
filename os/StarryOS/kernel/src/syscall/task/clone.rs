@@ -214,6 +214,9 @@ impl CloneArgs {
             // Thread: share parent's ProcessData, no cgroup pids charge.
             // Threads belong to the same process and share cgroup membership;
             // only the process leader's PID appears in cgroup.procs.
+            new_task
+                .ctx_mut()
+                .set_page_table_root(old_proc_data.aspace().lock().page_table_root());
             (old_proc_data.clone(), None)
         } else {
             let proc = if flags.contains(CloneFlags::PARENT) {
@@ -423,7 +426,7 @@ impl CloneArgs {
         // Block the parent until the child exec's or exits.
         if needs_vfork_block {
             new_proc_data.wait_vfork_done();
-            let _ = super::ptrace::ptrace_notify_vfork_done(parent_pid, parent_tid, tid as Pid);
+            let _ = super::ptrace::ptrace_notify_vfork_done(parent_pid, tid as Pid, tid as Pid);
         }
 
         Ok(tid as _)
