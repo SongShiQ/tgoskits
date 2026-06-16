@@ -24,6 +24,7 @@ extern crate std;
 mod config;
 mod consts;
 mod device;
+mod dhcp_server;
 mod general;
 mod listen_table;
 /// Socket option types and the [`Configurable`](options::Configurable) trait.
@@ -47,13 +48,17 @@ mod wrapper;
 
 use alloc::{borrow::ToOwned, boxed::Box, vec, vec::Vec};
 use core::{
+    future::poll_fn,
     net::IpAddr,
     sync::atomic::{AtomicBool, Ordering},
+    task::Poll,
     time::Duration,
 };
 
 use ax_errno::{AxError, AxResult, ax_err_type};
 use ax_sync::Mutex;
+use ax_task::future::block_on;
+use axpoll::PollSet;
 use smoltcp::{
     socket::dns::{self, GetQueryResultError, StartQueryError},
     wire::{DnsQueryType, EthernetAddress, IpAddress, Ipv4Address, Ipv4Cidr},
@@ -89,6 +94,20 @@ static SOCKET_SET: LazyLock<SocketSetWrapper> = LazyLock::new(SocketSetWrapper::
 static SERVICE: Once<Mutex<Service>> = Once::new();
 static POLLING_INTERFACES: AtomicBool = AtomicBool::new(false);
 static POLL_AGAIN: AtomicBool = AtomicBool::new(false);
+
+/// Registry of wireless control-plane handles, keyed by interface name.
+///
+/// Populated when a wireless device is registered (the runtime captures a
+/// [`rd_net::WifiControlHandle`] before the `Net` is consumed into the data-plane
+/// driver). Lets runtime mode switching (e.g. a StarryOS wireless-extensions
+/// `ioctl`) reach the device's [`WifiControl`] by name.
+static WIFI_CONTROLS: LazyLock<Mutex<Vec<(alloc::string::String, rd_net::WifiControlHandle)>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Signalled by [`notify_oob_rx`] to wake the out-of-band RX poll task, for
+/// devices whose RX arrives outside the ethernet IRQ framework (e.g. SDIO).
+static OOB_RX_SIGNAL: PollSet = PollSet::new();
+static OOB_POLL_TASK_STARTED: AtomicBool = AtomicBool::new(false);
 
 const DHCP_BOOTSTRAP_ATTEMPTS: usize = 200;
 const DHCP_BOOTSTRAP_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -250,6 +269,196 @@ pub fn poll_interfaces() {
 
 pub fn arp_entries() -> Vec<ArpEntry> {
     get_service().arp_entries()
+}
+
+/// Stack-agnostic configuration for registering an already-wrapped ethernet
+/// device with a static IPv4 and optional services.
+///
+/// This carries no notion of "Wi-Fi" or "SoftAP" — it is the generic policy the
+/// protocol stack applies. Link-type-specific policy (e.g. a SoftAP's choice of
+/// addresses and DHCP-server lease) is decided by the caller (board/runtime) and
+/// passed in as data.
+pub struct NetConfig {
+    /// Interface name (e.g. `"wlan0"`).
+    pub name: alloc::string::String,
+    /// This interface's static address / gateway.
+    pub ip: [u8; 4],
+    pub prefix_len: u8,
+    /// If set, run a built-in DHCP server handing out this single address.
+    pub dhcp_server_client_ip: Option<[u8; 4]>,
+    /// Spawn a dedicated poll task woken via [`notify_oob_rx`]. Needed for
+    /// out-of-band RX devices (e.g. SDIO) that sit outside the ethernet IRQ
+    /// framework.
+    pub dedicated_poll: bool,
+}
+
+/// Registers an already-wrapped ethernet device with a static IPv4 and the
+/// services described by `config`. The network service must already be
+/// initialized (via [`init_network`]).
+///
+/// This is the generic, link-type-agnostic registration entry point. A SoftAP
+/// is just one caller that fills in a static IP + DHCP server + dedicated poll.
+pub fn register_device_with_config(dev: Box<dyn EthernetDriver>, config: NetConfig) {
+    let server_ip = Ipv4Address::new(config.ip[0], config.ip[1], config.ip[2], config.ip[3]);
+    let cidr = Ipv4Cidr::new(server_ip, config.prefix_len);
+
+    let mac = EthernetAddress(dev.mac_address());
+    // A dedicated-poll device gets RX out-of-band (via `notify_oob_rx` →
+    // `wake_rx`), so its socket wakers must be armed even though it has no
+    // ethernet IRQ registration.
+    let eth_dev = if config.dedicated_poll {
+        EthernetDevice::new_oob_rx(config.name.clone(), dev, Some(cidr))
+    } else {
+        EthernetDevice::new(config.name.clone(), dev, Some(cidr))
+    };
+
+    {
+        let mut s = get_service();
+        let dev_idx = s.register_static_device(config.name.clone(), eth_dev, cidr);
+        if let Some(client) = config.dhcp_server_client_ip {
+            let client_ip = Ipv4Address::new(client[0], client[1], client[2], client[3]);
+            let subnet_mask = prefix_to_mask(config.prefix_len);
+            s.enable_dhcp_server(dev_idx, server_ip, client_ip, subnet_mask);
+        }
+    }
+
+    info!("{}: up, mac {mac}, ip {cidr}", config.name);
+    if config.dedicated_poll {
+        start_oob_poll_task(config.name);
+    }
+}
+
+/// Registers a wireless control-plane handle under an interface name.
+///
+/// Called by the runtime when adapting a wireless net device, *before* the
+/// `Net` is consumed into the data-plane driver, so the control plane stays
+/// reachable by name for runtime mode switching.
+pub fn register_wifi_control(name: &str, handle: rd_net::WifiControlHandle) {
+    let mut controls = WIFI_CONTROLS.lock();
+    if let Some(entry) = controls.iter_mut().find(|(n, _)| n == name) {
+        entry.1 = handle;
+    } else {
+        controls.push((name.into(), handle));
+    }
+}
+
+/// Target role for a runtime Wi-Fi mode switch.
+pub enum WifiMode<'a> {
+    /// Station: associate to `ssid`/`password`, then use DHCP for addressing.
+    Station { ssid: &'a str, password: &'a str },
+    /// Open SoftAP on `channel`, static `ip`/`prefix_len`, optionally running a
+    /// single-client DHCP server handing out `dhcp_client_ip`.
+    AccessPoint {
+        ssid: &'a [u8],
+        channel: u8,
+        ip: [u8; 4],
+        prefix_len: u8,
+        dhcp_client_ip: Option<[u8; 4]>,
+    },
+}
+
+/// Atomically switches a wireless interface between STA and SoftAP at runtime.
+///
+/// This is the single entry point the OS layer (e.g. a StarryOS wireless-
+/// extensions `SIOCSIWCOMMIT` handler) calls after staging the desired config.
+/// It performs the whole transition in order:
+///
+/// 1. Drive the link-layer switch through the device's `WifiControl` (the chip
+///    driver tears down the old VIF and brings up the new one).
+/// 2. Reconfigure this interface's IPv4 / DHCP role in the protocol stack
+///    (STA → DHCP client, AP → static IP + optional DHCP server).
+///
+/// Both halves run from the caller's task context, never from the RX poll
+/// task, so the blocking firmware command path cannot deadlock the stack.
+///
+/// Returns [`AxError::NoSuchDevice`] if `name` has no registered wireless
+/// control plane, or [`AxError::Unsupported`] if the link-layer switch fails.
+pub fn reconfigure_wifi(name: &str, mode: WifiMode<'_>) -> AxResult<()> {
+    // 1. Link-layer switch through the device control plane, plus the device's
+    //    (possibly new) MAC. The registry lock is released before touching the
+    //    stack service to avoid holding two locks across the blocking path.
+    let mac = {
+        let controls = WIFI_CONTROLS.lock();
+        let (_, handle) = controls
+            .iter()
+            .find(|(n, _)| n == name)
+            .ok_or(AxError::NoSuchDevice)?;
+        let ctrl = handle.wifi_control().ok_or(AxError::NoSuchDevice)?;
+        match &mode {
+            WifiMode::Station { ssid, password } => ctrl
+                .connect(ssid, password)
+                .map_err(|_| ax_err_type!(Unsupported, "wifi STA connect failed"))?,
+            WifiMode::AccessPoint { ssid, channel, .. } => ctrl
+                .start_ap_open(ssid, *channel)
+                .map_err(|_| ax_err_type!(Unsupported, "wifi SoftAP start failed"))?,
+        }
+        EthernetAddress(handle.mac_address())
+    };
+
+    // 2. Reconfigure the stack's IPv4 / DHCP role for this interface.
+    {
+        let mut service = get_service();
+        let dev = service.device_index(name).ok_or(AxError::NoSuchDevice)?;
+        match mode {
+            WifiMode::Station { .. } => service.reconfigure_as_sta(dev, mac),
+            WifiMode::AccessPoint {
+                ip,
+                prefix_len,
+                dhcp_client_ip,
+                ..
+            } => {
+                let server_ip = Ipv4Address::new(ip[0], ip[1], ip[2], ip[3]);
+                let client_ip = dhcp_client_ip.map(|c| Ipv4Address::new(c[0], c[1], c[2], c[3]));
+                service.reconfigure_as_ap(dev, server_ip, prefix_len, client_ip);
+            }
+        }
+    }
+
+    // Kick a poll so the new addressing takes effect immediately.
+    poll_interfaces();
+    info!("{name}: wifi mode switch complete");
+    Ok(())
+}
+
+/// Wakes the out-of-band RX poll task; intended as a device RX-data callback.
+///
+/// A device whose RX path sits outside the ethernet IRQ framework (e.g. an SDIO
+/// chip owning its own card interrupt) registers this as its RX callback. It
+/// only signals here; the dedicated poll task does the actual stack polling, so
+/// the device's RX thread is never blocked on the stack.
+pub fn notify_oob_rx() {
+    OOB_RX_SIGNAL.wake();
+}
+
+/// Spawns the out-of-band RX poll task (idempotent across all such devices).
+///
+/// `ifname` names the task (e.g. `wlan0` → `wlan0-poll`). One shared task drives
+/// `poll_interfaces()` for every dedicated-poll device, woken by [`notify_oob_rx`].
+fn start_oob_poll_task(ifname: alloc::string::String) {
+    if OOB_POLL_TASK_STARTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    ax_task::spawn_with_name(
+        || {
+            block_on(poll_fn(|cx| {
+                // Register first to avoid lost wakeups.
+                OOB_RX_SIGNAL.register(cx.waker());
+                poll_interfaces();
+                get_service().wake_all_devices();
+                Poll::<()>::Pending
+            }));
+        },
+        alloc::format!("{ifname}-poll"),
+    );
+}
+
+fn prefix_to_mask(prefix_len: u8) -> Ipv4Address {
+    let bits: u32 = if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix_len.min(32) as u32)
+    };
+    Ipv4Address::from_bits(bits)
 }
 
 pub fn eth0_ipv4_config() -> Option<Ipv4InterfaceConfig> {

@@ -4,7 +4,7 @@ use core::{
     task::{Context, Waker},
 };
 
-use ax_hal::time::{NANOS_PER_MICROS, TimeValue, wall_time_nanos};
+use ax_hal::time::{NANOS_PER_MICROS, TimeValue, monotonic_time_nanos, wall_time_nanos};
 use ax_task::future::sleep_until;
 use smoltcp::{
     iface::{Interface, SocketSet},
@@ -18,11 +18,12 @@ use smoltcp::{
 };
 
 use crate::{
-    SOCKET_SET, config::Ipv4InterfaceConfig, consts::STANDARD_MTU, device::ArpEntry, router::Router,
+    SOCKET_SET, config::Ipv4InterfaceConfig, consts::STANDARD_MTU, device::ArpEntry,
+    dhcp_server::DhcpServer, router::Router,
 };
 
 fn now() -> Instant {
-    Instant::from_micros_const((wall_time_nanos() / NANOS_PER_MICROS) as i64)
+    Instant::from_micros_const((monotonic_time_nanos() / NANOS_PER_MICROS) as i64)
 }
 
 pub struct Service {
@@ -30,6 +31,7 @@ pub struct Service {
     router: Router,
     timeout: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
     dhcp: Option<DhcpState>,
+    dhcp_server: Option<DhcpServer>,
     static_dns: Vec<Ipv4Address>,
 }
 
@@ -207,6 +209,7 @@ impl Service {
             router,
             timeout: None,
             dhcp: None,
+            dhcp_server: None,
             static_dns,
         }
     }
@@ -214,6 +217,96 @@ impl Service {
     pub fn enable_dhcp(&mut self, dev: usize, mac: EthernetAddress) {
         self.dhcp = Some(DhcpState::new(dev, mac));
         info!("eth0: DHCP enabled");
+    }
+
+    /// 注册一个带静态 IPv4 的设备(如 SoftAP 接口),返回设备索引。
+    pub fn register_static_device(
+        &mut self,
+        name: alloc::string::String,
+        dev: crate::device::EthernetDevice,
+        cidr: Ipv4Cidr,
+    ) -> usize {
+        let dev_idx = self.router.add_device(Box::new(dev));
+        self.router.set_ipv4_config(dev_idx, Some(cidr), None);
+        Self::set_interface_ipv4(&mut self.iface, None, Some(cidr));
+        info!("{name}: static ip {cidr}");
+        dev_idx
+    }
+
+    /// 在指定设备上启用内置 DHCP 服务器(SoftAP 给客户端分配地址)。
+    pub fn enable_dhcp_server(
+        &mut self,
+        dev: usize,
+        server_ip: Ipv4Address,
+        client_ip: Ipv4Address,
+        subnet_mask: Ipv4Address,
+    ) {
+        self.dhcp_server = Some(DhcpServer::new(dev, server_ip, client_ip, subnet_mask));
+        info!("dev {dev}: DHCP server enabled (lease {client_ip})");
+    }
+
+    /// 按接口名查找设备索引(如 `"wlan0"`)。
+    pub fn device_index(&self, name: &str) -> Option<usize> {
+        self.router.device_index(name)
+    }
+
+    /// 运行时把某设备重配为 SoftAP 角色:静态 IP + 内置 DHCP 服务器。
+    ///
+    /// 清掉该设备旧的 DHCP 客户端状态,设置静态地址,并(可选)启动单客户端
+    /// DHCP 服务器。供 Wi-Fi 运行时 STA→AP 切换使用,链路层切换(teardown +
+    /// `start_ap_open`)由调用方在调用本方法前完成。
+    pub fn reconfigure_as_ap(
+        &mut self,
+        dev: usize,
+        server_ip: Ipv4Address,
+        prefix_len: u8,
+        client_ip: Option<Ipv4Address>,
+    ) {
+        // 若该设备此前是 DHCP 客户端,撤掉客户端状态及其获得的接口地址。
+        if self.dhcp.as_ref().is_some_and(|s| s.dev == dev) {
+            if let Some(addr) = self.dhcp.as_ref().and_then(|s| s.address) {
+                Self::set_interface_ipv4(&mut self.iface, Some(addr), None);
+            }
+            self.dhcp = None;
+        }
+
+        let cidr = Ipv4Cidr::new(server_ip, prefix_len);
+        self.router.set_ipv4_config(dev, Some(cidr), None);
+        Self::set_interface_ipv4(&mut self.iface, None, Some(cidr));
+
+        match client_ip {
+            Some(client_ip) => {
+                let subnet_mask = mask_from_prefix(prefix_len);
+                self.dhcp_server = Some(DhcpServer::new(dev, server_ip, client_ip, subnet_mask));
+                info!("dev {dev}: reconfigured as AP {cidr}, DHCP server lease {client_ip}");
+            }
+            None => {
+                self.dhcp_server = None;
+                info!("dev {dev}: reconfigured as AP {cidr} (no DHCP server)");
+            }
+        }
+    }
+
+    /// 运行时把某设备重配为 STA 角色:撤掉 AP 静态 IP / DHCP 服务器,
+    /// 改用 DHCP 客户端获取地址。链路层关联由调用方先行完成。
+    pub fn reconfigure_as_sta(&mut self, dev: usize, mac: EthernetAddress) {
+        // 撤掉该设备作为 AP 时的 DHCP 服务器与静态地址。
+        if self.dhcp_server.as_ref().is_some_and(|s| s.dev == dev) {
+            self.dhcp_server = None;
+        }
+        if let Some(cfg) = self.router.ipv4_config_for_dev(dev) {
+            Self::set_interface_ipv4(&mut self.iface, Some(cfg.address), None);
+        }
+        self.router.set_ipv4_config(dev, None, None);
+
+        // 启用 DHCP 客户端,从新 AP 获取地址。
+        self.dhcp = Some(DhcpState::new(dev, mac));
+        info!("dev {dev}: reconfigured as STA, DHCP client enabled");
+    }
+
+    /// 唤醒所有设备的 RX 就绪(SDIO WiFi 带外收包后由 poll 任务调用)。
+    pub fn wake_all_devices(&self) {
+        self.router.wake_all_devices();
     }
 
     pub fn dhcp_enabled(&self) -> bool {
@@ -243,9 +336,11 @@ impl Service {
     pub fn poll(&mut self, sockets: &mut SocketSet) -> bool {
         let timestamp = now();
         let mut dhcp_events = Vec::new();
+        let mut dhcp_server_replies: Vec<(usize, Vec<u8>)> = Vec::new();
 
         {
             let dhcp = &mut self.dhcp;
+            let dhcp_server = &mut self.dhcp_server;
             self.router.poll(timestamp, sockets, |dev, packet| {
                 if let Some(event) = dhcp
                     .as_mut()
@@ -253,14 +348,31 @@ impl Service {
                 {
                     dhcp_events.push(event);
                 }
+                if let Some(reply) = dhcp_server
+                    .as_mut()
+                    .and_then(|srv| srv.process_packet(dev, packet))
+                {
+                    dhcp_server_replies.push((dev, reply));
+                }
             });
         }
         for event in dhcp_events {
             self.handle_dhcp_event(event);
         }
+        let mut server_sent = false;
+        for (dev, reply) in dhcp_server_replies {
+            if self.router.send_on_device(
+                dev,
+                IpAddress::Ipv4(Ipv4Address::BROADCAST),
+                &reply,
+                timestamp,
+            ) {
+                server_sent = true;
+            }
+        }
         self.iface.poll(timestamp, &mut self.router, sockets);
         let dhcp_poll_next = self.poll_dhcp(timestamp);
-        self.router.dispatch(timestamp) || dhcp_poll_next
+        self.router.dispatch(timestamp) || dhcp_poll_next || server_sent
     }
 
     fn poll_dhcp(&mut self, timestamp: Instant) -> bool {
@@ -407,6 +519,17 @@ fn dhcp_transaction_id(mac: EthernetAddress) -> u32 {
 
 fn is_unicast_ipv4(addr: Ipv4Address) -> bool {
     addr != Ipv4Address::UNSPECIFIED && addr != Ipv4Address::BROADCAST && !addr.is_multicast()
+}
+
+/// 由前缀长度构造 IPv4 子网掩码(与 lib.rs 的 `prefix_to_mask` 等价,
+/// 这里独立提供以免暴露跨模块的私有函数)。
+fn mask_from_prefix(prefix_len: u8) -> Ipv4Address {
+    let bits: u32 = if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix_len.min(32) as u32)
+    };
+    Ipv4Address::from_bits(bits)
 }
 
 fn build_dhcp_packet(

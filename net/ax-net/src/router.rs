@@ -106,6 +106,11 @@ impl Router {
         self.devices.len() - 1
     }
 
+    /// Finds the index of a device by its interface name (e.g. `"wlan0"`).
+    pub fn device_index(&self, name: &str) -> Option<usize> {
+        self.devices.iter().position(|dev| dev.name() == name)
+    }
+
     pub fn set_ipv4_config(
         &mut self,
         dev: usize,
@@ -164,6 +169,13 @@ impl Router {
             entries.extend(device.arp_entries(timestamp));
         }
         entries
+    }
+
+    /// Wakes RX readiness on every device (used by the SDIO WiFi poll task).
+    pub fn wake_all_devices(&self) {
+        for device in &self.devices {
+            device.wake_rx();
+        }
     }
 
     pub fn ipv4_config_for_dev(&self, dev: usize) -> Option<Ipv4InterfaceConfig> {

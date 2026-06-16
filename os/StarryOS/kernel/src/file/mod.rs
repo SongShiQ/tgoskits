@@ -3,7 +3,7 @@ pub mod event;
 mod fs;
 pub mod inotify;
 pub mod io_uring;
-#[cfg(all(feature = "sg2002", not(feature = "plat-dyn")))]
+#[cfg(feature = "sg2002")]
 pub mod ion;
 pub mod memfd;
 mod net;
@@ -14,6 +14,7 @@ mod pidfd;
 mod pipe;
 pub mod signalfd;
 pub mod timerfd;
+mod wext;
 
 use alloc::{borrow::Cow, sync::Arc};
 use core::{ffi::c_int, time::Duration};
@@ -33,7 +34,7 @@ use linux_raw_sys::general::{
 use spin::RwLock;
 
 pub use self::{
-    fs::{Directory, File, resolve_at, with_fs},
+    fs::{Directory, File, ResolveAtResult, resolve_at, with_fs},
     io_uring::IoUring,
     net::Socket,
     nsfd::NsFd,

@@ -1,6 +1,6 @@
 [package]
 name = "ax-feat"
-version = "0.5.19"
+version = "0.5.20"
 repository = "https://github.com/rcore-os/tgoskits"
 edition.workspace = true
 authors = ["Yuekai Jia <equation618@gmail.com>"]
@@ -60,6 +60,7 @@ stack-guard-page = [
     "ax-task/stack-guard-page",
     "ax-runtime/stack-guard-page",
 ]
+stack-protector = ["ax-runtime/stack-protector"]
 
 # File system
 fs = [
@@ -80,6 +81,7 @@ net = [
     "dep:ax-net",
     "ax-runtime/net",
 ]
+aic8800-wifi = ["net", "ax-runtime/aic8800-wifi"]
 vsock = ["ax-runtime/vsock"]
 
 # Display

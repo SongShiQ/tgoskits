@@ -6,7 +6,7 @@ use starry_vm::{VmMutPtr, VmPtr};
 use syscalls::Sysno;
 
 use super::{
-    AsThread, SyscallRestartInfo, SyscallTraceState, TimerState, check_signals,
+    AsThread, SyscallRestartInfo, SyscallTraceState, TimerState, check_signals, poll_process_timer,
     ptrace_stop_current, ptrace_syscall_stop_current, raise_signal_fatal, set_timer_state,
     unblock_next_signal, wait_existing_ptrace_stop_current,
 };
@@ -36,7 +36,11 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
                 if thr.proc_data.is_ptrace_singlestep_for(thr.tid())
                     && (thr.proc_data.is_ptrace_traceme() || thr.proc_data.is_ptrace_attached())
                 {
-                    #[cfg(target_arch = "riscv64")]
+                    #[cfg(any(
+                        target_arch = "riscv64",
+                        target_arch = "aarch64",
+                        target_arch = "loongarch64"
+                    ))]
                     crate::syscall::ptrace_setup_singlestep(&thr.proc_data, thr.tid(), &mut uctx);
                 }
 
@@ -144,14 +148,26 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
                             let saved_insn = thr.proc_data.take_ptrace_ss_saved_insn_for(thr.tid());
                             if let Some((addr, insn)) = saved_insn {
                                 if addr == uctx.ip() {
-                                    let aspace = thr.proc_data.aspace();
-                                    let aspace = aspace.lock();
-                                    let _ = aspace.write(
-                                        ax_memory_addr::VirtAddr::from_usize(addr),
-                                        &(insn as u16).to_ne_bytes(),
+                                    #[cfg(any(
+                                        target_arch = "riscv64",
+                                        target_arch = "aarch64",
+                                        target_arch = "loongarch64"
+                                    ))]
+                                    let _ = crate::syscall::ptrace_restore_singlestep_insn(
+                                        &thr.proc_data,
+                                        thr.tid(),
+                                        addr,
+                                        insn,
                                     );
-                                    #[cfg(target_arch = "riscv64")]
-                                    ax_runtime::hal::cpu::asm::flush_icache_all();
+                                    #[cfg(not(any(
+                                        target_arch = "riscv64",
+                                        target_arch = "aarch64",
+                                        target_arch = "loongarch64"
+                                    )))]
+                                    thr.proc_data.set_ptrace_ss_saved_insn_for(
+                                        thr.tid(),
+                                        Some((addr, insn)),
+                                    );
                                 } else {
                                     thr.proc_data.set_ptrace_ss_saved_insn_for(
                                         thr.tid(),
@@ -209,6 +225,11 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
                 }
 
                 if !unblock_next_signal() {
+                    // POSIX timers are also driven by the alarm task, but polling
+                    // here closes the window where an expired timer is only noticed
+                    // after the current syscall returns to userspace.
+                    poll_process_timer(thr.proc_data.proc.pid());
+
                     let eintr_code = -(ax_errno::LinuxError::EINTR.code() as isize);
                     let restart = if is_syscall
                         && (uctx.retval() as isize) == eintr_code

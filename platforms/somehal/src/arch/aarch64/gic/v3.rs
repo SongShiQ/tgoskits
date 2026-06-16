@@ -103,19 +103,36 @@ pub fn is_support_icc() -> bool {
     val >> 24 & 0xf > 0
 }
 
-pub fn handle_irq() -> someboot::irq::IrqId {
-    let ack = ack1();
+pub struct ActiveIrq {
+    irq: rdrive::IrqId,
+    ack: IntId,
+}
 
-    super::_handle_irq(someboot::irq::IrqId::new(ack.to_u32() as _));
+impl ActiveIrq {
+    pub fn id(&self) -> rdrive::IrqId {
+        self.irq
+    }
+}
 
-    if !ack.is_special() {
-        eoi1(ack);
+impl Drop for ActiveIrq {
+    fn drop(&mut self) {
+        eoi1(self.ack);
         if eoi_mode() {
-            dir(ack);
+            dir(self.ack);
         }
     }
-    let id: u32 = ack.into();
-    (id as usize).into()
+}
+
+pub fn begin_irq() -> Option<ActiveIrq> {
+    let ack = ack1();
+    if ack.is_special() {
+        return None;
+    }
+
+    Some(ActiveIrq {
+        irq: (ack.to_u32() as usize).into(),
+        ack,
+    })
 }
 
 pub fn irq_set_enable(raw: usize, enable: bool) {
@@ -137,12 +154,7 @@ pub fn send_ipi(raw: usize, target: crate::irq::IpiTarget) {
 }
 
 fn affinity_from_mpidr(mpidr: usize) -> Affinity {
-    Affinity {
-        aff0: (mpidr & 0xff) as u8,
-        aff1: ((mpidr >> 8) & 0xff) as u8,
-        aff2: ((mpidr >> 16) & 0xff) as u8,
-        aff3: ((mpidr >> 32) & 0xff) as u8,
-    }
+    Affinity::from_mpidr(mpidr as u64)
 }
 
 pub fn init_cpu(cpu_idx: usize) {
