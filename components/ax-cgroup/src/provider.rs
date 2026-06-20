@@ -25,6 +25,10 @@ pub trait CgroupProvider: Send + Sync {
 }
 
 /// Internal cell for the provider singleton.
+///
+/// Uses `Box::into_raw` to store the provider slot. The allocated slot is
+/// intentionally never freed — the provider lives for the entire kernel
+/// lifetime and freeing it would require careful synchronization.
 pub struct ProviderCell {
     inner: core::sync::atomic::AtomicPtr<ProviderSlot>,
 }

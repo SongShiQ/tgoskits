@@ -37,30 +37,52 @@ cgroup 层次结构、各控制器状态以及进程成员关系。该 crate 是
 | 方面       | Asterinas                              | ax-cgroup                                        |
 | ---------- | -------------------------------------- | ------------------------------------------------ |
 | 层次框架   | `SysTree`（`SysBranchNode` / `SysObj`） | 自管理的 `BTreeMap<String, Arc<CgroupNode>>`     |
-| 控制器访问 | `Controller` + `SubControl` trait       | 节点上固定的 `pids` / `cpu` 字段                 |
-| 属性读写   | trait 方法分发                          | `read_attr_at`/`write_attr` 中的 `match name`    |
+| 控制器访问 | `Controller` + `SubControl` trait       | 基于注册表的 `BTreeMap<String, Arc<dyn CgroupController>>` |
+| 属性读写   | trait 方法分发                          | 通过控制器实例进行 trait 方法分发                |
 | 成员关系锁 | `CgroupMembership` 全局 `Mutex`         | `SpinNoIrq<MembershipState>`（`LazyInit`）       |
 | 文件系统   | 基于 `SysTree` 的自定义 cgroupfs        | 内核侧的 `axfs-ng-vfs` 适配                       |
 
 ### 模块划分
 
-| 模块       | 职责                                                         |
-| ---------- | ------------------------------------------------------------ |
-| `core`     | `CgroupNode`、全局根节点，以及 id 到节点的注册表。           |
-| `pids`     | `PidsState` —— 基于 CAS 充值路径的进程数计量。              |
-| `cpu`      | `CpuState` / `BandwidthState` —— `cpu.weight` 与 `cpu.max` 状态。 |
-| `provider` | `CgroupProvider` trait 与注册单元。                          |
-| crate 根   | 成员关系、fork/migrate/exit 事务，以及属性解析。            |
+| 模块          | 职责                                                         |
+| ------------- | ------------------------------------------------------------ |
+| `controller`  | `CgroupController` / `CgroupControllerFactory` trait、工厂注册表、`parse_attr_name`。 |
+| `core`        | `CgroupNode`、全局根节点，以及 id 到节点的注册表。           |
+| `pids`        | `PidsState` + `PidsController` —— 基于 CAS 充值路径的进程数计量。 |
+| `cpu`         | `CpuState` + `CpuController` / `BandwidthState` —— `cpu.weight` 与 `cpu.max` 状态。 |
+| `provider`    | `CgroupProvider` trait 与注册单元。                          |
+| crate 根      | 成员关系、fork/migrate/exit 事务，以及属性分发。            |
 
 ### 控制器
 
-实现了两个控制器：
+控制器采用 **工厂 + 实例** 模式：
+
+- **工厂**（`CgroupControllerFactory`）：在 `init()` 时全局注册。报告控制器
+  名称、属性元数据，并创建每节点实例。
+- **实例**（`CgroupController`）：存储在 `CgroupNode.controllers` 中，负责
+  处理该控制器属性的 `read_attr` / `write_attr`。属性名使用**短名**（不含
+  控制器前缀）：例如 `"max"` 而非 `"pids.max"`。
+
+内置了两个控制器：
 
 - **pids** —— `pids.max` / `pids.current`。充值会沿路径回溯到根节点，失败时
   回滚已充值部分；每个节点的计数器使用 CAS 循环，以避免 SMP 上的 TOCTOU 竞态。
+  `PidsState` 也直接存储在 `CgroupNode.pids` 上，用于无锁的 fork 快速路径。
 - **cpu** —— `cpu.weight`、`cpu.max`（quota/period）与 `cpu.stat`。带宽
   quota/period 状态在此维护；定时器 tick 的限流执行钩子位于内核侧，因为它
   需要访问 `ax_task` / `ax_hal`。
+
+### 新增控制器
+
+1. 定义状态结构体（如 `MemoryState`）和控制器结构体（`MemoryController`），
+   实现 `CgroupController` trait。
+2. 定义工厂结构体（`MemoryControllerFactory`），实现
+   `CgroupControllerFactory` trait。
+3. 在 `init()` 中注册工厂：
+   ```rust
+   controller::register_factory(Arc::new(MemoryControllerFactory));
+   ```
+4. `subtree_control` 机制、属性分发和接口文件检测均通过注册表自动完成。
 
 ## 快速开始
 
@@ -98,6 +120,7 @@ impl CgroupProvider for KernelProvider {
 static PROVIDER: KernelProvider = KernelProvider;
 
 fn boot() {
+    // init() 注册内置控制器工厂并创建根节点
     ax_cgroup::init();
     ax_cgroup::register_provider(&PROVIDER);
 }
