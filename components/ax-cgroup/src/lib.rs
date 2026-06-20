@@ -54,19 +54,22 @@ static PROVIDER: LazyInit<provider::ProviderCell> = LazyInit::new();
 
 /// Initialize the cgroup subsystem. Called once during boot.
 pub fn init() {
-    // Initialize controller registry first
+    // 1. Initialize controller registry
     controller::init_registry();
 
+    // 2. Register built-in controller factories (before core::init creates root node)
+    controller::register_factory(Arc::new(pids::PidsControllerFactory));
+    controller::register_factory(Arc::new(cpu::CpuControllerFactory));
+
+    // 3. Initialize membership state
     MEMBERSHIP.init_once(SpinNoIrq::new(MembershipState {
         detached_pids: BTreeSet::new(),
         pending_pids: BTreeMap::new(),
     }));
+
+    // 4. Create root node — factories must be registered before this
     core::init();
     PROVIDER.init_once(provider::ProviderCell::new());
-
-    // Register built-in controller factories
-    controller::register_factory(Arc::new(pids::PidsControllerFactory));
-    controller::register_factory(Arc::new(cpu::CpuControllerFactory));
 
     info!("cgroup: initialized");
 }

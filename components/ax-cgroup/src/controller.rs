@@ -114,6 +114,11 @@ pub fn all_factory_names() -> Vec<String> {
 /// Uses `find('.')` to support multi-dot attribute names.
 /// E.g. `"cpu.stat.periods"` → `("cpu", "stat.periods")`.
 /// Returns `None` if there is no dot.
+///
+/// **Note**: This function does not distinguish controller attributes from
+/// builtin interface files (e.g. `"cgroup.procs"` would return
+/// `("cgroup", "procs")`). Callers should check `BUILTIN_FILES` first
+/// before relying on this parse result for controller dispatch.
 pub fn parse_attr_name(full_name: &str) -> Option<(&str, &str)> {
     full_name
         .find('.')

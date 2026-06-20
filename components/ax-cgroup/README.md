@@ -39,8 +39,8 @@ Concrete differences from Asterinas:
 | Aspect            | Asterinas                               | ax-cgroup                                      |
 | ----------------- | --------------------------------------- | ---------------------------------------------- |
 | Hierarchy         | `SysTree` (`SysBranchNode` / `SysObj`)  | self-managed `BTreeMap<String, Arc<CgroupNode>>` |
-| Controller access | `Controller` + `SubControl` trait       | fixed `pids` / `cpu` fields on the node        |
-| Attribute I/O     | trait-method dispatch                    | `match name { ... }` in `read_attr_at`/`write_attr` |
+| Controller access | `Controller` + `SubControl` trait       | registry-based `BTreeMap<String, Arc<dyn CgroupController>>` |
+| Attribute I/O     | trait-method dispatch                    | trait-method dispatch via controller instances |
 | Membership lock   | `CgroupMembership` global `Mutex`        | `SpinNoIrq<MembershipState>` (`LazyInit`)      |
 | Filesystem        | custom cgroupfs over `SysTree`           | `axfs-ng-vfs` adapter in the kernel            |
 
@@ -48,22 +48,46 @@ Concrete differences from Asterinas:
 
 | Module        | Responsibility                                                       |
 | ------------- | -------------------------------------------------------------------- |
+| `controller`  | `CgroupController` / `CgroupControllerFactory` traits, factory registry, `parse_attr_name`. |
 | `core`        | `CgroupNode`, the global root, and the id-to-node registry.          |
-| `pids`        | `PidsState` — process-count accounting with a CAS-based charge path. |
-| `cpu`         | `CpuState` / `BandwidthState` — `cpu.weight` and `cpu.max` state.    |
+| `pids`        | `PidsState` + `PidsController` — process-count accounting with a CAS-based charge path. |
+| `cpu`         | `CpuState` + `CpuController` / `BandwidthState` — `cpu.weight` and `cpu.max` state. |
 | `provider`    | `CgroupProvider` trait and the registration cell.                    |
-| crate root    | membership, fork/migrate/exit transactions, and attribute parsing.   |
+| crate root    | membership, fork/migrate/exit transactions, and attribute dispatch.  |
 
 ### Controllers
 
-Two controllers are implemented:
+Controllers follow a **factory + instance** pattern:
+
+- **Factory** (`CgroupControllerFactory`): registered globally during `init()`.
+  Reports controller name, attribute metadata, and creates per-node instances.
+- **Instance** (`CgroupController`): stored per-node in
+  `CgroupNode.controllers`. Handles `read_attr` / `write_attr` for the
+  controller's attributes. Attribute names are **short** (without the controller
+  prefix): e.g. `"max"` not `"pids.max"`.
+
+Two controllers are built in:
 
 - **pids** — `pids.max` / `pids.current`. Charging walks the path to the root
   and rolls back partial charges on failure; the per-node counter uses a CAS
-  loop to avoid the TOCTOU race on SMP.
+  loop to avoid the TOCTOU race on SMP. The `PidsState` is also stored directly
+  on `CgroupNode.pids` for lock-free fork fast path.
 - **cpu** — `cpu.weight`, `cpu.max` (quota/period), and `cpu.stat`. The
   bandwidth quota/period state is maintained here; the timer-tick enforcement
   hook lives on the kernel side because it needs `ax_task` / `ax_hal` access.
+
+### Adding a new controller
+
+1. Define state struct (e.g. `MemoryState`) and controller struct
+   (`MemoryController`) implementing `CgroupController`.
+2. Define a factory struct (`MemoryControllerFactory`) implementing
+   `CgroupControllerFactory`.
+3. Register the factory in `init()`:
+   ```rust
+   controller::register_factory(Arc::new(MemoryControllerFactory));
+   ```
+4. The `subtree_control` mechanism, attribute dispatch, and interface file
+   detection all work automatically through the registry.
 
 ## Quick Start
 
@@ -99,6 +123,7 @@ impl CgroupProvider for KernelProvider {
 static PROVIDER: KernelProvider = KernelProvider;
 
 fn boot() {
+    // init() registers built-in controller factories and creates the root node
     ax_cgroup::init();
     ax_cgroup::register_provider(&PROVIDER);
 }
