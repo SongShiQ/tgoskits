@@ -66,3 +66,4 @@ loongarch64-axvisor-guest-tests.md
 
 # GitHub page snapshots accidentally saved into the repo
 *rcore-os_tgoskits*.html
+.gstack/
