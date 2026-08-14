@@ -9,8 +9,8 @@ use core::{
 
 use ax_errno::{AxError, AxResult, LinuxError};
 #[cfg(feature = "vsock")]
-use axnet::vsock::VsockAddr;
-use axnet::{SocketAddrEx, unix::UnixSocketAddr};
+use ax_net::vsock::VsockAddr;
+use ax_net::{SocketAddrEx, unix::UnixSocketAddr};
 use linux_raw_sys::{net::*, netlink::sockaddr_nl};
 
 use crate::mm::{UserConstPtr, UserPtr};
@@ -103,7 +103,11 @@ pub fn read_netlink_addr(
     addr: UserConstPtr<sockaddr>,
     addrlen: socklen_t,
 ) -> AxResult<sockaddr_nl> {
-    if addrlen != size_of::<sockaddr_nl>() as socklen_t {
+    // Linux `netlink_bind`/`netlink_connect` reject only `addrlen < sizeof(sockaddr_nl)`;
+    // a larger length is accepted and the trailing bytes ignored. Callers commonly zero a
+    // `sockaddr_storage` and pass its full size, so requiring an exact match wrongly
+    // returned EINVAL for legitimate binds/connects. Read just the leading sockaddr_nl.
+    if (addrlen as usize) < size_of::<sockaddr_nl>() {
         return Err(AxError::InvalidInput);
     }
     let addr_nl = addr.cast::<sockaddr_nl>().get_as_ref()?;
@@ -245,7 +249,10 @@ impl SocketAddrExt for UnixSocketAddr {
             UnixSocketAddr::Path(path) => 1 + path.len(),
         };
         let mut buf = Vec::with_capacity(size_of::<__kernel_sa_family_t>() + data_len);
-        buf.extend_from_slice(&AF_UNIX.to_ne_bytes());
+        // sun_family is sa_family_t (2 bytes). `AF_UNIX` from linux_raw_sys is a
+        // u32; writing it raw would emit a 4-byte family, over-reporting addrlen
+        // by 2 and shifting sun_path against the 2-byte offset the read path uses.
+        buf.extend_from_slice(&(AF_UNIX as __kernel_sa_family_t).to_ne_bytes());
         match self {
             UnixSocketAddr::Unnamed => {}
             UnixSocketAddr::Abstract(name) => {
@@ -341,4 +348,23 @@ impl SocketAddrExt for SocketAddrEx {
             SocketAddrEx::Vsock(vsock) => vsock.family(),
         }
     }
+}
+
+#[cfg(axtest)]
+pub(crate) fn net_addr_conversion_rules_hold_for_test() -> bool {
+    use core::net::{Ipv4Addr, SocketAddrV4};
+
+    // Test socket_addr_v4_to_mapped_v6 conversion
+    let v4 = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 1), 8080);
+    let v6 = socket_addr_v4_to_mapped_v6(&v4);
+
+    // Check port preservation
+    assert!(v6.port() == 8080);
+
+    // Test localhost mapping
+    let localhost_v4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 80);
+    let localhost_v6 = socket_addr_v4_to_mapped_v6(&localhost_v4);
+    assert!(localhost_v6.port() == 80);
+
+    true
 }

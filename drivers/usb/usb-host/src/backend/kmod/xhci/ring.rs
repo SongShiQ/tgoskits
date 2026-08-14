@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use dma_api::{DArray, DmaDirection};
+use dma_api::{CoherentArray, DmaDirection};
 use mbarrier::mb;
 use xhci::ring::trb::{Link, command, transfer};
 
@@ -16,12 +16,12 @@ pub(crate) const TRB_SIZE: usize = size_of::<TrbData>();
 pub(crate) const TRBS_PER_SEGMENT: usize = 256;
 const DEFAULT_RING_PAGES: usize = 2;
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 #[repr(transparent)]
-pub struct TrbData([u32; TRB_LEN]);
+pub(crate) struct TrbData([u32; TRB_LEN]);
 
 impl TrbData {
-    pub fn to_raw(&self) -> [u32; TRB_LEN] {
+    pub fn to_raw(self) -> [u32; TRB_LEN] {
         self.0
     }
 }
@@ -40,15 +40,12 @@ impl From<transfer::Allowed> for TrbData {
     }
 }
 
-pub struct Ring {
+pub(crate) struct Ring {
     link: bool,
-    pub trbs: DArray<TrbData>,
-    pub i: usize,
-    pub cycle: bool,
+    trbs: CoherentArray<TrbData>,
+    i: usize,
+    cycle: bool,
 }
-
-unsafe impl Send for Ring {}
-unsafe impl Sync for Ring {}
 
 impl Ring {
     pub fn new_with_len(
@@ -57,7 +54,8 @@ impl Ring {
         direction: DmaDirection,
         dma: &Kernel,
     ) -> core::result::Result<Self, HostError> {
-        let trbs = dma.array_zero_with_align(len, dma.page_size(), direction)?;
+        let _ = direction;
+        let trbs = dma.coherent_array_zero_with_align(len, dma.page_size())?;
 
         Ok(Self {
             link,
@@ -91,6 +89,10 @@ impl Ring {
 
     pub fn bus_addr(&self) -> BusAddr {
         self.trbs.dma_addr().as_u64().into()
+    }
+
+    pub(crate) fn read_trb(&self, index: usize) -> Option<TrbData> {
+        self.trbs.read_cpu(index)
     }
 
     pub fn enque_command(&mut self, mut trb: command::Allowed) -> BusAddr {
@@ -134,11 +136,11 @@ impl Ring {
     }
 
     fn set_transfer_trb(&mut self, index: usize, trb: transfer::Allowed) {
-        self.trbs.set(index, trb.into());
+        self.trbs.set_cpu(index, trb.into());
     }
 
     pub fn enque_trb(&mut self, trb: TrbData) -> BusAddr {
-        self.trbs.set(self.i, trb);
+        self.trbs.set_cpu(self.i, trb);
         let addr = self.trb_bus_addr(self.i);
         self.next_index();
         addr
@@ -164,7 +166,7 @@ impl Ring {
             }
             let trb = command::Allowed::Link(link);
 
-            self.trbs.set(len - 1, trb.into());
+            self.trbs.set_cpu(len - 1, trb.into());
 
             self.cycle = !self.cycle;
         } else if self.i >= len {
@@ -262,5 +264,9 @@ impl<R> SendRing<R> {
 
     pub fn cycle(&self) -> bool {
         self.ring.cycle
+    }
+
+    pub fn enqueue_pointer(&self) -> (BusAddr, bool) {
+        (self.ring.trb_bus_addr(self.ring.i), self.ring.cycle)
     }
 }

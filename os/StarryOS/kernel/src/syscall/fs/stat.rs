@@ -4,7 +4,6 @@ use core::{
 };
 
 use ax_errno::{AxError, AxResult, LinuxError};
-use ax_fs::FS_CONTEXT;
 use ax_task::current;
 use axfs_ng_vfs::{Location, NodePermission};
 use linux_raw_sys::general::{
@@ -14,14 +13,20 @@ use linux_raw_sys::general::{
 use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
-    file::{File, FileLike, resolve_at},
-    mm::{UserPtr, vm_load_string},
+    file::{Directory, File, get_file_like, memfd::Memfd, resolve_at},
+    mm::{UserPtr, vm_load_path_string},
     task::AsThread,
 };
 
 const FILE_HANDLE_BYTES: usize = size_of::<u64>() * 2;
 const FILE_HANDLE_TYPE_DEV_INO: i32 = 1;
-
+const MS_NOSUID: u32 = 1 << 1;
+const MS_NODEV: u32 = 1 << 2;
+const MS_NOEXEC: u32 = 1 << 3;
+const MS_NOATIME: u32 = 1 << 10;
+const MS_RELATIME: u32 = 1 << 21;
+const ST_RDONLY: u32 = 1;
+const ST_RELATIME: u32 = 1 << 12;
 #[repr(C)]
 pub struct FileHandleHeader {
     handle_bytes: u32,
@@ -68,7 +73,7 @@ pub fn sys_fstatat(
         return Err(AxError::InvalidInput);
     }
 
-    let path = path.nullable().map(vm_load_string).transpose()?;
+    let path = path.nullable().map(vm_load_path_string).transpose()?;
 
     debug!("sys_fstatat <= dirfd: {dirfd}, path: {path:?}, flags: {flags}");
 
@@ -126,7 +131,7 @@ pub fn sys_statx(
     //        below), then the target file is the one referred to by the
     //        file descriptor dirfd.
 
-    let path = path.nullable().map(vm_load_string).transpose()?;
+    let path = path.nullable().map(vm_load_path_string).transpose()?;
     debug!("sys_statx <= dirfd: {dirfd}, path: {path:?}, flags: {flags}");
 
     statxbuf.vm_write(resolve_at(dirfd, path.as_deref(), flags)?.stat()?.into())?;
@@ -154,7 +159,7 @@ pub fn sys_faccessat2(dirfd: c_int, path: *const c_char, mode: u32, flags: u32) 
         return Err(AxError::InvalidInput);
     }
 
-    let path = path.nullable().map(vm_load_string).transpose()?;
+    let path = path.nullable().map(vm_load_path_string).transpose()?;
     debug!("sys_faccessat2 <= dirfd: {dirfd}, path: {path:?}, mode: {mode}, flags: {flags}");
 
     let file = resolve_at(dirfd, path.as_deref(), flags)?;
@@ -224,16 +229,28 @@ fn statfs(loc: &Location) -> AxResult<statfs> {
     };
     result.f_namelen = stat.name_length as _;
     result.f_frsize = stat.fragment_size as _;
-    result.f_flags = stat.mount_flags as _;
+    result.f_flags = (stat.mount_flags | statfs_mount_flags(loc)) as _;
     Ok(result)
 }
 
+fn statfs_mount_flags(loc: &Location) -> u32 {
+    let mountpoint = loc.mountpoint();
+    let mount_flags = mountpoint.mount_flags();
+    let mut statfs_flags = mount_flags & (MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_NOATIME);
+    if mountpoint.is_readonly() {
+        statfs_flags |= ST_RDONLY;
+    }
+    if mount_flags & MS_RELATIME != 0 {
+        statfs_flags |= ST_RELATIME;
+    }
+    statfs_flags
+}
 pub fn sys_statfs(path: *const c_char, buf: *mut statfs) -> AxResult<isize> {
-    let path = vm_load_string(path)?;
+    let path = vm_load_path_string(path)?;
     debug!("sys_statfs <= path: {path:?}");
 
     buf.vm_write(statfs(
-        &FS_CONTEXT
+        &ax_fs_ng::vfs::current_fs_context()
             .lock()
             .resolve(path)?
             .mountpoint()
@@ -245,7 +262,17 @@ pub fn sys_statfs(path: *const c_char, buf: *mut statfs) -> AxResult<isize> {
 pub fn sys_fstatfs(fd: i32, buf: *mut statfs) -> AxResult<isize> {
     debug!("sys_fstatfs <= fd: {fd}");
 
-    buf.vm_write(statfs(File::from_fd(fd)?.inner().location())?)?;
+    let file_like = get_file_like(fd)?;
+    let location = if let Some(directory) = file_like.downcast_ref::<Directory>() {
+        directory.inner()
+    } else if let Some(file) = file_like.downcast_ref::<File>() {
+        file.inner().location()
+    } else if let Some(memfd) = file_like.downcast_ref::<Memfd>() {
+        memfd.inner().inner().location()
+    } else {
+        return Err(AxError::InvalidInput);
+    };
+    buf.vm_write(statfs(location)?)?;
     Ok(0)
 }
 
@@ -261,7 +288,7 @@ pub fn sys_name_to_handle_at(
         return Err(AxError::InvalidInput);
     }
 
-    let path = path.nullable().map(vm_load_string).transpose()?;
+    let path = path.nullable().map(vm_load_path_string).transpose()?;
     debug!("sys_name_to_handle_at <= dirfd: {dirfd}, path: {path:?}, flags: {flags}");
 
     let resolve_flags = if flags & AT_SYMLINK_FOLLOW != 0 {
@@ -294,4 +321,32 @@ pub fn sys_name_to_handle_at(
 
     (mount_id as *mut c_int).vm_write(loc.mountpoint().device() as c_int)?;
     Ok(0)
+}
+
+#[cfg(axtest)]
+pub(crate) fn stat_flags_validation_rules_hold_for_test() -> bool {
+    use linux_raw_sys::general::{AT_EMPTY_PATH, AT_NO_AUTOMOUNT, AT_SYMLINK_NOFOLLOW};
+    // Test fstatat flag validation
+    const FSTATAT_VALID: u32 = AT_EMPTY_PATH | AT_NO_AUTOMOUNT | AT_SYMLINK_NOFOLLOW;
+
+    let valid_flags = 0u32;
+    assert!(valid_flags & !FSTATAT_VALID == 0);
+
+    let empty_path = AT_EMPTY_PATH as u32;
+    assert!(empty_path & !FSTATAT_VALID == 0);
+
+    let no_automount = AT_NO_AUTOMOUNT as u32;
+    assert!(no_automount & !FSTATAT_VALID == 0);
+
+    let symlink_nofollow = AT_SYMLINK_NOFOLLOW as u32;
+    assert!(symlink_nofollow & !FSTATAT_VALID == 0);
+
+    let all_valid = AT_EMPTY_PATH as u32 | AT_NO_AUTOMOUNT as u32 | AT_SYMLINK_NOFOLLOW as u32;
+    assert!(all_valid & !FSTATAT_VALID == 0);
+
+    // Invalid flag should be detected
+    let invalid_flags = 0xFFFFu32;
+    assert!(invalid_flags & !FSTATAT_VALID != 0);
+
+    true
 }

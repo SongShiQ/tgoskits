@@ -37,7 +37,7 @@ tgoskits/
 └── docs/                      # Docusaurus 文档站点
 ```
 
-更多关于 subtree 同步、组件分层和开发约定的说明，请参考 [仓库结构与协作方式](https://rcore-os.cn/tgoskits/docs/contributing/repo) 和 [组件开发指南](https://rcore-os.cn/tgoskits/docs/development/components)。
+更多关于 subtree 同步、组件分层和开发约定的说明，请参考 [仓库结构与协作方式](https://rcore-os.cn/tgoskits/docs/contributing/repo) 和 [架构设计概览](https://rcore-os.cn/tgoskits/docs/architecture/overview)。
 
 ## 3. 快速体验
 
@@ -83,7 +83,7 @@ qemu-system-loongarch64 --version
 
 ```bash
 # ArceOS: 运行 Hello World
-cargo xtask arceos qemu --package ax-helloworld --arch aarch64
+cargo xtask arceos qemu --package arceos-helloworld --arch aarch64
 
 # StarryOS: 首次运行前准备 rootfs
 cargo xtask starry rootfs --arch aarch64

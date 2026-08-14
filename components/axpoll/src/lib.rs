@@ -5,16 +5,20 @@
 
 extern crate alloc;
 
-use alloc::{boxed::Box, sync::Arc, task::Wake};
+#[cfg(all(axtest, feature = "axtest"))]
+/// Coverage tests for polling events and wait lists.
+pub mod axtest;
+
+use alloc::{boxed::Box, vec::Vec};
 use core::{
     mem::MaybeUninit,
     task::{Context, Waker},
 };
 
-use ax_kspin::SpinNoIrq;
+use ax_lazyinit::OnceLock;
+use ax_sync::SpinLock;
 use bitflags::bitflags;
 use linux_raw_sys::general::*;
-use spin::Lazy;
 
 bitflags! {
     /// I/O events.
@@ -66,8 +70,19 @@ pub trait Pollable {
 
 const POLL_SET_CAPACITY: usize = 64;
 
+struct Entry {
+    waker: Waker,
+    interests: IoEvents,
+}
+
+impl Entry {
+    fn wake(self) {
+        self.waker.wake();
+    }
+}
+
 struct Inner {
-    entries: Box<[MaybeUninit<Waker>]>,
+    entries: Box<[MaybeUninit<Entry>]>,
     cursor: usize,
 }
 
@@ -87,18 +102,66 @@ impl Inner {
         self.cursor == 0
     }
 
-    fn register(&mut self, waker: &Waker) {
+    fn push_entry(&mut self, entry: Entry) {
+        debug_assert!(self.cursor < POLL_SET_CAPACITY);
+        let slot = self.cursor;
+        self.cursor += 1;
+        self.entries[slot].write(entry);
+    }
+
+    fn register(&mut self, waker: &Waker, interests: IoEvents) -> Option<Entry> {
         let slot = self.cursor % POLL_SET_CAPACITY;
-        if self.cursor >= POLL_SET_CAPACITY {
+        let replaced = if self.cursor >= POLL_SET_CAPACITY {
             let old = unsafe { self.entries[slot].assume_init_read() };
-            if !old.will_wake(waker) {
-                old.wake();
-            }
+            let replaced = (!old.waker.will_wake(waker)).then_some(old);
             self.cursor = ((slot + 1) % POLL_SET_CAPACITY) + POLL_SET_CAPACITY;
+            replaced
         } else {
             self.cursor += 1;
+            None
+        };
+        self.entries[slot].write(Entry {
+            waker: waker.clone(),
+            interests,
+        });
+        replaced
+    }
+
+    fn drain_ready(&mut self, ready: IoEvents, ready_entries: &mut Vec<Entry>) {
+        if self.is_empty() {
+            return;
         }
-        self.entries[slot].write(waker.clone());
+
+        let mut old = Self::new();
+        core::mem::swap(&mut old, self);
+
+        for i in 0..old.len() {
+            let entry = unsafe { old.entries[i].assume_init_read() };
+            if entry.interests.intersects(ready) {
+                ready_entries.push(entry);
+            } else {
+                self.push_entry(entry);
+            }
+        }
+        old.cursor = 0;
+    }
+
+    fn take_one_ready(&mut self, ready: IoEvents) -> Option<Entry> {
+        let len = self.len();
+        let mut selected = None;
+        let mut keep_len = 0;
+
+        for index in 0..len {
+            let entry = unsafe { self.entries[index].assume_init_read() };
+            if selected.is_none() && entry.interests.intersects(ready) {
+                selected = Some(entry);
+            } else {
+                self.entries[keep_len].write(entry);
+                keep_len += 1;
+            }
+        }
+        self.cursor = keep_len;
+        selected
     }
 }
 
@@ -111,7 +174,7 @@ impl Drop for Inner {
 }
 
 /// A data structure for waking up tasks that are waiting for I/O events.
-pub struct PollSet(Lazy<SpinNoIrq<Inner>>);
+pub struct PollSet(OnceLock<SpinLock<Inner>>);
 
 impl Default for PollSet {
     fn default() -> Self {
@@ -122,39 +185,121 @@ impl Default for PollSet {
 impl PollSet {
     /// Creates a new empty [`PollSet`].
     pub const fn new() -> Self {
-        Self(Lazy::new(|| SpinNoIrq::new(Inner::new())))
+        Self(OnceLock::new())
     }
 
-    /// Registers a waker.
-    pub fn register(&self, waker: &Waker) {
-        self.0.lock().register(waker);
-    }
-
-    /// Wakes up all registered wakers.
-    pub fn wake(&self) -> usize {
-        let mut guard = self.0.lock();
-        if guard.is_empty() {
-            return 0;
+    /// Registers a waker for the requested I/O events.
+    ///
+    /// # Safety
+    ///
+    /// This method is task/deferred-context only. Callers must not invoke it
+    /// from hard IRQ, NMI, or trap callbacks, and must not hold locks that may
+    /// be re-entered by the registered waker or by poll wakeup paths.
+    pub unsafe fn register(&self, waker: &Waker, interests: IoEvents) {
+        let replaced = {
+            self.0
+                .call_once(|| SpinLock::new(Inner::new()))
+                .lock_irqsave()
+                .register(waker, interests)
+        };
+        if let Some(entry) = replaced {
+            entry.wake();
         }
-        let inner = core::mem::replace(&mut *guard, Inner::new());
-        drop(guard);
-        inner.len()
+    }
+
+    /// Wakes up registered wakers whose interests intersect `ready`.
+    ///
+    /// # Safety
+    ///
+    /// This method is task/deferred-context only. Callers must not invoke it
+    /// from hard IRQ, NMI, or trap callbacks. The readiness state represented
+    /// by `ready` must be published before this method is called, and callers
+    /// must not hold locks that may be re-entered by waker execution or poll
+    /// wakeup paths.
+    pub unsafe fn wake(&self, ready: IoEvents) -> usize {
+        let Some(inner) = self.0.get() else {
+            return 0;
+        };
+        let mut ready_entries = Vec::with_capacity(POLL_SET_CAPACITY);
+        {
+            inner.lock_irqsave().drain_ready(ready, &mut ready_entries);
+        }
+        let woke = ready_entries.len();
+        for entry in ready_entries {
+            entry.wake();
+        }
+        woke
+    }
+
+    /// Wakes one registered waker whose interests intersect `ready`.
+    ///
+    /// Matching wakers that are not selected remain registered. This is used
+    /// by wait queues with Linux-style exclusive wakeup semantics, where one
+    /// readiness transition should give one waiter a chance to consume work.
+    ///
+    /// # Safety
+    ///
+    /// This method is task/deferred-context only. Callers must not invoke it
+    /// from hard IRQ, NMI, or trap callbacks. The readiness state represented
+    /// by `ready` must be published before this method is called, and callers
+    /// must not hold locks that may be re-entered by waker execution or poll
+    /// wakeup paths.
+    pub unsafe fn wake_one(&self, ready: IoEvents) -> usize {
+        let Some(inner) = self.0.get() else {
+            return 0;
+        };
+        let ready_entry = inner.lock_irqsave().take_one_ready(ready);
+        let Some(entry) = ready_entry else {
+            return 0;
+        };
+        entry.wake();
+        1
+    }
+
+    /// Wakes up registered wakers whose interests intersect `ready` from IRQ context.
+    ///
+    /// Unlike [`wake`](Self::wake), this does not allocate a replacement
+    /// waiter buffer. It drains the already-initialized entries in place, so
+    /// device IRQ handlers can acknowledge the device and then wake matching
+    /// poll waiters without allocating in hard IRQ context.
+    pub fn wake_from_irq(&self, ready: IoEvents) -> usize {
+        let Some(inner) = self.0.get() else {
+            return 0;
+        };
+        let mut ready_entries = [const { MaybeUninit::<Entry>::uninit() }; POLL_SET_CAPACITY];
+        let ready_len = {
+            let mut inner = inner.lock_irqsave();
+            let len = inner.len();
+            if len == 0 {
+                return 0;
+            }
+
+            let mut ready_len = 0;
+            let mut keep_len = 0;
+            for i in 0..len {
+                let entry = unsafe { inner.entries[i].assume_init_read() };
+                if entry.interests.intersects(ready) {
+                    ready_entries[ready_len].write(entry);
+                    ready_len += 1;
+                } else {
+                    inner.entries[keep_len].write(entry);
+                    keep_len += 1;
+                }
+            }
+            inner.cursor = keep_len;
+            ready_len
+        };
+
+        for entry in ready_entries.iter_mut().take(ready_len) {
+            unsafe { entry.assume_init_read() }.wake();
+        }
+        ready_len
     }
 }
 
 impl Drop for PollSet {
     fn drop(&mut self) {
         // Ensure all entries are dropped
-        self.wake();
-    }
-}
-
-impl Wake for PollSet {
-    fn wake(self: Arc<Self>) {
-        self.as_ref().wake();
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.as_ref().wake();
+        unsafe { self.wake(IoEvents::all()) };
     }
 }

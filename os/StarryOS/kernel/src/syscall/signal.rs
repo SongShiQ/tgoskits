@@ -1,14 +1,14 @@
 use core::{future::poll_fn, task::Poll};
 
 use ax_errno::{AxError, AxResult, LinuxError};
-use ax_hal::uspace::UserContext;
+use ax_runtime::hal::cpu::uspace::UserContext;
 use ax_task::{
     current,
     future::{self, block_on},
 };
 use linux_raw_sys::general::{
-    MINSIGSTKSZ, SI_TKILL, SI_USER, SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK, SS_DISABLE,
-    kernel_sigaction, siginfo, timespec,
+    MINSIGSTKSZ, SI_TKILL, SI_USER, SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK, SS_DISABLE, SS_FLAG_BITS,
+    SS_ONSTACK, kernel_sigaction, siginfo, timespec,
 };
 use starry_process::Pid;
 use starry_signal::{SignalInfo, SignalSet, SignalStack, Signo};
@@ -23,11 +23,9 @@ use crate::{
 };
 
 pub(crate) fn check_sigset_size(size: usize) -> AxResult<()> {
-    // Accept the kernel sigset size and any larger libc/ABI sigset size,
-    // since the kernel only uses the low `size_of::<SignalSet>()` bytes
-    // (glibc uses 8, musl uses 16). Keep accepting 0 for callers that use
-    // it to mean "no mask".
-    if size != 0 && size < size_of::<SignalSet>() {
+    // Align with Linux raw syscall semantics (for ABI param 'sigmask'): when sigsetsize is checked,
+    // it must exactly match the kernel SignalSet size (8 bytes).
+    if size != size_of::<SignalSet>() {
         return Err(AxError::InvalidInput);
     }
     Ok(())
@@ -168,7 +166,24 @@ pub fn sys_kill(pid: i32, signo: u32) -> AxResult<isize> {
     match pid {
         1.. => {
             check_kill_permission(pid as _)?;
-            send_signal_to_process(pid as _, sig)?;
+            if let Some(sig) = sig {
+                let curr = current();
+                let thread = curr.as_thread();
+                let signo = sig.signo();
+                if pid as Pid == thread.proc_data.proc.pid() && !thread.signal.signal_blocked(signo)
+                {
+                    // A process-directed signal may be delivered to any
+                    // unblocked thread. Prefer the current thread for
+                    // self-signals so `kill(getpid(), SIGSTOP)` cannot return
+                    // to userspace and race into the next syscall before this
+                    // thread observes the stop.
+                    send_signal_to_thread(None, thread.tid() as Pid, Some(sig))?;
+                } else {
+                    send_signal_to_process(pid as _, Some(sig))?;
+                }
+            } else {
+                send_signal_to_process(pid as _, None)?;
+            }
         }
         0 => {
             let pgid = current().as_thread().proc_data.proc.group().pgid();
@@ -196,7 +211,11 @@ pub fn sys_kill(pid: i32, signo: u32) -> AxResult<isize> {
     Ok(0)
 }
 
-pub fn sys_tkill(tid: Pid, signo: u32) -> AxResult<isize> {
+pub fn sys_tkill(tid: i32, signo: u32) -> AxResult<isize> {
+    if tid <= 0 {
+        return Err(AxError::InvalidInput);
+    }
+    let tid = tid as Pid;
     check_kill_permission(tid)?;
     let sig = make_siginfo(signo, SI_TKILL)?;
     send_signal_to_thread(None, tid, sig)?;
@@ -366,10 +385,62 @@ pub fn sys_sigaltstack(ss: *const SignalStack, old_ss: *mut SignalStack) -> AxRe
 
     if let Some(ss) = ss.nullable() {
         let ss = unsafe { ss.vm_read_uninit()?.assume_init() };
-        if ss.flags != SS_DISABLE && ss.size < MINSIGSTKSZ as usize {
+        if sig.stack_active() {
+            return Err(AxError::OperationNotPermitted);
+        }
+        if ss.flags & !(SS_DISABLE | SS_ONSTACK | SS_FLAG_BITS) != 0 {
+            return Err(AxError::InvalidInput);
+        }
+        if ss.flags & SS_DISABLE == 0 && ss.size < MINSIGSTKSZ as usize {
             return Err(AxError::NoMemory);
         }
         sig.set_stack(ss);
     }
     Ok(0)
+}
+
+#[cfg(axtest)]
+pub(crate) fn signal_sigset_size_and_signo_validation_rules_hold_for_test() -> bool {
+    use core::mem::size_of;
+
+    use starry_signal::SignalSet;
+
+    // check_sigset_size: only accepts exact size of SignalSet.
+    let correct_size = size_of::<SignalSet>();
+    let ok = check_sigset_size(correct_size).is_ok();
+    let too_small = check_sigset_size(correct_size - 1).is_err();
+    let too_big = check_sigset_size(correct_size + 1).is_err();
+    let zero = check_sigset_size(0).is_err();
+
+    // parse_signo: valid signos (1-31 typically) parse, 0 and out-of-range fail.
+    // SIGKILL=9, SIGSTOP=19 on Linux x86_64.
+    let valid_signo = parse_signo(9).is_ok(); // SIGKILL
+    let valid_signo2 = parse_signo(19).is_ok(); // SIGSTOP
+    let zero_signo = parse_signo(0).is_err(); // 0 is not a valid signo
+    // Signo::from_repr uses u8, so values > 255 fail
+    let overflow = parse_signo(256).is_err();
+
+    ok && too_small && too_big && zero && valid_signo && valid_signo2 && zero_signo && overflow
+}
+
+#[cfg(axtest)]
+pub(crate) fn signal_sigset_and_signo_validation_rules_hold_for_test() -> bool {
+    use core::mem::size_of;
+
+    use starry_signal::SignalSet;
+
+    // Test check_sigset_size
+    let correct_size = size_of::<SignalSet>();
+    assert!(check_sigset_size(correct_size).is_ok());
+    assert!(check_sigset_size(correct_size - 1).is_err());
+    assert!(check_sigset_size(correct_size + 1).is_err());
+    assert!(check_sigset_size(0).is_err());
+
+    // Test parse_signo
+    assert!(parse_signo(1).is_ok()); // SIGHUP
+    assert!(parse_signo(9).is_ok()); // SIGKILL
+    assert!(parse_signo(0).is_err()); // Invalid signo
+    assert!(parse_signo(255).is_err()); // Out of range
+
+    true
 }

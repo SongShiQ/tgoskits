@@ -60,7 +60,7 @@ sidebar_label: "平台实现"
 **Axvisor 配置额外包含一条步进过滤规则**：
 
 ```json
-"settings set target.process.thread.step-avoid-regexp ^(core::|alloc::|bitflags::|ax_page_table_entry::|page_table_multiarch::)"
+"settings set target.process.thread.step-avoid-regexp ^(core::|alloc::|bitflags::|page_table_generic::)"
 ```
 
 这条规则让 LLDB 在单步执行（step over / step into）时**自动跳过**匹配的 crate 路径。Axvisor 作为 hypervisor，其执行路径会频繁穿过 `core::`（Rust 核心库）、`alloc::`（全局分配器）、`bitflags::`（位标志宏展开）以及页表操作 crate。如果不做步进过滤，开发者按一次 F10 可能会陷入数十个无关帧才回到业务代码。ArceOS 和 StarryOS 当前未启用此规则——它们的调用深度和 crate 依赖模式使得默认步进行为已经可用。
@@ -131,10 +131,10 @@ sidebar_label: "平台实现"
 
 | 配置 | 断点策略 | 典型命中位置 |
 |------|---------|-------------|
-| ArceOS Main | 单个软件断点 + `continue` | `os/arceos/examples/helloworld/src/main.rs:8` |
+| ArceOS Main | 单个软件断点 + `continue` | `apps/arceos/helloworld/src/main.rs:8` |
 | ArceOS Boot | 多个符号/行号断点（不自动 continue） | `ax_plat::call_main`、`axruntime/src/lib.rs:141`、`main.rs:8` |
 | Axvisor Main | 单个软件断点 + `continue` | `os/axvisor/src/main.rs:42` |
-| Axvisor Boot | 多个行号断点（不自动 continue） | `platform/axplat-dyn/src/boot.rs:8`、`axvisor/src/main.rs:42` |
+| Axvisor Boot | 多个行号断点（不自动 continue） | `platforms/axplat-dyn/src/boot.rs:8`、`axvisor/src/main.rs:42` |
 | StarryOS Main | **单个硬件断点** + `continue` | `os/StarryOS/starryos/src/main.rs:12` |
 | StarryOS Boot | 混合符号/行号断点（不自动 continue） | `ax_plat::call_main`、`axruntime/src/lib.rs:141`、`starry_kernel::entry::init`、`starryos/src/main.rs:12` |
 
@@ -165,7 +165,7 @@ StarryOS Main 配置使用 `--hardware true`：
 {
   "label": "TGOS: Build ArceOS debug image",
   "command": "cargo",
-  "args": ["xtask", "arceos", "build", "--debug", "--package", "ax-helloworld", "--arch", "aarch64"]
+  "args": ["xtask", "arceos", "build", "--debug", "--package", "arceos-helloworld", "--arch", "aarch64"]
 }
 ```
 

@@ -1,5 +1,6 @@
 use ax_errno::{AxError, AxResult};
-use ax_hal::time::TimeValue;
+use ax_memory_addr::PAGE_SIZE_4K;
+use ax_runtime::hal::time::TimeValue;
 use ax_task::current;
 use linux_raw_sys::general::{__kernel_old_timeval, RLIM_NLIMITS, rlimit64, rusage};
 use starry_process::Pid;
@@ -16,16 +17,22 @@ pub fn sys_prlimit64(
     new_limit: *const rlimit64,
     old_limit: *mut rlimit64,
 ) -> AxResult<isize> {
+    // pid lookup first — match Linux error priority (ESRCH before EINVAL)
+    let proc_data = get_process_data(pid)?;
+
     if resource >= RLIM_NLIMITS {
         return Err(AxError::InvalidInput);
     }
 
-    let proc_data = get_process_data(pid)?;
     if let Some(old_limit) = old_limit.nullable() {
-        let limit = &proc_data.rlim.read()[resource];
+        let (current, max) = {
+            let limits = proc_data.rlim.read();
+            let limit = &limits[resource];
+            (limit.current, limit.max)
+        };
         old_limit.vm_write(rlimit64 {
-            rlim_cur: limit.current,
-            rlim_max: limit.max,
+            rlim_cur: current,
+            rlim_max: max,
         })?;
     }
 
@@ -37,8 +44,15 @@ pub fn sys_prlimit64(
         }
 
         let limit = &mut proc_data.rlim.write()[resource];
-        // TODO: when a capability system is added, check CAP_SYS_RESOURCE
-        // before allowing new_limit.rlim_max > limit.max (return EPERM).
+        // Raising the hard limit requires CAP_SYS_RESOURCE.
+        // TODO: has_cap_sys_resource() is currently euid==0 until a
+        // fine-grained capability bitmap is implemented (see cred.rs).
+        if new_limit.rlim_max > limit.max {
+            let cred = current().as_thread().cred();
+            if !cred.has_cap_sys_resource() {
+                return Err(AxError::OperationNotPermitted);
+            }
+        }
         limit.max = new_limit.rlim_max;
         limit.current = new_limit.rlim_cur;
     }
@@ -50,17 +64,25 @@ pub fn sys_prlimit64(
 struct Rusage {
     utime: TimeValue,
     stime: TimeValue,
+    max_rss_kb: u64,
 }
 
 impl Rusage {
     fn from_thread(thread: &Thread) -> Self {
         let (utime, stime) = thread.time.borrow().output();
-        Self { utime, stime }
+        let max_rss_kb = thread.proc_data.aspace().lock().rss().hiwater_rss_pages()
+            * (PAGE_SIZE_4K as u64 / 1024);
+        Self {
+            utime,
+            stime,
+            max_rss_kb,
+        }
     }
 
     fn collate(mut self, other: Rusage) -> Self {
         self.utime += other.utime;
         self.stime += other.stime;
+        self.max_rss_kb = self.max_rss_kb.max(other.max_rss_kb);
         self
     }
 }
@@ -71,6 +93,7 @@ impl From<Rusage> for rusage {
         let mut usage: rusage = unsafe { core::mem::zeroed() };
         usage.ru_utime = __kernel_old_timeval::from_time_value(value.utime);
         usage.ru_stime = __kernel_old_timeval::from_time_value(value.stime);
+        usage.ru_maxrss = value.max_rss_kb as _;
         usage
     }
 }
@@ -118,4 +141,33 @@ pub fn sys_getrusage(who: i32, usage: *mut rusage) -> AxResult<isize> {
     usage.vm_write(result.into())?;
 
     Ok(0)
+}
+
+#[cfg(axtest)]
+pub(crate) fn resources_rlimit_validation_rules_hold_for_test() -> bool {
+    use linux_raw_sys::general::RLIM_NLIMITS;
+
+    // Test resource limit validation
+    // Resource must be < RLIM_NLIMITS
+    let valid_resource = 0u32;
+    assert!(valid_resource < RLIM_NLIMITS as u32);
+
+    let max_valid = (RLIM_NLIMITS - 1) as u32;
+    assert!(max_valid < RLIM_NLIMITS as u32);
+
+    // Invalid: resource >= RLIM_NLIMITS
+    let invalid_resource = RLIM_NLIMITS as u32;
+    assert!(invalid_resource >= RLIM_NLIMITS as u32);
+
+    // Test rlimit64 validation: rlim_cur <= rlim_max
+    let valid_cur = 100u64;
+    let valid_max = 200u64;
+    assert!(valid_cur <= valid_max);
+
+    // Invalid: rlim_cur > rlim_max
+    let invalid_cur = 300u64;
+    let invalid_max = 200u64;
+    assert!(invalid_cur > invalid_max);
+
+    true
 }

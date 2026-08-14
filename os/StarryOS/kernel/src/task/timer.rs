@@ -3,19 +3,21 @@
 use alloc::{borrow::ToOwned, collections::binary_heap::BinaryHeap, sync::Arc};
 use core::{mem, time::Duration};
 
-use ax_hal::time::{NANOS_PER_SEC, TimeValue, monotonic_time_nanos, wall_time};
+use ax_lazyinit::LazyLock;
+use ax_runtime::hal::time::{NANOS_PER_SEC, TimeValue, monotonic_time_nanos, wall_time};
 use ax_task::{
     WeakAxTaskRef, current,
-    future::{block_on, timeout_at},
+    future::{block_on, timeout_at_wall},
 };
 use event_listener::{Event, listener};
-use lazy_static::lazy_static;
-use spin::Mutex;
 use starry_process::Pid;
 use starry_signal::Signo;
 use strum::FromRepr;
 
-use crate::task::{poll_process_timer, poll_timer};
+use crate::{
+    sync::IrqMutex as Mutex,
+    task::{poll_process_timer, poll_timer},
+};
 
 fn time_value_from_nanos(nanos: usize) -> TimeValue {
     let secs = nanos as u64 / NANOS_PER_SEC;
@@ -51,10 +53,9 @@ impl Ord for Entry {
     }
 }
 
-lazy_static! {
-    static ref ALARM_LIST: Mutex<BinaryHeap<Entry>> = Mutex::new(BinaryHeap::new());
-    static ref EVENT_NEW_TIMER: Event = Event::new();
-}
+static ALARM_LIST: LazyLock<Mutex<BinaryHeap<Entry>>> =
+    LazyLock::new(|| Mutex::new(BinaryHeap::new()));
+static EVENT_NEW_TIMER: LazyLock<Event> = LazyLock::new(Event::new);
 
 /// The type of interval timer.
 #[repr(i32)]
@@ -320,7 +321,7 @@ async fn alarm_task() {
             {
                 continue;
             }
-            let _ = timeout_at(Some(deadline), listener).await;
+            let _ = timeout_at_wall(Some(deadline), listener).await;
         }
     }
 }
@@ -331,6 +332,21 @@ pub fn spawn_alarm_task() {
     ax_task::spawn_raw(
         || block_on(alarm_task()),
         "alarm_task".to_owned(),
-        ax_config::TASK_STACK_SIZE,
+        ax_task::default_task_stack_size(),
     );
+}
+
+#[cfg(axtest)]
+pub(crate) fn itimer_type_signo_and_time_conversion_rules_hold_for_test() -> bool {
+    // ITimerType::signo returns a Signo for each variant without panicking.
+    let _real = ITimerType::Real.signo();
+    let _virt = ITimerType::Virtual.signo();
+    let _prof = ITimerType::Prof.signo();
+
+    // time_value_from_nanos: converts nanoseconds to TimeValue without panicking.
+    let _ = time_value_from_nanos(0);
+    let _ = time_value_from_nanos(1);
+    let _ = time_value_from_nanos(1000000000usize);
+
+    true
 }

@@ -1,8 +1,9 @@
 use ax_errno::AxResult;
 use ax_io::{BufReader, prelude::*};
-use ax_sync::Mutex;
 #[cfg(feature = "fd")]
 use {alloc::sync::Arc, ax_errno::LinuxError, ax_errno::LinuxResult, ax_io::PollState};
+
+use crate::sync::Mutex;
 
 fn console_read_bytes(buf: &mut [u8]) -> AxResult<usize> {
     let len = ax_hal::console::read_bytes(buf);
@@ -15,6 +16,10 @@ fn console_read_bytes(buf: &mut [u8]) -> AxResult<usize> {
 }
 
 fn console_write_bytes(buf: &[u8]) -> AxResult<usize> {
+    #[cfg(feature = "serial")]
+    if let Some(result) = ax_runtime::serial::write_active_console_text(buf) {
+        return result;
+    }
     ax_hal::console::write_text_bytes(buf);
     Ok(buf.len())
 }
@@ -91,7 +96,8 @@ impl Write for Stdout {
 
 /// Constructs a new handle to the standard input of the current process.
 pub fn stdin() -> Stdin {
-    static INSTANCE: spin::Once<Mutex<BufReader<StdinRaw>>> = spin::Once::new();
+    static INSTANCE: ax_lazyinit::OnceLock<Mutex<BufReader<StdinRaw>>> =
+        ax_lazyinit::OnceLock::new();
     Stdin {
         inner: INSTANCE.call_once(|| Mutex::new(BufReader::new(StdinRaw))),
     }
@@ -131,6 +137,7 @@ impl super::fd_ops::FileLike for Stdin {
         Ok(PollState {
             readable: true,
             writable: true,
+            readiness_version: 0,
         })
     }
 
@@ -167,6 +174,7 @@ impl super::fd_ops::FileLike for Stdout {
         Ok(PollState {
             readable: true,
             writable: true,
+            readiness_version: 0,
         })
     }
 

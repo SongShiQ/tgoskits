@@ -1,6 +1,6 @@
 [package]
 name = "ax-hal"
-version = "0.5.14"
+version = "0.5.31"
 repository = "https://github.com/rcore-os/tgoskits"
 edition.workspace = true
 authors = ["Yuekai Jia <equation618@gmail.com>"]
@@ -8,107 +8,63 @@ description = "ArceOS hardware abstraction layer, provides unified APIs for plat
 license.workspace = true
 
 [features]
+axtest = ["dep:axtest", "irq"]
 smp = [
-    "ax-plat-x86-pc?/smp",
-    "ax-plat-aarch64-qemu-virt?/smp",
-    "ax-plat-riscv64-qemu-virt?/smp",
-    "ax-plat-loongarch64-qemu-virt?/smp",
-    "axplat-dyn?/smp",
+    "axplat-dyn/smp",
     "ax-plat/smp",
 ]
 irq = [
-    "ax-plat-x86-pc?/irq",
-    "ax-plat-aarch64-qemu-virt?/irq",
-    "ax-plat-riscv64-qemu-virt?/irq",
-    "ax-plat-loongarch64-qemu-virt?/irq",
     "ax-plat/irq",
-    "axplat-dyn?/irq",
+    "axplat-dyn/irq",
 ]
 fp-simd = [
     "ax-cpu/fp-simd",
-    "ax-plat-x86-pc?/fp-simd",
-    "ax-plat-aarch64-qemu-virt?/fp-simd",
-    "ax-plat-riscv64-qemu-virt?/fp-simd",
-    "ax-plat-loongarch64-qemu-virt?/fp-simd",
-    "axplat-dyn?/fp-simd",
+    "axplat-dyn/fp-simd",
 ]
-rtc = [
-    "ax-plat-x86-pc?/rtc",
-    "ax-plat-aarch64-qemu-virt?/rtc",
-    "ax-plat-riscv64-qemu-virt?/rtc",
-    "ax-plat-loongarch64-qemu-virt?/rtc",
-    "axplat-dyn?/rtc",
-]
-# Forward the GICv3 toggle to the aarch64 qemu-virt platform.
-# `?` lets non-aarch64 builds pass the feature through without
-# requiring the optional dependency. Orthogonal to
-# `aarch64-cntv-timer` below.
-aarch64-gic-v3 = ["ax-plat-aarch64-qemu-virt?/gic-v3"]
-# Forward the CNTV (virtual generic timer) toggle to the aarch64
-# qemu-virt platform. Required under Apple HVF because CNTP is
-# owned by EL2 there. Orthogonal to `aarch64-gic-v3`.
-aarch64-cntv-timer = ["ax-plat-aarch64-qemu-virt?/cntv-timer"]
+xuantie-c9xx = ["ax-cpu/xuantie-c9xx"]
+rtc = ["axplat-dyn/rtc"]
 paging = [
     "dep:ax-alloc",
-    "dep:ax-page-table-multiarch",
-    "ax-page-table-multiarch/ax-errno",
+    "dep:page-table-generic",
 ]
-tls = ["ax-cpu/tls"]
-uspace = ["paging", "ax-cpu/uspace", "axplat-dyn?/uspace"]
+tls = ["ax-cpu/tls", "cpu-local/tls", "axplat-dyn/tls"]
+uspace = ["paging", "ax-cpu/uspace", "axplat-dyn/uspace"]
 hv = [
     "paging",
     "ax-cpu/arm-el2",
     "ax-cpu/exception-table",
-    "ax-percpu/arm-el2",
-    "axplat-dyn?/hv",
+    "axplat-dyn/hv",
 ]
-axvisor-linker = []
-
-starry-kcov = []
-
-# Custom or default platforms
-myplat = []
-plat-dyn = ["axplat-dyn"]
-defplat = [
-    "dep:ax-plat-x86-pc",
-    "dep:ax-plat-aarch64-qemu-virt",
-    "dep:ax-plat-riscv64-qemu-virt",
-    "dep:ax-plat-loongarch64-qemu-virt",
+host-test = [
+    "cpu-local/host-test",
+    "ax-cpu/host-test",
+    "ax-percpu/host-test",
+    "ax-sync/host-test",
 ]
 
 default = []
 ipi = ["irq"]
 
 [dependencies]
+axtest = { workspace = true, optional = true }
 ax-alloc = { workspace = true, optional = true }
-ax-config.workspace = true
 ax-cpu.workspace = true
+cpu-local.workspace = true
 ax-plat.workspace = true
+ax-lazyinit.workspace = true
 cfg-if.workspace = true
 fdt-parser = "0.4"
 heapless = "0.9"
-ax-kernel-guard.workspace = true
+ax-sync.workspace = true
 log.workspace = true
 ax-memory-addr.workspace = true
-ax-page-table-multiarch = { workspace = true, optional = true }
-ax-percpu = { workspace = true, features = ["non-zero-vma"] }
-spin.workspace = true
-
-[target.'cfg(target_arch = "x86_64")'.dependencies]
-ax-plat-x86-pc = { workspace = true, optional = true }
-
-[target.'cfg(target_os = "none")'.dependencies]
-axplat-dyn = { workspace = true, default-features = false, optional = true }
-
-[target.'cfg(target_arch = "aarch64")'.dependencies]
-ax-plat-aarch64-qemu-virt = { workspace = true, optional = true }
-
-[target.'cfg(target_arch = "riscv64")'.dependencies]
-ax-plat-riscv64-qemu-virt = { workspace = true, optional = true }
-
-[target.'cfg(target_arch = "loongarch64")'.dependencies]
-ax-plat-loongarch64-qemu-virt = { workspace = true, optional = true }
+ax-percpu.workspace = true
+axplat-dyn = { workspace = true, default-features = false }
+page-table-generic = { workspace = true, optional = true }
+rdrive.workspace = true
 
 [build-dependencies]
-ax-config.workspace = true
-toml.workspace = true
+quote = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(axtest)'] }

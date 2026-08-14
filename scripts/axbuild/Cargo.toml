@@ -6,16 +6,18 @@ keywords.workspace = true
 license.workspace = true
 name = "axbuild"
 repository.workspace = true
-version = "0.4.7"
+version = "0.4.23"
 description = "An OS build lib toolkit used by arceos"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(axtest)'] }
 
 [target.'cfg(any(windows, unix))'.dependencies]
 anyhow = { workspace = true }
-ax-config-gen = { workspace = true }
 axvmconfig = { workspace = true, features = ["std"] }
 cargo_metadata = "0.23"
 chrono = { version = "0.4", features = ["serde"] }
-clap = { version = "4.6", features = ["derive"], optional = true }
+clap = { version = "4.6", features = ["derive"] }
 colored = { version = "3" }
 env_logger = { workspace = true }
 futures-util = "0.3"
@@ -26,6 +28,7 @@ log = "0.4"
 object = "0.38"
 ostool = { workspace = true }
 regex = { version = "1.12" }
+regex-automata = "0.4.16"
 reqwest = { version = "0.13", features = ["stream"] }
 addr2line = "0.26"
 rustc-demangle = "0.1"
@@ -34,16 +37,17 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1" }
 sha2 = { version = "0.10" }
 tar = { version = "0.4" }
-tokio = { version = "1.0", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "time"], optional = true }
-toml.workspace = true
+tempfile = "3"
+tokio = { version = "1.0", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "time"] }
+toml = { workspace = true, features = ["serde", "parse", "display"] }
 tracing = "0.1"
 tracing-log = "0.2"
 tracing-subscriber = { version = "0.3", features = ["fmt", "std", "time"] }
 xz2 = "0.1"
 raw-cpuid = "11.0"
-proc-macro2 = { version = "1", features = ["span-locations"] }
-quote = "1"
-syn = { version = "2", features = ["full", "visit"] }
+proc-macro2 = { workspace = true, features = ["span-locations"] }
+quote = { workspace = true }
+syn = { workspace = true, features = ["full", "visit"] }
 walkdir = "2"
 
 [target.'cfg(windows)'.dependencies]
@@ -55,12 +59,3 @@ windows-sys = { version = "0.59", features = [
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-
-[features]
-clap = ["dep:clap", "dep:tokio"]
-cli = ["dep:clap", "tokio"]
-default = ["cli"]
-tokio = ["dep:tokio", "dep:clap"]
-
-[dev-dependencies]
-tempfile = "3"

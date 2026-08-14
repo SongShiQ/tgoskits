@@ -50,9 +50,10 @@ mod tests {
             let mut devices = Vec::new();
             for _ in 0..50 {
                 let ls2 = host.probe_devices().await.unwrap();
-                if !ls2.is_empty() {
-                    info!("found {} devices", ls2.len());
+                if !ls2.connected.is_empty() {
+                    info!("found {} devices", ls2.connected.len());
                     devices = ls2
+                        .connected
                         .into_iter()
                         .filter_map(|device| device.into_device_info())
                         .collect();
@@ -347,7 +348,7 @@ mod tests {
                     println!("bar0: {:#x}", bar_addr);
                     println!("bar0 size: {:#x}", bar_size);
                     bar_size = bar_size.align_up(0x1000);
-                    println!("bar0 size algin: {:#x}", bar_size);
+                    println!("bar0 size align: {:#x}", bar_size);
 
                     let addr = iomap(bar_addr.into(), bar_size);
                     trace!("pin {:?}", ep.interrupt_pin);

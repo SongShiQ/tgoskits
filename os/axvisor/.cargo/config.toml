@@ -1,3 +1,6 @@
+[alias]
+xtask = "run --package axvisor --bin xtask --features host-xtask --"
+
 include = [{path = "../../../.cargo/.config-local.toml", optional = true}]
 
 [net]
@@ -11,7 +14,7 @@ lto = true
 rustflags = [
     "-Clink-args=-no-pie",
     "-Clink-args=-znostart-stop-gc",
-    "-Clink-args=-Tlink.x",
+    "-Clink-args=-Tlinker.x",
 ]
 
 # Comment out because it's specified by runner in tgoskits
@@ -20,18 +23,15 @@ rustflags = [
 #     "-Crelocation-model=pic",
 #     "-Clink-args=-pie",
 #     "-Clink-args=-znostart-stop-gc",
-#     "-Clink-args=-Taxplat.x",
+#     "-Clink-args=-Tlinker.x",
 # ]
 
 [target.riscv64gc-unknown-none-elf]
 rustflags = [
     "-Clink-args=-no-pie",
     "-Clink-args=-znostart-stop-gc",
-    "-Clink-args=-Tlink.x",
+    "-Clink-args=-Tlinker.x",
 ]
 
 [target.'cfg(target_os = "none")']
 runner = "cargo osrun"
-
-[alias]
-xtask = "run --bin xtask --"

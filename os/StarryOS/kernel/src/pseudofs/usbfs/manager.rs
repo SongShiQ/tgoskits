@@ -6,18 +6,19 @@ use core::{
 };
 
 use ax_errno::{AxError, AxResult, LinuxError};
+use ax_runtime::hal::irq::IrqId;
+use ax_task::IrqNotify;
 use crab_usb::{
-    Device, DeviceInfo, Endpoint, EventHandler, ProbedDevice,
+    Device, DeviceInfo, EndpointHandle, InterfaceSession, ProbeChanges,
     usb_if::{
         endpoint::{RequestId, TransferCompletion, TransferRequest},
         err::{TransferError, USBError},
-        host::ControlSetup,
+        host::{ControlSetup, hub::Speed},
         transfer::{Direction, Recipient, Request, RequestType},
     },
 };
-use event_listener::{Event as NotifyEvent, listener};
+use event_listener::Event as NotifyEvent;
 use rdrive::DeviceId as RDriveDeviceId;
-use spin::{Mutex, RwLock};
 use starry_vm::{VmMutPtr, vm_load, vm_write_slice};
 
 use super::{
@@ -31,6 +32,7 @@ use super::{
     },
     irq::{self, PendingUsbIrqSlot},
 };
+use crate::sync::{IrqMutex as Mutex, Mutex as BlockingMutex};
 
 const ROOT_HUB_STABLE_DEVICE_ID: usize = usize::MAX;
 const USB_REQ_GET_DESCRIPTOR: u8 = 0x06;
@@ -41,7 +43,8 @@ const USB_DT_CONFIG: u16 = 0x02;
 pub(super) struct UsbHostState {
     pub(super) device_id: RDriveDeviceId,
     pub(super) bus_num: u8,
-    pub(super) irq_num: Option<usize>,
+    pub(super) irq: Option<IrqId>,
+    pub(super) root_hub_speed: Speed,
     pub(super) needs_probe: bool,
     pub(super) next_device_num: u8,
     pub(super) stable_id_to_device_num: BTreeMap<usize, u8>,
@@ -71,13 +74,14 @@ struct UsbDeviceRecord {
     next_session_id: u64,
 }
 
-type EndpointHandle = Arc<Mutex<Endpoint>>;
+struct LiveInterfaceSession {
+    owner: u64,
+    session: InterfaceSession,
+}
 
 struct LiveDeviceState {
-    device: Mutex<Device>,
-    endpoints: RwLock<BTreeMap<u8, EndpointHandle>>,
-    endpoint_interfaces: RwLock<BTreeMap<u8, u8>>,
-    interface_owners: Mutex<BTreeMap<u8, u64>>,
+    device: BlockingMutex<Device>,
+    interfaces: BlockingMutex<BTreeMap<u8, LiveInterfaceSession>>,
 }
 
 pub(super) struct IsoTransferResult {
@@ -86,6 +90,12 @@ pub(super) struct IsoTransferResult {
 
 pub(super) struct SubmittedTransfer {
     inner: SubmittedTransferInner,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum SubmittedTransferQueue {
+    Endpoint(usize),
+    Control(usize),
 }
 
 enum SubmittedTransferInner {
@@ -122,15 +132,23 @@ impl Clone for SubmittedTransfer {
 }
 
 impl SubmittedTransfer {
+    pub(super) fn queue_key(&self) -> SubmittedTransferQueue {
+        match &self.inner {
+            SubmittedTransferInner::Endpoint { endpoint, .. } => {
+                SubmittedTransferQueue::Endpoint(endpoint.info().address.raw() as usize)
+            }
+            SubmittedTransferInner::Control { live_device, .. } => {
+                SubmittedTransferQueue::Control(Arc::as_ptr(live_device) as usize)
+            }
+        }
+    }
+
     pub(super) fn try_reclaim(&self) -> AxResult<Option<TransferCompletion>> {
         match &self.inner {
             SubmittedTransferInner::Endpoint {
                 endpoint,
                 request_id,
-            } => endpoint
-                .lock()
-                .reclaim(*request_id)
-                .map_err(map_transfer_error),
+            } => endpoint.reclaim(*request_id).map_err(map_transfer_error),
             SubmittedTransferInner::Control {
                 live_device,
                 request_id,
@@ -148,7 +166,7 @@ impl SubmittedTransfer {
             SubmittedTransferInner::Endpoint {
                 endpoint,
                 request_id,
-            } => endpoint.lock().poll_request(*request_id, cx),
+            } => endpoint.poll_request(*request_id, cx),
             SubmittedTransferInner::Control {
                 live_device,
                 request_id,
@@ -169,10 +187,7 @@ impl SubmittedTransfer {
             SubmittedTransferInner::Endpoint {
                 endpoint,
                 request_id,
-            } => endpoint
-                .lock()
-                .cancel(*request_id)
-                .map_err(map_transfer_error),
+            } => endpoint.cancel(*request_id).map_err(map_transfer_error),
             SubmittedTransferInner::Control {
                 live_device,
                 request_id,
@@ -190,15 +205,10 @@ fn wait_endpoint(
     endpoint: EndpointHandle,
     request: TransferRequest,
 ) -> AxResult<TransferCompletion> {
-    let request_id = endpoint
-        .lock()
-        .submit(request)
-        .map_err(map_transfer_error)?;
-    ax_task::future::block_on(poll_fn(|cx| {
-        match endpoint.lock().poll_request(request_id, cx) {
-            Poll::Ready(result) => Poll::Ready(result.map_err(map_transfer_error)),
-            Poll::Pending => Poll::Pending,
-        }
+    let request_id = endpoint.submit(request).map_err(map_transfer_error)?;
+    ax_task::future::block_on(poll_fn(|cx| match endpoint.poll_request(request_id, cx) {
+        Poll::Ready(result) => Poll::Ready(result.map_err(map_transfer_error)),
+        Poll::Pending => Poll::Pending,
     }))
 }
 
@@ -227,9 +237,9 @@ fn wait_control(
 
 pub(super) struct UsbFsManager {
     state: Mutex<UsbFsState>,
-    open_lock: Mutex<()>,
-    pub(super) refresh_event: NotifyEvent,
+    open_lock: BlockingMutex<()>,
     usb_activity: UsbActivity,
+    irq_notify: IrqNotify,
 }
 
 struct UsbActivity {
@@ -268,21 +278,23 @@ impl UsbDeviceLease {
     }
 
     pub(super) fn bulk_in(&self, endpoint: u8, data: &mut [u8]) -> AxResult<usize> {
-        self.manager.live_bulk_in(self.stable_id, endpoint, data)
+        self.manager
+            .live_bulk_in(self.stable_id, self.session_id, endpoint, data)
     }
 
     pub(super) fn bulk_out(&self, endpoint: u8, data: &[u8]) -> AxResult<usize> {
-        self.manager.live_bulk_out(self.stable_id, endpoint, data)
+        self.manager
+            .live_bulk_out(self.stable_id, self.session_id, endpoint, data)
     }
 
     pub(super) fn interrupt_in(&self, endpoint: u8, data: &mut [u8]) -> AxResult<usize> {
         self.manager
-            .live_interrupt_in(self.stable_id, endpoint, data)
+            .live_interrupt_in(self.stable_id, self.session_id, endpoint, data)
     }
 
     pub(super) fn interrupt_out(&self, endpoint: u8, data: &[u8]) -> AxResult<usize> {
         self.manager
-            .live_interrupt_out(self.stable_id, endpoint, data)
+            .live_interrupt_out(self.stable_id, self.session_id, endpoint, data)
     }
 
     pub(super) fn iso_in(
@@ -291,8 +303,13 @@ impl UsbDeviceLease {
         data: &mut [u8],
         packet_lengths: &[usize],
     ) -> AxResult<IsoTransferResult> {
-        self.manager
-            .live_iso_in(self.stable_id, endpoint, data, packet_lengths)
+        self.manager.live_iso_in(
+            self.stable_id,
+            self.session_id,
+            endpoint,
+            data,
+            packet_lengths,
+        )
     }
 
     pub(super) fn iso_out(
@@ -301,8 +318,13 @@ impl UsbDeviceLease {
         data: &[u8],
         packet_lengths: &[usize],
     ) -> AxResult<usize> {
-        self.manager
-            .live_iso_out(self.stable_id, endpoint, data, packet_lengths)
+        self.manager.live_iso_out(
+            self.stable_id,
+            self.session_id,
+            endpoint,
+            data,
+            packet_lengths,
+        )
     }
 
     pub(super) fn submit_endpoint_transfer(
@@ -310,8 +332,12 @@ impl UsbDeviceLease {
         endpoint: u8,
         request: TransferRequest,
     ) -> AxResult<SubmittedTransfer> {
-        self.manager
-            .live_submit_endpoint_transfer(self.stable_id, endpoint, request)
+        self.manager.live_submit_endpoint_transfer(
+            self.stable_id,
+            self.session_id,
+            endpoint,
+            request,
+        )
     }
 
     pub(super) fn submit_control_transfer(
@@ -322,14 +348,32 @@ impl UsbDeviceLease {
             .live_submit_control_transfer(self.stable_id, request)
     }
 
-    pub(super) fn release_endpoints(&self, endpoints: &[u8]) -> AxResult<()> {
-        self.manager
-            .live_release_endpoints(self.stable_id, endpoints)
+    pub(super) fn control_transfer(
+        &self,
+        b_request_type: u8,
+        b_request: u8,
+        w_value: u16,
+        w_index: u16,
+        data: &mut [u8],
+    ) -> AxResult<usize> {
+        self.manager.live_control_transfer(
+            self.stable_id,
+            b_request_type,
+            b_request,
+            w_value,
+            w_index,
+            data,
+        )
     }
 
     pub(super) fn release_interface(&self, interface: u8) -> AxResult<()> {
         self.manager
             .live_release_interface(self.stable_id, self.session_id, interface)
+    }
+
+    pub(super) fn clear_halt(&self, endpoint: u8) -> AxResult<()> {
+        self.manager
+            .live_clear_halt(self.stable_id, self.session_id, endpoint)
     }
 }
 
@@ -352,7 +396,7 @@ impl UsbFsManager {
                 },
                 UsbDeviceRecord {
                     host_device_id: host.device_id,
-                    snapshot: root_hub_snapshot(host.bus_num),
+                    snapshot: root_hub_snapshot(host.bus_num, host.root_hub_speed),
                     present: true,
                     unopened_info: None,
                     live_device: None,
@@ -366,15 +410,23 @@ impl UsbFsManager {
 
         Self {
             state: Mutex::new(UsbFsState { hosts, devices }),
-            open_lock: Mutex::new(()),
-            refresh_event: NotifyEvent::new(),
+            open_lock: BlockingMutex::new(()),
             usb_activity: UsbActivity::new(),
+            irq_notify: IrqNotify::new(),
         }
     }
 
-    pub(super) fn notify_usb_activity(&self) {
+    pub(super) fn notify_usb_activity_from_irq(&self) {
         self.usb_activity.seq.fetch_add(1, Ordering::AcqRel);
-        self.usb_activity.event.notify(usize::MAX);
+        self.irq_notify.notify_irq();
+    }
+
+    pub(super) fn notify_topology_from_irq(&self) {
+        self.irq_notify.notify_irq();
+    }
+
+    pub(super) fn notify_refresh(&self) {
+        self.irq_notify.notify();
     }
 
     pub(super) fn usb_activity_seq(&self) -> u64 {
@@ -385,65 +437,63 @@ impl UsbFsManager {
         self.usb_activity.event.listen()
     }
 
+    pub(super) fn has_hosts(&self) -> bool {
+        !self.state.lock().hosts.is_empty()
+    }
+
     pub(super) fn refresh_dirty_hosts(&self) {
-        #[cfg(not(target_os = "none"))]
-        return;
-        #[cfg(target_os = "none")]
-        {
-            let pending_hosts = {
-                let mut state = self.state.lock();
-                let open_hosts = state
-                    .devices
-                    .values()
-                    .filter(|record| record.open_count > 0)
-                    .map(|record| record.host_device_id)
-                    .collect::<Vec<_>>();
-                let mut pending = Vec::new();
-                for host in &mut state.hosts {
-                    let irq_dirty = host.irq_num.map(irq::take_dirty).unwrap_or(false);
-                    if open_hosts.contains(&host.device_id) {
-                        host.needs_probe |= irq_dirty;
-                        continue;
-                    }
-                    if host.needs_probe || irq_dirty {
-                        host.needs_probe = false;
-                        pending.push((host.device_id, host.bus_num));
-                    }
+        let pending_hosts = {
+            let mut state = self.state.lock();
+            let open_hosts = state
+                .devices
+                .values()
+                .filter(|record| record.open_count > 0)
+                .map(|record| record.host_device_id)
+                .collect::<Vec<_>>();
+            let mut pending = Vec::new();
+            for host in &mut state.hosts {
+                let irq_dirty = host.irq.map(irq::take_dirty).unwrap_or(false);
+                if open_hosts.contains(&host.device_id) {
+                    host.needs_probe |= irq_dirty;
+                    continue;
                 }
-                pending
+                if host.needs_probe || irq_dirty {
+                    host.needs_probe = false;
+                    pending.push((host.device_id, host.bus_num));
+                }
+            }
+            pending
+        };
+
+        for (device_id, bus_num) in pending_hosts {
+            let host = match rdrive::get::<ax_driver::usb::PlatformUsbHost>(device_id) {
+                Ok(host) => host,
+                Err(err) => {
+                    warn!(
+                        "usbfs: failed to reacquire USB host {:?}: {err:?}",
+                        device_id
+                    );
+                    continue;
+                }
             };
 
-            for (device_id, bus_num) in pending_hosts {
-                let host = match rdrive::get::<axplat_dyn::drivers::usb::PlatformUsbHost>(device_id)
-                {
-                    Ok(host) => host,
-                    Err(err) => {
-                        warn!(
-                            "usbfs: failed to reacquire USB host {:?}: {err:?}",
-                            device_id
-                        );
-                        continue;
-                    }
-                };
+            let mut guard = match host.lock() {
+                Ok(guard) => guard,
+                Err(err) => {
+                    warn!("usbfs: failed to lock USB host {:?}: {err:?}", device_id);
+                    continue;
+                }
+            };
 
-                let mut guard = match host.lock() {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        warn!("usbfs: failed to lock USB host {:?}: {err:?}", device_id);
-                        continue;
-                    }
-                };
-
-                let devices = match ax_task::future::block_on(guard.host_mut().probe_devices()) {
-                    Ok(devices) => devices,
-                    Err(err) => {
-                        warn!("usbfs: refresh probe failed on bus {bus_num}: {err:?}");
-                        continue;
-                    }
-                };
-                drop(guard);
-                self.apply_probe_results(device_id, bus_num, devices);
-            }
+            let devices = match ax_task::future::block_on(guard.host_mut().probe_devices()) {
+                Ok(devices) => devices,
+                Err(err) => {
+                    warn!("usbfs: refresh probe failed on bus {bus_num}: {err:?}");
+                    continue;
+                }
+            };
+            drop(guard);
+            self.apply_probe_results(device_id, bus_num, devices);
         }
     }
 
@@ -576,12 +626,11 @@ impl UsbFsManager {
         }
     }
 
-    fn apply_probe_results(
-        &self,
-        device_id: RDriveDeviceId,
-        bus_num: u8,
-        devices: Vec<ProbedDevice>,
-    ) {
+    fn apply_probe_results(&self, device_id: RDriveDeviceId, bus_num: u8, changes: ProbeChanges) {
+        let ProbeChanges {
+            connected: devices,
+            disconnected,
+        } = changes;
         let mut state = self.state.lock();
         let Some(host_index) = state
             .hosts
@@ -612,6 +661,20 @@ impl UsbFsManager {
             updates
         };
 
+        let disconnected_devices = disconnected
+            .into_iter()
+            .filter_map(|disconnected_id| {
+                let stable_id = UsbStableId {
+                    host_device_id: device_id,
+                    device_id: disconnected_id,
+                };
+                let record = state.devices.get_mut(&stable_id)?;
+                record.present = false;
+                record.unopened_info = None;
+                record.live_device.clone()
+            })
+            .collect::<Vec<_>>();
+
         for (stable_id, snapshot, unopened_info, openable) in updates {
             let record = state
                 .devices
@@ -632,6 +695,14 @@ impl UsbFsManager {
             record.present = true;
             record.openable = openable;
             record.unopened_info = unopened_info;
+        }
+        drop(state);
+
+        for live_device in disconnected_devices {
+            let mut device = live_device.device.lock();
+            if let Err(err) = ax_task::future::block_on(device.disconnect()) {
+                warn!("usbfs: failed to quiesce disconnected USB device: {err:?}");
+            }
         }
     }
 
@@ -681,10 +752,8 @@ impl UsbFsManager {
                     let mut state = self.state.lock();
                     let record = state.devices.get_mut(&stable_id).ok_or(AxError::NotFound)?;
                     record.live_device = Some(Arc::new(LiveDeviceState {
-                        device: Mutex::new(live_device),
-                        endpoints: RwLock::new(BTreeMap::new()),
-                        endpoint_interfaces: RwLock::new(BTreeMap::new()),
-                        interface_owners: Mutex::new(BTreeMap::new()),
+                        device: BlockingMutex::new(live_device),
+                        interfaces: BlockingMutex::new(BTreeMap::new()),
                     }));
                     return Ok(());
                 }
@@ -698,9 +767,8 @@ impl UsbFsManager {
         }
     }
 
-    #[cfg(target_os = "none")]
     fn open_device(&self, host_device_id: RDriveDeviceId, info: &DeviceInfo) -> AxResult<Device> {
-        let host = rdrive::get::<axplat_dyn::drivers::usb::PlatformUsbHost>(host_device_id)
+        let host = rdrive::get::<ax_driver::usb::PlatformUsbHost>(host_device_id)
             .map_err(|_| AxError::NoSuchDevice)?;
         let mut guard = host.lock().map_err(|_| AxError::ResourceBusy)?;
         ax_task::future::block_on(guard.host_mut().open_device(info)).map_err(|err| {
@@ -714,15 +782,8 @@ impl UsbFsManager {
         })
     }
 
-    #[cfg(not(target_os = "none"))]
-    fn open_device(&self, host_device_id: RDriveDeviceId, info: &DeviceInfo) -> AxResult<Device> {
-        let _ = (host_device_id, info);
-        Err(AxError::Unsupported)
-    }
-
-    #[cfg(target_os = "none")]
     fn refresh_host(&self, host_device_id: RDriveDeviceId, bus_num: u8) -> AxResult<()> {
-        let host = rdrive::get::<axplat_dyn::drivers::usb::PlatformUsbHost>(host_device_id)
+        let host = rdrive::get::<ax_driver::usb::PlatformUsbHost>(host_device_id)
             .map_err(|_| AxError::NoSuchDevice)?;
         let mut guard = host.lock().map_err(|_| AxError::ResourceBusy)?;
         let devices =
@@ -730,12 +791,6 @@ impl UsbFsManager {
         drop(guard);
         self.apply_probe_results(host_device_id, bus_num, devices);
         Ok(())
-    }
-
-    #[cfg(not(target_os = "none"))]
-    fn refresh_host(&self, host_device_id: RDriveDeviceId, bus_num: u8) -> AxResult<()> {
-        let _ = (host_device_id, bus_num);
-        Err(AxError::Unsupported)
     }
 
     fn snapshot_by_id(&self, stable_id: UsbStableId) -> AxResult<UsbDeviceSnapshot> {
@@ -756,13 +811,19 @@ impl UsbFsManager {
             .ok_or(AxError::NoSuchDevice)
     }
 
-    fn live_endpoint(&self, stable_id: UsbStableId, endpoint: u8) -> AxResult<EndpointHandle> {
+    fn live_endpoint(
+        &self,
+        stable_id: UsbStableId,
+        session_id: u64,
+        endpoint: u8,
+    ) -> AxResult<EndpointHandle> {
         let live_device = self.live_device_by_id(stable_id)?;
         live_device
-            .endpoints
-            .read()
-            .get(&endpoint)
-            .cloned()
+            .interfaces
+            .lock()
+            .values()
+            .filter(|claimed| claimed.owner == session_id)
+            .find_map(|claimed| claimed.session.endpoint(endpoint).ok())
             .ok_or(AxError::NotFound)
     }
 
@@ -786,6 +847,31 @@ impl UsbFsManager {
         }
     }
 
+    fn live_clear_halt(
+        &self,
+        stable_id: UsbStableId,
+        session_id: u64,
+        endpoint: u8,
+    ) -> AxResult<()> {
+        self.live_ensure_configured(stable_id)?;
+        let live_device = self.live_device_by_id(stable_id)?;
+        let endpoint_handle = self.live_endpoint(stable_id, session_id, endpoint)?;
+
+        clear_halt_then_reset(
+            || {
+                wait_control(
+                    live_device,
+                    TransferRequest::control_out(clear_halt_setup(endpoint), &[]),
+                )
+                .map(|_| ())
+            },
+            || {
+                let reset = endpoint_handle.reset();
+                ax_task::future::block_on(reset).map_err(map_transfer_error)
+            },
+        )
+    }
+
     fn live_claim_interface(
         &self,
         stable_id: UsbStableId,
@@ -795,49 +881,26 @@ impl UsbFsManager {
     ) -> AxResult<()> {
         self.live_ensure_configured(stable_id)?;
         let live_device = self.live_device_by_id(stable_id)?;
-        {
-            let mut owners = live_device.interface_owners.lock();
-            if let Some(owner) = owners.get(&interface)
-                && *owner != session_id
-            {
+        let mut interfaces = live_device.interfaces.lock();
+        let mut device = live_device.device.lock();
+        if let Some(claimed) = interfaces.get_mut(&interface) {
+            if claimed.owner != session_id {
                 return Err(AxError::ResourceBusy);
             }
-            owners.insert(interface, session_id);
+            return ax_task::future::block_on(
+                claimed.session.set_alternate(&mut device, alternate),
+            )
+            .map_err(map_usb_error);
         }
-
-        {
-            let mut device = live_device.device.lock();
-            if let Err(err) =
-                ax_task::future::block_on(device.claim_interface(interface, alternate))
-                    .map_err(map_usb_error)
-            {
-                live_device.interface_owners.lock().remove(&interface);
-                return Err(err);
-            }
-            let endpoints = match device.take_endpoints_for_interface(interface) {
-                Ok(endpoints) => endpoints,
-                Err(err) => {
-                    live_device.interface_owners.lock().remove(&interface);
-                    return Err(map_usb_error(err));
-                }
-            };
-            let mut live_endpoints = live_device.endpoints.write();
-            let mut endpoint_interfaces = live_device.endpoint_interfaces.write();
-            let stale_endpoints = endpoint_interfaces
-                .iter()
-                .filter_map(|(address, ep_interface)| {
-                    (*ep_interface == interface).then_some(*address)
-                })
-                .collect::<Vec<_>>();
-            for address in stale_endpoints {
-                endpoint_interfaces.remove(&address);
-                live_endpoints.remove(&address);
-            }
-            for (address, endpoint) in endpoints {
-                endpoint_interfaces.insert(address, interface);
-                live_endpoints.insert(address, Arc::new(Mutex::new(endpoint)));
-            }
-        }
+        let session = ax_task::future::block_on(device.claim_interface(interface, alternate))
+            .map_err(map_usb_error)?;
+        interfaces.insert(
+            interface,
+            LiveInterfaceSession {
+                owner: session_id,
+                session,
+            },
+        );
         Ok(())
     }
 
@@ -859,28 +922,34 @@ impl UsbFsManager {
 
     fn live_set_configuration(&self, stable_id: UsbStableId, configuration: u8) -> AxResult<()> {
         let live_device = self.live_device_by_id(stable_id)?;
+        let mut interfaces = live_device.interfaces.lock();
         let mut device = live_device.device.lock();
         ax_task::future::block_on(device.set_configuration(configuration))
             .map_err(map_usb_error)?;
-        live_device.endpoints.write().clear();
-        live_device.endpoint_interfaces.write().clear();
-        live_device.interface_owners.lock().clear();
+        interfaces.clear();
         Ok(())
     }
 
     fn live_bulk_in(
         &self,
         stable_id: UsbStableId,
+        session_id: u64,
         endpoint: u8,
         data: &mut [u8],
     ) -> AxResult<usize> {
-        let endpoint = self.live_endpoint(stable_id, endpoint)?;
+        let endpoint = self.live_endpoint(stable_id, session_id, endpoint)?;
         wait_endpoint(endpoint, TransferRequest::bulk_in(data))
             .map(|completion| completion.actual_length)
     }
 
-    fn live_bulk_out(&self, stable_id: UsbStableId, endpoint: u8, data: &[u8]) -> AxResult<usize> {
-        let endpoint = self.live_endpoint(stable_id, endpoint)?;
+    fn live_bulk_out(
+        &self,
+        stable_id: UsbStableId,
+        session_id: u64,
+        endpoint: u8,
+        data: &[u8],
+    ) -> AxResult<usize> {
+        let endpoint = self.live_endpoint(stable_id, session_id, endpoint)?;
         wait_endpoint(endpoint, TransferRequest::bulk_out(data))
             .map(|completion| completion.actual_length)
     }
@@ -888,10 +957,11 @@ impl UsbFsManager {
     fn live_interrupt_in(
         &self,
         stable_id: UsbStableId,
+        session_id: u64,
         endpoint: u8,
         data: &mut [u8],
     ) -> AxResult<usize> {
-        let endpoint = self.live_endpoint(stable_id, endpoint)?;
+        let endpoint = self.live_endpoint(stable_id, session_id, endpoint)?;
         wait_endpoint(endpoint, TransferRequest::interrupt_in(data))
             .map(|completion| completion.actual_length)
     }
@@ -899,10 +969,11 @@ impl UsbFsManager {
     fn live_interrupt_out(
         &self,
         stable_id: UsbStableId,
+        session_id: u64,
         endpoint: u8,
         data: &[u8],
     ) -> AxResult<usize> {
-        let endpoint = self.live_endpoint(stable_id, endpoint)?;
+        let endpoint = self.live_endpoint(stable_id, session_id, endpoint)?;
         wait_endpoint(endpoint, TransferRequest::interrupt_out(data))
             .map(|completion| completion.actual_length)
     }
@@ -910,11 +981,12 @@ impl UsbFsManager {
     fn live_iso_in(
         &self,
         stable_id: UsbStableId,
+        session_id: u64,
         endpoint: u8,
         data: &mut [u8],
         packet_lengths: &[usize],
     ) -> AxResult<IsoTransferResult> {
-        let endpoint = self.live_endpoint(stable_id, endpoint)?;
+        let endpoint = self.live_endpoint(stable_id, session_id, endpoint)?;
         wait_endpoint(endpoint, TransferRequest::iso_in(data, packet_lengths)).map(|completion| {
             IsoTransferResult {
                 actual_length: completion.actual_length,
@@ -925,11 +997,12 @@ impl UsbFsManager {
     fn live_iso_out(
         &self,
         stable_id: UsbStableId,
+        session_id: u64,
         endpoint: u8,
         data: &[u8],
         packet_lengths: &[usize],
     ) -> AxResult<usize> {
-        let endpoint = self.live_endpoint(stable_id, endpoint)?;
+        let endpoint = self.live_endpoint(stable_id, session_id, endpoint)?;
         wait_endpoint(endpoint, TransferRequest::iso_out(data, packet_lengths))
             .map(|completion| completion.actual_length)
     }
@@ -937,14 +1010,12 @@ impl UsbFsManager {
     fn live_submit_endpoint_transfer(
         &self,
         stable_id: UsbStableId,
+        session_id: u64,
         endpoint: u8,
         request: TransferRequest,
     ) -> AxResult<SubmittedTransfer> {
-        let endpoint = self.live_endpoint(stable_id, endpoint)?;
-        let request_id = endpoint
-            .lock()
-            .submit(request)
-            .map_err(map_transfer_error)?;
+        let endpoint = self.live_endpoint(stable_id, session_id, endpoint)?;
+        let request_id = endpoint.submit(request).map_err(map_transfer_error)?;
         Ok(SubmittedTransfer {
             inner: SubmittedTransferInner::Endpoint {
                 endpoint,
@@ -974,17 +1045,6 @@ impl UsbFsManager {
         })
     }
 
-    fn live_release_endpoints(&self, stable_id: UsbStableId, endpoints: &[u8]) -> AxResult<()> {
-        let live_device = self.live_device_by_id(stable_id)?;
-        let mut live_endpoints = live_device.endpoints.write();
-        let mut endpoint_interfaces = live_device.endpoint_interfaces.write();
-        for endpoint in endpoints {
-            live_endpoints.remove(endpoint);
-            endpoint_interfaces.remove(endpoint);
-        }
-        Ok(())
-    }
-
     fn live_release_interface(
         &self,
         stable_id: UsbStableId,
@@ -992,25 +1052,16 @@ impl UsbFsManager {
         interface: u8,
     ) -> AxResult<()> {
         let live_device = self.live_device_by_id(stable_id)?;
-        {
-            let mut owners = live_device.interface_owners.lock();
-            if owners.get(&interface).copied() == Some(session_id) {
-                owners.remove(&interface);
-            }
+        let mut interfaces = live_device.interfaces.lock();
+        let mut device = live_device.device.lock();
+        let claimed = interfaces
+            .get_mut(&interface)
+            .ok_or(AxError::InvalidInput)?;
+        if claimed.owner != session_id {
+            return Err(AxError::ResourceBusy);
         }
-
-        let stale_endpoints = live_device
-            .endpoint_interfaces
-            .read()
-            .iter()
-            .filter_map(|(address, ep_interface)| (*ep_interface == interface).then_some(*address))
-            .collect::<Vec<_>>();
-        let mut live_endpoints = live_device.endpoints.write();
-        let mut endpoint_interfaces = live_device.endpoint_interfaces.write();
-        for address in stale_endpoints {
-            live_endpoints.remove(&address);
-            endpoint_interfaces.remove(&address);
-        }
+        ax_task::future::block_on(claimed.session.release(&mut device)).map_err(map_usb_error)?;
+        interfaces.remove(&interface);
         Ok(())
     }
 
@@ -1145,112 +1196,130 @@ fn snapshot_config_blob(snapshot: &UsbDeviceSnapshot, index: usize) -> Option<&[
     None
 }
 
-pub(super) async fn usbfs_refresh_task(manager: Arc<UsbFsManager>) {
+pub(super) fn usbfs_refresh_task(manager: Arc<UsbFsManager>) {
     loop {
-        listener!(manager.refresh_event => refresh_listener);
-        refresh_listener.await;
+        manager.irq_notify.wait();
+        manager.usb_activity.event.notify(usize::MAX);
         manager.refresh_dirty_hosts();
     }
 }
 
 pub(super) fn initialize_hosts(manager: &UsbFsManager) -> usize {
-    #[cfg(not(target_os = "none"))]
-    {
-        let _ = manager;
-        0
-    }
-    #[cfg(target_os = "none")]
-    {
-        let hosts = {
-            let state = manager.state.lock();
-            state
-                .hosts
-                .iter()
-                .map(|host| (host.device_id, host.bus_num, host.irq_num))
-                .collect::<Vec<_>>()
-        };
+    let hosts = {
+        let state = manager.state.lock();
+        state
+            .hosts
+            .iter()
+            .map(|host| (host.device_id, host.bus_num, host.irq))
+            .collect::<Vec<_>>()
+    };
 
-        let mut initialized = 0usize;
-        let mut failed_device_ids = Vec::new();
+    let mut initialized = 0usize;
+    let mut failed_device_ids = Vec::new();
 
-        for (device_id, bus_num, irq_num) in hosts {
-            let host = match rdrive::get::<axplat_dyn::drivers::usb::PlatformUsbHost>(device_id) {
-                Ok(host) => host,
-                Err(err) => {
-                    warn!(
-                        "usbfs: failed to reacquire USB host {:?} for init: {err:?}",
-                        device_id
-                    );
-                    failed_device_ids.push((device_id, irq_num));
-                    continue;
-                }
-            };
-
-            let mut guard = match host.lock() {
-                Ok(guard) => guard,
-                Err(err) => {
-                    warn!(
-                        "usbfs: failed to lock USB host {:?} for init: {err:?}",
-                        device_id
-                    );
-                    failed_device_ids.push((device_id, irq_num));
-                    continue;
-                }
-            };
-
-            info!("usbfs: initializing host on bus {}", bus_num);
-            if let Err(err) = ax_task::future::block_on(guard.host_mut().init()) {
-                warn!("usbfs: failed to initialize USB host on bus {bus_num}: {err:?}");
-                failed_device_ids.push((device_id, irq_num));
+    for (device_id, bus_num, host_irq) in hosts {
+        let host = match rdrive::get::<ax_driver::usb::PlatformUsbHost>(device_id) {
+            Ok(host) => host,
+            Err(err) => {
+                warn!(
+                    "usbfs: failed to reacquire USB host {:?} for init: {err:?}",
+                    device_id
+                );
+                failed_device_ids.push((device_id, host_irq));
                 continue;
             }
+        };
 
-            let devices = match ax_task::future::block_on(guard.host_mut().probe_devices()) {
-                Ok(devices) => devices,
-                Err(err) => {
-                    warn!("usbfs: initial probe failed on bus {bus_num}: {err:?}");
-                    failed_device_ids.push((device_id, irq_num));
-                    continue;
+        let mut guard = match host.lock() {
+            Ok(guard) => guard,
+            Err(err) => {
+                warn!(
+                    "usbfs: failed to lock USB host {:?} for init: {err:?}",
+                    device_id
+                );
+                failed_device_ids.push((device_id, host_irq));
+                continue;
+            }
+        };
+
+        info!("usbfs: initializing host on bus {}", bus_num);
+        if let Err(err) = ax_task::future::block_on(guard.host_mut().init()) {
+            warn!("usbfs: failed to initialize USB host on bus {bus_num}: {err:?}");
+            failed_device_ids.push((device_id, host_irq));
+            continue;
+        }
+
+        if let Some(host_irq) = host_irq {
+            // DWC2 internal-DMA transfers complete through host-channel IRQs.
+            // Enable both the controller interrupt mask and the framework
+            // callback before the initial probe, because enumeration itself
+            // issues control transfers that wait for IRQ completions.
+            if let Err(err) = guard.enable_irq() {
+                warn!("usbfs: failed to enable host IRQ on bus {bus_num}: {err:?}");
+                failed_device_ids.push((device_id, Some(host_irq)));
+                continue;
+            }
+            if !irq::enable_irq(host_irq) {
+                warn!("usbfs: failed to enable framework IRQ for bus {bus_num}");
+                if let Err(err) = guard.disable_irq() {
+                    warn!("usbfs: failed to roll back host IRQ on bus {bus_num}: {err:?}");
                 }
-            };
-
-            info!("usbfs: host on bus {} initialized", bus_num);
-            initialized += 1;
-
-            if let Some(irq_num) = irq_num {
-                irq::bootstrap_irq(irq_num);
+                failed_device_ids.push((device_id, Some(host_irq)));
+                continue;
             }
-            manager.apply_probe_results(device_id, bus_num, devices);
+            irq::bootstrap_irq(host_irq);
         }
 
-        if !failed_device_ids.is_empty() {
-            let mut state = manager.state.lock();
-            state.hosts.retain(|host| {
-                !failed_device_ids
-                    .iter()
-                    .any(|(failed_device_id, _)| *failed_device_id == host.device_id)
-            });
-        }
-
-        for (_, irq_num) in failed_device_ids {
-            if let Some(irq_num) = irq_num {
-                let _ = ax_hal::irq::unregister(irq_num);
+        let devices = match ax_task::future::block_on(guard.host_mut().probe_devices()) {
+            Ok(devices) => devices,
+            Err(err) => {
+                warn!("usbfs: initial probe failed on bus {bus_num}: {err:?}");
+                if host_irq.is_some()
+                    && let Err(disable_err) = guard.disable_irq()
+                {
+                    warn!(
+                        "usbfs: failed to disable host IRQ after probe failure on bus {bus_num}: \
+                         {disable_err:?}"
+                    );
+                }
+                failed_device_ids.push((device_id, host_irq));
+                continue;
             }
-        }
-
-        info!("usbfs: {} host(s) ready", initialized);
-        initialized
+        };
+        info!("usbfs: host on bus {} initialized", bus_num);
+        initialized += 1;
+        manager.apply_probe_results(device_id, bus_num, devices);
     }
+
+    if !failed_device_ids.is_empty() {
+        let mut state = manager.state.lock();
+        state.hosts.retain(|host| {
+            !failed_device_ids
+                .iter()
+                .any(|(failed_device_id, _)| *failed_device_id == host.device_id)
+        });
+    }
+
+    for (_, host_irq) in failed_device_ids {
+        if let Some(host_irq) = host_irq {
+            irq::free_irq(host_irq);
+        }
+    }
+
+    info!("usbfs: {} host(s) ready", initialized);
+    initialized
 }
 
 fn map_transfer_error(err: TransferError) -> AxError {
     match err {
         TransferError::Timeout => AxError::TimedOut,
-        TransferError::Cancelled => AxError::from(LinuxError::ENOENT),
+        TransferError::Cancelled | TransferError::EndpointRevoked => {
+            AxError::from(LinuxError::ENOENT)
+        }
         TransferError::Stall => AxError::BrokenPipe,
         TransferError::QueueFull => AxError::ResourceBusy,
         TransferError::InvalidEndpoint => AxError::InvalidInput,
-        TransferError::NoDevice => AxError::NoSuchDevice,
+        TransferError::NoDevice | TransferError::Disconnected => AxError::NoSuchDevice,
         TransferError::NotSupported => AxError::Unsupported,
         TransferError::Other(_) => AxError::Io,
     }
@@ -1262,6 +1331,7 @@ fn map_usb_error(err: USBError) -> AxError {
         USBError::NoMemory => AxError::NoMemory,
         USBError::TransferError(err) => map_transfer_error(err),
         USBError::NotInitialized | USBError::ConfigurationNotSet => AxError::BadState,
+        USBError::InterfaceBroken => AxError::Io,
         USBError::NotFound => AxError::NoSuchDevice,
         USBError::InvalidParameter => AxError::InvalidInput,
         USBError::SlotLimitReached => AxError::ResourceBusy,
@@ -1311,55 +1381,114 @@ fn recipient_from_raw(raw: u8) -> Recipient {
     }
 }
 
-pub(super) fn discover_hosts() -> (Vec<UsbHostState>, Vec<PendingUsbIrqSlot>) {
-    #[cfg(not(target_os = "none"))]
-    {
-        (Vec::new(), Vec::new())
+fn clear_halt_setup(endpoint: u8) -> ControlSetup {
+    ControlSetup {
+        request_type: RequestType::Standard,
+        recipient: Recipient::Endpoint,
+        request: Request::ClearFeature,
+        value: 0,
+        index: endpoint as u16,
     }
-    #[cfg(target_os = "none")]
-    {
-        let hosts = rdrive::get_list::<axplat_dyn::drivers::usb::PlatformUsbHost>();
-        let mut initialized_hosts = Vec::new();
-        let mut irq_slots = Vec::new();
+}
 
-        for (index, host) in hosts.into_iter().enumerate() {
-            let device_id = host.descriptor().device_id();
-            let bus_num = (index + 1) as u8;
-            info!("usbfs: preparing host {:?} as bus {}", device_id, bus_num);
+fn clear_halt_then_reset<E>(
+    clear_device_halt: impl FnOnce() -> Result<(), E>,
+    reset_host_endpoint: impl FnOnce() -> Result<(), E>,
+) -> Result<(), E> {
+    clear_device_halt()?;
+    reset_host_endpoint()
+}
 
-            let mut guard = match host.lock() {
-                Ok(guard) => guard,
-                Err(err) => {
-                    warn!("usbfs: failed to lock USB host {device_id:?}: {err:?}");
-                    continue;
-                }
-            };
+pub(super) fn discover_hosts() -> (Vec<UsbHostState>, Vec<PendingUsbIrqSlot>) {
+    let hosts = rdrive::get_list::<ax_driver::usb::PlatformUsbHost>();
+    let mut initialized_hosts = Vec::new();
+    let mut irq_slots = Vec::new();
 
-            let irq_num = guard.irq_num();
-            info!("usbfs: creating event handler for bus {}", bus_num);
-            let event_handler: EventHandler = guard.host_mut().create_event_handler();
-            drop(guard);
+    for (index, host) in hosts.into_iter().enumerate() {
+        let device_id = host.descriptor().device_id();
+        let bus_num = (index + 1) as u8;
+        info!("usbfs: preparing host {:?} as bus {}", device_id, bus_num);
 
-            if let Some(irq_num) = irq_num {
-                irq_slots.push(PendingUsbIrqSlot {
-                    irq_num,
-                    device_id,
-                    bus_num,
-                    handler: event_handler,
-                });
+        let mut guard = match host.lock() {
+            Ok(guard) => guard,
+            Err(err) => {
+                warn!("usbfs: failed to lock USB host {device_id:?}: {err:?}");
+                continue;
             }
+        };
 
-            initialized_hosts.push(UsbHostState {
+        let host_irq =
+            guard.irq_cloned().and_then(|irq| {
+                match ax_runtime::irq::resolve_binding_irq(irq.clone()) {
+                    Ok(id) => Some(id),
+                    Err(err) => {
+                        warn!(
+                            "usbfs: failed to resolve IRQ binding {irq:?} for {device_id:?}: \
+                             {err:?}"
+                        );
+                        None
+                    }
+                }
+            });
+        let root_hub_speed = guard.root_hub_speed();
+        let irq_handler = guard
+            .take_event_handler()
+            .map(|handler| (host_irq, handler));
+        drop(guard);
+
+        if let Some((slot_irq, handler)) = irq_handler {
+            irq_slots.push(PendingUsbIrqSlot {
+                irq: slot_irq,
                 device_id,
                 bus_num,
-                irq_num,
-                needs_probe: true,
-                next_device_num: 1,
-                stable_id_to_device_num: BTreeMap::new(),
+                handler,
             });
         }
 
-        info!("usbfs: discovered {} USB host(s)", initialized_hosts.len());
-        (initialized_hosts, irq_slots)
+        initialized_hosts.push(UsbHostState {
+            device_id,
+            bus_num,
+            irq: host_irq,
+            root_hub_speed,
+            needs_probe: true,
+            next_device_num: 1,
+            stable_id_to_device_num: BTreeMap::new(),
+        });
+    }
+
+    info!("usbfs: discovered {} USB host(s)", initialized_hosts.len());
+    (initialized_hosts, irq_slots)
+}
+
+#[cfg(test)]
+mod tests {
+    use core::cell::Cell;
+
+    use super::*;
+
+    #[test]
+    fn clear_halt_uses_standard_endpoint_clear_feature_request() {
+        let setup = clear_halt_setup(0x82);
+        assert_eq!(setup.request_type as u8, RequestType::Standard as u8);
+        assert_eq!(setup.recipient as u8, Recipient::Endpoint as u8);
+        assert_eq!(u8::from(setup.request), u8::from(Request::ClearFeature));
+        assert_eq!(setup.value, 0);
+        assert_eq!(setup.index, 0x82);
+    }
+
+    #[test]
+    fn clear_halt_does_not_reset_host_endpoint_when_control_request_fails() {
+        let reset_called = Cell::new(false);
+
+        let result = clear_halt_then_reset(
+            || Err("control request failed"),
+            || {
+                reset_called.set(true);
+                Ok(())
+            },
+        );
+
+        assert_eq!(result, Err("control request failed"));
+        assert!(!reset_called.get());
     }
 }

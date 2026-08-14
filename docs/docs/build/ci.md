@@ -1,11 +1,11 @@
 ---
-sidebar_position: 7
+sidebar_position: 20
 sidebar_label: "自动 CI 测试"
 ---
 
 # 自动 CI 测试
 
-本文档说明 `.github/workflows/ci.yml`、`.github/workflows/reusable-command.yml` 和容器镜像在 CI 中的职责，以及当前测试矩阵、缓存策略和 self-hosted runner 的使用方式。
+本文档说明 `.github/workflows/ci.yml`、`.github/workflows/ci-branch-push.yml`、`.github/workflows/reusable-command.yml` 和容器镜像在 CI 中的职责，以及当前测试矩阵、缓存策略和 self-hosted runner 的使用方式。
 
 TGOSKits 将大部分构建与运行依赖收敛到统一的 container 镜像，由 GitHub Actions 和本地开发流程共同消费。需要物理设备、虚拟化能力或专用机器环境的任务则运行在 self-hosted runner 上。
 
@@ -20,7 +20,7 @@ flowchart TB
         L2_D["reusable-command.yml"]
     end
     subgraph L3["CI 编排"]
-        L3_D["ci.yml · container-publish.yml"]
+        L3_D["ci-branch-push.yml · ci.yml · container-publish.yml"]
     end
     L1 --> L2 --> L3
 ```
@@ -29,25 +29,30 @@ flowchart TB
 |------|------|----------|
 | Container 镜像 | 固化工具链、QEMU、交叉编译器 | `container/Dockerfile`、`container/Dockerfile.axvisor-lvz` |
 | 可复用工作流 | 统一在 host 或 container 中执行命令 | `.github/workflows/reusable-command.yml` |
-| CI 编排 | 选择测试矩阵、决定何时发布镜像 | `.github/workflows/ci.yml`、`.github/workflows/container-publish.yml` |
+| CI 编排 | 选择测试矩阵、决定何时发布镜像，并路由非主线分支 push | `.github/workflows/ci.yml`、`.github/workflows/ci-branch-push.yml`、`.github/workflows/container-publish.yml` |
 
 ## 触发条件
 
 | 事件 | 说明 |
 |------|------|
-| `push` | 排除纯文档变更（`*.md`、`docs/**` 等），其余路径触发 CI |
+| `push` 到 `main` / `dev` | 排除纯文档变更（`*.md`、`docs/**` 等），其余路径直接触发完整 CI |
+| `push` 到其他分支 | 先进入 `ci-branch-push.yml`。若该分支已有 open PR，则 router 成功结束；否则由 router 触发完整 CI |
 | `pull_request` | 同上 |
-| `workflow_dispatch` | 手动触发，仅用于发布容器镜像（`base` / `axvisor-lvz` / `both`），不执行 CI 检查 |
+| `workflow_dispatch` | 默认用于发布容器镜像（`base` / `axvisor-lvz` / `both`）；router 也会用 `run_target=ci` 调度非 PR 分支的完整 CI |
 
-同一 `ref` 上新的触发会取消正在运行的旧任务（`concurrency.cancel-in-progress: true`）。
+`dev` 分支的 `push` 和手动触发使用 `concurrency.queue: max` 串行排队运行，避免多个 dev CI 同时占用 runner。其他分支、`main` 分支、PR 以及非 `dev` 手动触发不会进入 dev 队列；新 run 会在最早的 `cancel_stale_runs` 阶段取消同一分支或同一 PR 上仍在 queued/running 的旧 CI run。
+
+非 `main` / `dev` 分支的 `push` 由轻量 router 先检查是否已有同仓库、同名分支的 open PR。已有 PR 时不会调度 `.github/workflows/ci.yml`，router 会输出跳过原因并以成功状态结束，PR 的 `pull_request` CI 负责验证同一提交。没有 open PR 时，router 使用 `workflow_dispatch(run_target=ci)` 调度完整 CI，并把 push 事件的 `before` SHA 传给差异检查。
 
 ## 执行流水线
 
 ```text
-detect_changes
+cancel_stale_runs
+  |
+  `-- detect_changes
   |
   +-- [ci_checks == true]
-  |     `-- static_checks (fmt || sync-lint)    fail-fast: true
+  |     `-- static_checks (fmt/publish-dry-run || sync-lint || lock-lint)  fail-fast: true
   |           `-- test_checks (所有测试并发)     fail-fast: true
   |
   `-- [push/dispatch 到 main/dev]
@@ -55,7 +60,17 @@ detect_changes
         `-- publish_axvisor_lvz_container       依赖 base 成功后才运行
 ```
 
-`static_checks` 作为测试矩阵的前置门禁：格式检查或 sync-lint 不通过时，后续测试不会启动。`static_checks` 和 `test_checks` 都启用 `fail-fast: true`，任意矩阵项失败会取消同矩阵内其他任务，减少 runner 占用。
+非 `main` / `dev` 分支 push 会先经过 `.github/workflows/ci-branch-push.yml`：
+
+```text
+branch push router
+  |
+  +-- [branch has open PR]  success summary only
+  |
+  `-- [no open PR]         workflow_dispatch(run_target=ci) -> ci.yml
+```
+
+`static_checks` 作为测试矩阵的前置门禁：格式检查、workspace 发布 dry-run、sync-lint 或 lock-lint 不通过时，后续测试不会启动。`static_checks` 和 `test_checks` 都启用 `fail-fast: true`，任意矩阵项失败会取消同矩阵内其他任务，减少 runner 占用。
 
 ## 变更检测
 
@@ -63,11 +78,11 @@ detect_changes
 
 | 检测路径 | 触发任务 |
 |----------|----------|
-| `.cargo/`、`Cargo.toml`、`Cargo.lock`、`components/`、`drivers/`、`examples/`、`os/`、`platform/`、`scripts/`、`test-suit/`、`xtask/` 等 | CI 检查 |
+| `.cargo/`、`.github/workflows/{ci,ci-branch-push,reusable-command,container-publish}.yml`、`Cargo.toml`、`Cargo.lock`、`rust-toolchain.toml`、`bootloader/axloader/`、`components/`、`drivers/`、`memory/`、`net/`、`os/`、`platforms/`、`scripts/`、`test-suit/`、`virtualization/`、`xtask/` 等 | CI 检查 |
 | `container/Dockerfile`、`rust-toolchain.toml` | 发布基础容器镜像 |
 | `container/Dockerfile.axvisor-lvz`、`rust-toolchain.toml` | 发布 LVZ 扩展镜像 |
 
-push 到 `main` / `dev` 时强制运行 CI 检查。若非 `main` / `dev` 分支的 push 已存在 open PR，则跳过重复的 push CI，由 pull request CI 覆盖同一提交。
+push 到 `main` / `dev` 时强制运行 CI 检查。非 `main` / `dev` 分支没有 open PR 时由 router 调度完整 CI；已有 open PR 时只保留一个成功的 router 检查，由 pull request CI 覆盖同一提交。
 
 `detect_changes` 内部还负责输出跳过原因：
 
@@ -80,8 +95,9 @@ push 到 `main` / `dev` 时强制运行 CI 检查。若非 `main` / `dev` 分支
 
 | Job 名称 | Runner | 使用容器 | Cache Key | 功能说明 |
 |----------|--------|----------|-----------|----------|
-| Check formatting | `ubuntu-latest` | 否 | 无 | `cargo fmt --all -- --check` |
-| Run sync-lint | `ubuntu-latest` | 是（`base`） | `sync-lint` | `cargo xtask sync-lint --since <base>`；需要完整 git 历史 |
+| Check formatting | `self-hosted linux qcs`（非 `rcore-os` 回退到 `ubuntu-latest` + `base` 容器） | 通常否 | 无 | `cargo fmt --all -- --check` 和 `cargo publish --workspace --dry-run --no-verify` |
+| Run sync-lint | `ubuntu-latest` | 是（`base`） | 无 | `cargo xtask sync-lint --since <base>`；需要完整 git 历史，并上传编译好的 `tg-xtask` 供后续容器 job 复用 |
+| Run lock-lint | `ubuntu-latest` | 是（`base`） | 无 | `cargo xtask lock-lint`，校验统一锁依赖、OS facade 和 runtime provider 约束 |
 
 ## Test Checks
 
@@ -89,10 +105,10 @@ push 到 `main` / `dev` 时强制运行 CI 检查。若非 `main` / `dev` 分支
 
 | Job 名称 | Runner | 使用容器 | Cache Key | 功能说明 |
 |----------|--------|----------|-----------|----------|
-| Run clippy | `ubuntu-latest` | 是（`base`） | `clippy` | `cargo xtask clippy --since <base>`；需要完整 git 历史 |
-| Test with std | `ubuntu-latest` | 是（`base`） | `test-std` | `cargo xtask test`，运行 `scripts/test/std_crates.csv` 中的 host 测试 |
-| Test axvisor aarch64 qemu | `ubuntu-latest` | 是（`base`） | `test-axvisor-aarch64` | `cargo xtask axvisor test qemu --arch aarch64` |
-| Test axvisor riscv64 qemu | `ubuntu-latest` | 是（`base`） | `test-axvisor-riscv64` | `cargo xtask axvisor test qemu --arch riscv64` |
+| Run clippy | `self-hosted linux qcs` | 否 | 无 | `cargo xtask clippy --since <base>`；需要完整 git 历史；fork PR 回退到 `ubuntu-latest` + `base` 容器 |
+| Test with std | `self-hosted linux qcs` | 否 | 无 | `cargo xtask test`，运行 `scripts/test/std_crates.csv` 中的 host 测试；fork PR 回退到 `ubuntu-latest` + `base` 容器 |
+| Test axvisor aarch64 qemu | `self-hosted linux qcs` | 否 | 无 | `cargo xtask axvisor test qemu --arch aarch64`；`rcore-os` 仓库使用 self-hosted，fork PR 回退到 `ubuntu-latest` + `base` 容器 |
+| Test axvisor riscv64 qemu | `self-hosted linux qcs` | 否 | 无 | `cargo xtask axvisor test qemu --arch riscv64`；`rcore-os` 仓库使用 self-hosted，fork PR 回退到 `ubuntu-latest` + `base` 容器 |
 | Test axvisor loongarch64 qemu | `ubuntu-latest` | 是（`axvisor-lvz`） | `test-axvisor-loongarch64` | `cargo xtask axvisor test qemu --arch loongarch64`，使用带 LVZ 支持的镜像 |
 | Test starry riscv64 qemu | `ubuntu-latest` | 是（`base`） | `test-starry-riscv64` | `cargo xtask starry test qemu --arch riscv64` |
 | Test starry aarch64 qemu | `ubuntu-latest` | 是（`base`） | `test-starry-aarch64` | `cargo xtask starry test qemu --arch aarch64` |
@@ -102,22 +118,28 @@ push 到 `main` / `dev` 时强制运行 CI 检查。若非 `main` / `dev` 分支
 | Test arceos riscv64 qemu | `self-hosted linux qcs` | 否 | 无 | `cargo xtask arceos test qemu --arch riscv64`；仅 `rcore-os` 仓库触发 |
 | Test arceos aarch64 qemu | `self-hosted linux qcs` | 否 | 无 | `cargo xtask arceos test qemu --arch aarch64`；仅 `rcore-os` 仓库触发 |
 | Test arceos loongarch64 qemu | `self-hosted linux qcs` | 否 | 无 | `cargo xtask arceos test qemu --arch loongarch64`；仅 `rcore-os` 仓库触发 |
-| Test axvisor self-hosted x86_64 | `self-hosted linux intel kvm` | 否 | 无 | `cargo xtask axvisor test qemu --arch x86_64`；仅 `rcore-os` 仓库触发 |
-| Test axvisor x86_64 svm hosted | `ubuntu-latest` | 否 | 无 | AMD SVM 虚拟化冒烟测试；Intel CPU 时自动跳过 |
+| Test axvisor self-hosted x86_64(svm) | `self-hosted linux amd kvm` | 否 | 无 | `cargo xtask axvisor test qemu --arch x86_64 --test-case smoke-svm`；验证 SVM 宿主启动及宿主 NVMe 根文件系统写入/回读，仅 `rcore-os` 仓库触发 |
+| Test axvisor self-hosted x86_64(vmx) | `self-hosted linux intel kvm` | 否 | 无 | `cargo xtask axvisor test qemu --arch x86_64 --test-case smoke-vmx`；验证 VMX 宿主启动及宿主 NVMe 根文件系统写入/回读，仅 `rcore-os` 仓库触发 |
+| Test axloader HTTP smoke | `self-hosted linux intel kvm` | 否 | 无 | 安装 `x86_64-unknown-uefi` target，通过 Ostool 获取并校验 OVMF，运行 `cargo xtask axloader test qemu --target x86_64-unknown-uefi`；仅 `rcore-os` 仓库触发 |
 | Test axvisor self-hosted board orangepi-5-plus-linux | `self-hosted linux board` | 否 | 无 | `cargo xtask axvisor test board --board orangepi-5-plus-linux`；物理板卡；仅 `rcore-os` 仓库触发 |
+| Test axvisor self-hosted board orangepi-5-plus-starry | `self-hosted linux board` | 否 | 无 | `cargo xtask axvisor test board --board orangepi-5-plus-starry`；物理板卡；仅 `rcore-os` 仓库触发 |
+| Test axvisor self-hosted board roc-rk3568-pc-linux | `self-hosted linux board` | 否 | 无 | `cargo xtask axvisor test board --board roc-rk3568-pc-linux`；物理板卡；仅 `rcore-os` 仓库触发 |
+| Test axvisor self-hosted board phytiumpi-linux | `self-hosted linux board` | 否 | 无 | `cargo xtask axvisor test board --board phytiumpi-linux`；物理板卡；仅 `rcore-os` 仓库触发 |
 | Test starry self-hosted board orangepi-5-plus | `self-hosted linux board` | 否 | 无 | `cargo xtask starry test board --board orangepi-5-plus`；物理板卡；仅 `rcore-os` 仓库触发 |
+| Test starry self-hosted board aka-00-sg2002 | `self-hosted linux board` | 否 | 无 | `cargo xtask starry test board --board aka-00-sg2002`；物理板卡；仅 `rcore-os` 仓库触发 |
+| Test starry self-hosted board visionfive2 | `self-hosted linux board` | 否 | 无 | `cargo xtask starry test board --board visionfive2`；物理板卡；仅 `rcore-os` 仓库触发 |
 
 StarryOS stress 测试条目保留在 workflow 中，但当前处于注释状态。启用后仅用于 target 为 `main` 的 PR。
 
 ## Self-Hosted Runner 约定
 
-self-hosted runner 任务只在 `rcore-os` 仓库内运行，避免 fork 仓库因没有对应 runner 而长时间排队。迁移到 self-hosted 的 ArceOS QEMU 测试直接在原生 runner 环境中运行，不再套 Docker container。
+self-hosted runner 任务优先在 `rcore-os` 仓库内运行。带 `self_hosted_owner` 的任务在 fork PR 或非 `rcore-os` 仓库中会回退到 `ubuntu-latest` + 对应容器，避免没有对应 runner 时长时间排队。迁移到 self-hosted 的任务直接在原生 runner 环境中运行，不再套 Docker container。
 
 现有 label 约定：
 
 | Label | 用途 |
 |-------|------|
-| `self-hosted`, `linux`, `qcs` | ArceOS QEMU 测试 |
+| `self-hosted`, `linux`, `qcs` | clippy、std 测试、ArceOS QEMU 测试、Axvisor aarch64/riscv64 QEMU |
 | `self-hosted`, `linux`, `intel`, `kvm` | Axvisor x86_64 KVM 测试 |
 | `self-hosted`, `linux`, `board` | 物理板卡测试 |
 
@@ -125,12 +147,9 @@ self-hosted runner 任务只在 `rcore-os` 仓库内运行，避免 fork 仓库�
 
 | Cache Key | 使用 Job | 保存时机 | 说明 |
 |-----------|----------|----------|------|
-| `sync-lint` | Run sync-lint | `push` 事件 | xtask 与 sync-lint 工具链编译产物 |
-| `clippy` | Run clippy | `push` 事件 | xtask 与目标 crate 编译产物 |
-| `test-std` | Test with std | `push` 事件 | host std 测试编译产物 |
-| `test-axvisor-aarch64/riscv64/loongarch64` | Test axvisor QEMU | `push` 事件 | 各架构 Axvisor 编译产物 |
-| `test-starry-aarch64/riscv64/loongarch64/x86_64` | Test starry QEMU | `push` 事件 | 各架构 StarryOS 编译产物 |
-| 无（`cache_key: ""`） | self-hosted runner job | - | 依赖 self-hosted runner 本地磁盘缓存，不使用 GitHub Actions cache |
+| `test-axvisor-loongarch64` | Test axvisor loongarch64 QEMU | `push` 事件 | Axvisor loongarch64 编译产物 |
+| `test-starry-riscv64/aarch64/loongarch64/x86_64` | Test starry riscv64/aarch64/loongarch64/x86_64 QEMU | `push` 事件 | StarryOS QEMU 编译产物 |
+| 无（`cache_key: ""`） | static checks、self-hosted x86_64/board 类 job | - | 不启用 `Swatinem/rust-cache`；self-hosted 任务依赖 runner 本地磁盘缓存 |
 
 self-hosted runner 不设置 `cache_key`，避免 `Swatinem/rust-cache@v2` 的 post-job 清理影响 runner 上跨次运行自然积累的共享缓存。
 
@@ -140,7 +159,7 @@ CI 使用两个容器镜像：
 
 | 镜像 | Dockerfile | 用途 |
 |------|------------|------|
-| `base` | `container/Dockerfile` | 常规 clippy、sync-lint、std 测试、Axvisor aarch64/riscv64 QEMU、StarryOS QEMU |
+| `base` | `container/Dockerfile` | sync-lint、StarryOS QEMU，以及 clippy、std、self-hosted QEMU 测试在 fork PR 或非 `rcore-os` 仓库中的回退环境 |
 | `axvisor-lvz` | `container/Dockerfile.axvisor-lvz` | Axvisor loongarch64 QEMU，额外包含 LVZ 支持 |
 
 基础镜像以 `ubuntu:24.04` 为底，内置 Rust 工具链、QEMU、musl cross-toolchain、libav、libudev 等依赖。容器内的 musl cross-toolchain 已通过 `PATH` 配置好，`reusable-command.yml` 会在 container job 启动时验证 QEMU user emulators 和 musl compiler 是否存在，不再在运行时动态下载。

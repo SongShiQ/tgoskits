@@ -6,7 +6,7 @@
 use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec, vec::Vec};
 use core::ops::{Deref, DerefMut};
 
-use dma_api::{DArray, DmaDirection};
+use dma_api::{ContiguousArray, DmaDirection};
 use event::EventBuffer;
 use futures::{FutureExt, future::BoxFuture};
 use reg::{GCTL, GEVNTSIZ, GHWPARAMS0, GHWPARAMS1, GHWPARAMS3, GHWPARAMS4, GUCTL1, GUSB2PHYCFG};
@@ -53,19 +53,44 @@ use reg::Dwc3Regs;
 pub use udphy::UdphyParam;
 // pub use usb2phy::Usb2Phy;
 
-/// CRU (Clock and Reset Unit)
-pub trait CruOp: Sync + Send + 'static {
-    fn reset_assert(&self, id: u64);
-    fn reset_deassert(&self, id: u64);
+pub trait ResetLine: Sync + Send + 'static {
+    fn assert(&self);
+    fn deassert(&self);
 }
 
-pub struct DwcNewParams<'a, C: CruOp> {
+#[derive(Clone)]
+pub struct NamedResetLine {
+    name: String,
+    line: Arc<dyn ResetLine>,
+}
+
+impl NamedResetLine {
+    pub fn new(name: impl Into<String>, line: impl ResetLine) -> Self {
+        Self::from_arc(name, Arc::new(line))
+    }
+
+    pub fn from_arc(name: impl Into<String>, line: Arc<dyn ResetLine>) -> Self {
+        Self {
+            name: name.into(),
+            line,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn line(&self) -> Arc<dyn ResetLine> {
+        self.line.clone()
+    }
+}
+
+pub struct DwcNewParams<'a> {
     pub ctrl: Mmio,
     pub phy: Mmio,
     pub phy_param: UdphyParam<'a>,
     pub usb2_phy_param: Usb2PhyParam<'a>,
-    pub cru: C,
-    pub rst_list: &'a [(&'a str, u64)],
+    pub rst_list: &'a [NamedResetLine],
     pub params: DwcParams,
     pub kernel: &'static dyn KernelOp,
 }
@@ -117,30 +142,28 @@ pub struct Dwc {
     usb3_phy: Udphy,
     usb2_phy: Usb2Phy,
     dwc_regs: Dwc3Regs,
-    cru: Arc<dyn CruOp>,
-    rsts: BTreeMap<String, u64>,
+    rsts: BTreeMap<String, Arc<dyn ResetLine>>,
     ev_buffs: Vec<EventBuffer>,
     revistion: u32,
     nr_scratch: u32,
     params: DwcParams,
-    scratchbuf: Option<DArray<u8>>,
+    scratchbuf: Option<ContiguousArray<u8>>,
 }
 
 impl Dwc {
-    pub fn new(mut params: DwcNewParams<'_, impl CruOp>) -> Result<Self> {
+    pub fn new(mut params: DwcNewParams<'_>) -> Result<Self> {
         let mmio_base = params.ctrl.as_ptr() as usize;
         params.params.max_speed = Speed::Full;
-        let cru = Arc::new(params.cru);
         let xhci = Xhci::new(params.ctrl, params.kernel)?;
 
-        let phy = Udphy::new(params.phy, cru.clone(), params.phy_param);
-        let usb2_phy = Usb2Phy::new(cru.clone(), params.usb2_phy_param, xhci.kernel().clone());
+        let phy = Udphy::new(params.phy, params.phy_param);
+        let usb2_phy = Usb2Phy::new(params.usb2_phy_param, xhci.kernel().clone());
 
         let dwc_regs = unsafe { Dwc3Regs::new(mmio_base) };
 
         let mut rsts = BTreeMap::new();
-        for &(name, id) in params.rst_list.iter() {
-            rsts.insert(String::from(name), id);
+        for reset in params.rst_list.iter() {
+            rsts.insert(reset.name.clone(), reset.line());
         }
 
         Ok(Self {
@@ -148,7 +171,6 @@ impl Dwc {
             dwc_regs,
             usb3_phy: phy,
             usb2_phy,
-            cru,
             rsts,
             ev_buffs: vec![],
             revistion: 0,
@@ -506,20 +528,13 @@ impl Dwc {
 
         let scratchbuf = self
             .kernel()
-            .array_zero_with_align(
+            .contiguous_array_zero_with_align(
                 scratch_size,
                 self.kernel().page_size(),
                 DmaDirection::Bidirectional,
             )
             .map_err(|_| USBError::NoMemory)?;
-
-        // let scratchbuf = DVec::zeros(
-        //     self.xhci.dma_mask as _,
-        //     scratch_size,
-        //     page_size(),
-        //     dma_api::Direction::Bidirectional,
-        // )
-        // .map_err(|_| USBError::NoMemory)?;
+        scratchbuf.prepare_for_device_all();
 
         self.scratchbuf = Some(scratchbuf);
         debug!(
@@ -637,8 +652,8 @@ impl Dwc {
 
         // It must hold whole USB3.0 OTG controller in resetting to hold pipe
         // power state in P2 before initializing TypeC PHY on RK3399 platform.
-        for &id in self.rsts.values() {
-            self.cru.reset_assert(id);
+        for reset in self.rsts.values() {
+            reset.assert();
         }
 
         self.kernel().delay(core::time::Duration::from_millis(1));
@@ -648,8 +663,8 @@ impl Dwc {
         let kernel = self.kernel().clone();
         self.usb3_phy.setup(&kernel).await?;
 
-        for &id in self.rsts.values() {
-            self.cru.reset_deassert(id);
+        for reset in self.rsts.values() {
+            reset.deassert();
         }
 
         self.dwc3_init().await?;
@@ -703,6 +718,16 @@ impl CoreOp for Dwc {
             xhci: self.xhci.create_event_handler(),
             _dwc: self.dwc_regs.clone(),
         })
+    }
+
+    fn enable_irq(&mut self) -> Result<()> {
+        self.xhci.enable_irq();
+        Ok(())
+    }
+
+    fn disable_irq(&mut self) -> Result<()> {
+        self.xhci.disable_irq();
+        Ok(())
     }
 
     fn new_addressed_device<'a>(

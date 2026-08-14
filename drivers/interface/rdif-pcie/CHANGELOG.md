@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.7](https://github.com/rcore-os/tgoskits/compare/rdif-pcie-v0.2.6...rdif-pcie-v0.2.7) - 2026-08-09
+
+### Other
+
+- updated the following local packages: axtest, rdif-base
+
+## [0.2.6](https://github.com/rcore-os/tgoskits/compare/rdif-pcie-v0.2.5...rdif-pcie-v0.2.6) - 2026-08-03
+
+### Other
+
+- enhance axtest coverage for various starry-kernel contracts ([#1674](https://github.com/rcore-os/tgoskits/pull/1674))
+
+## [0.2.5](https://github.com/rcore-os/tgoskits/compare/rdif-pcie-v0.2.4...rdif-pcie-v0.2.5) - 2026-06-22
+
+### Fixed
+
+- *(driver)* fix testcase in rdif-pcie ([#1301](https://github.com/rcore-os/tgoskits/pull/1301))
+
+## [0.2.4](https://github.com/rcore-os/tgoskits/compare/rdif-pcie-v0.2.3...rdif-pcie-v0.2.4) - 2026-06-12
+
+### Other
+
+- updated the following local packages: rdif-base
+
+## [0.2.3](https://github.com/rcore-os/tgoskits/compare/rdif-pcie-v0.2.2...rdif-pcie-v0.2.3) - 2026-06-09
+
+### Other
+
+- updated the following local packages: rdif-base
+
+## [0.2.2](https://github.com/rcore-os/tgoskits/compare/rdif-pcie-v0.2.1...rdif-pcie-v0.2.2) - 2026-06-03
+
+### Other
+
+- *(drivers)* split shared driver stack from ArceOS ([#831](https://github.com/rcore-os/tgoskits/pull/831))
+
 ## [0.2.0](https://github.com/drivercraft/rdrive/compare/rdif-pcie-v0.1.3...rdif-pcie-v0.2.0) - 2025-10-16
 
 ### Other

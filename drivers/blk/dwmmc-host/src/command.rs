@@ -1,13 +1,14 @@
 //! Command issue and response decoding.
 //!
 //! Encodes [`sdmmc_protocol::cmd::Command`] into a DW_mshc CMD register
-//! value, fires it, polls RINTSTS for completion, and decodes the four
-//! 32-bit response slots back into [`Response`].
+//! value, fires it, consumes IRQ-latched RINTSTS events, advances bounded
+//! register-only waits, and decodes the four response slots into [`Response`].
 
+use log::warn;
 use sdmmc_protocol::{
-    CommandPoll, CommandResponsePoll,
+    CommandProgress, CommandResponseProgress,
     cmd::{Command as ProtoCmd, DataDirection},
-    error::{Error, Phase},
+    error::{Error, ErrorContext, Phase},
     response::{
         IfCondResponse, OcrResponse, R1Response, RcaResponse, Response, ResponseType,
         SdioOcrResponse, SdioRwResponse,
@@ -25,12 +26,20 @@ pub(crate) enum CommandState {
     WaitingInhibit {
         cmd: ProtoCmd,
         data: Option<crate::host::PendingData>,
+        polls: u32,
     },
     WaitingStart {
         cmd: ProtoCmd,
+        polls: u32,
     },
     Issued {
         cmd: ProtoCmd,
+        polls: u32,
+    },
+    WaitingBusy {
+        cmd: ProtoCmd,
+        response: Response,
+        polls: u32,
     },
     Complete {
         response: Response,
@@ -41,69 +50,147 @@ pub(crate) enum CommandState {
 }
 
 impl DwMmc {
-    pub fn poll_command_response(&mut self) -> Result<CommandResponsePoll, Error> {
-        match self.poll_command() {
-            Ok(CommandPoll::Pending) => Ok(CommandResponsePoll::Pending),
-            Ok(CommandPoll::Complete) => self
+    pub fn advance_command_response(
+        &mut self,
+        cause: sdio_host2::ProgressCause,
+    ) -> Result<CommandResponseProgress, Error> {
+        let acknowledged_irq = cause == sdio_host2::ProgressCause::AcknowledgedIrq;
+        match self.advance_command_for_cause(acknowledged_irq) {
+            Ok(CommandProgress::Pending) => Ok(CommandResponseProgress::Pending),
+            Ok(CommandProgress::Complete) => self
                 .take_command_response()
-                .map(CommandResponsePoll::Complete),
-            // Future CommandPoll variants: treat as best-effort harvest, same as Err path.
-            Ok(_) => self
-                .take_command_response()
-                .map(CommandResponsePoll::Complete),
-            Err(_) => self
-                .take_command_response()
-                .map(CommandResponsePoll::Complete),
+                .map(CommandResponseProgress::Complete),
+            Err(err) => Err(err),
         }
     }
 
     pub fn submit_command(&mut self, cmd: &ProtoCmd) -> Result<(), Error> {
+        self.submit_command_in_generation(cmd, true)
+    }
+
+    pub(crate) fn submit_chained_command(&mut self, cmd: &ProtoCmd) -> Result<(), Error> {
+        self.submit_command_in_generation(cmd, false)
+    }
+
+    fn submit_command_in_generation(
+        &mut self,
+        cmd: &ProtoCmd,
+        begin_irq_generation: bool,
+    ) -> Result<(), Error> {
         if !matches!(self.command_state, CommandState::Idle) {
             return Err(Error::UnsupportedCommand);
         }
+        if !self.card_present() {
+            return Err(Error::NoCard);
+        }
         let data = self.pending_data.take();
-        self.command_state = CommandState::WaitingInhibit { cmd: *cmd, data };
-        if let Err(err) = self.poll_command() {
+        if begin_irq_generation {
+            self.prepare_irq_for_request();
+        }
+        self.command_state = CommandState::WaitingInhibit {
+            cmd: *cmd,
+            data,
+            polls: 0,
+        };
+        if let Err(err) = self.advance_command() {
             self.command_state = CommandState::Idle;
             return Err(err);
         }
         Ok(())
     }
 
-    pub fn poll_command(&mut self) -> Result<CommandPoll, Error> {
+    pub(crate) fn advance_command_for_cause(
+        &mut self,
+        acknowledged_irq: bool,
+    ) -> Result<CommandProgress, Error> {
+        let was_waiting_for_start = matches!(self.command_state, CommandState::WaitingStart { .. });
+        let progress = self.advance_command()?;
+        if acknowledged_irq
+            && was_waiting_for_start
+            && matches!(progress, CommandProgress::Pending)
+            && matches!(self.command_state, CommandState::Issued { .. })
+        {
+            // The command may finish before a register retry observes
+            // START_CMD clearing. Its IRQ is already latched, so consume the
+            // cached completion before the maintenance thread sleeps again.
+            return self.advance_command();
+        }
+        Ok(progress)
+    }
+
+    pub fn advance_command(&mut self) -> Result<CommandProgress, Error> {
         match self.command_state {
-            CommandState::WaitingInhibit { cmd, data } => {
+            CommandState::WaitingInhibit { cmd, data, polls } => {
                 if !self.command_can_issue(data.is_some()) {
-                    return Ok(CommandPoll::Pending);
+                    if polls >= COMMAND_WAIT_POLLS {
+                        self.log_command_timeout("wait-inhibit", cmd);
+                        let err =
+                            Error::Timeout(ErrorContext::for_cmd(Phase::CommandSend, cmd.index));
+                        self.command_state = CommandState::Failed { error: err };
+                        return Err(err);
+                    }
+                    self.command_state = CommandState::WaitingInhibit {
+                        cmd,
+                        data,
+                        polls: polls + 1,
+                    };
+                    return Ok(CommandProgress::Pending);
                 }
                 self.program_command(&cmd, data);
-                return Ok(CommandPoll::Pending);
+                return Ok(CommandProgress::Pending);
             }
-            CommandState::WaitingStart { cmd } => {
+            CommandState::WaitingStart { cmd, polls } => {
                 if self.regs.cmd().read().start_cmd() {
-                    return Ok(CommandPoll::Pending);
+                    if polls >= COMMAND_WAIT_POLLS {
+                        self.log_command_timeout("wait-start", cmd);
+                        let err =
+                            Error::Timeout(ErrorContext::for_cmd(Phase::CommandSend, cmd.index));
+                        self.command_state = CommandState::Failed { error: err };
+                        return Err(err);
+                    }
+                    self.command_state = CommandState::WaitingStart {
+                        cmd,
+                        polls: polls + 1,
+                    };
+                    return Ok(CommandProgress::Pending);
                 }
-                self.command_state = CommandState::Issued { cmd };
-                return Ok(CommandPoll::Pending);
+                self.command_state = CommandState::Issued { cmd, polls: 0 };
+                return Ok(CommandProgress::Pending);
             }
             CommandState::Issued { .. } => {}
-            CommandState::Complete { .. } => return Ok(CommandPoll::Complete),
+            CommandState::WaitingBusy {
+                cmd,
+                response,
+                polls,
+            } => return self.advance_r1b_busy(cmd, response, polls),
+            CommandState::Complete { .. } => return Ok(CommandProgress::Complete),
             CommandState::Failed { error } => return Err(error),
             CommandState::Idle => return Err(Error::InvalidArgument),
         }
 
-        let CommandState::Issued { cmd } = self.command_state else {
+        let CommandState::Issued { cmd, polls } = self.command_state else {
             unreachable!();
         };
         let raw_status = self.take_command_irq_status();
+        if raw_status & crate::DWMMC_LATCH_IDMAC_ERROR != 0 {
+            let phase = if cmd.index == 12 {
+                Phase::BusyWait
+            } else {
+                Phase::ResponseWait
+            };
+            let err = Error::BusError(ErrorContext::for_cmd(phase, cmd.index));
+            self.command_state = CommandState::Failed { error: err };
+            return Err(err);
+        }
         let status = crate::regs::RIntSts::from_bits(raw_status);
         if status.error() {
-            let err = self.translate_int_error(status, Phase::ResponseWait, cmd.cmd);
+            let err = self.translate_int_error(status, Phase::ResponseWait, cmd.index);
+            self.log_command_error("interrupt-error", cmd, raw_status, err);
             self.command_state = CommandState::Failed { error: err };
             return Err(err);
         }
         if status.command_done() {
-            let response = match decode_response(self, cmd.resp_type) {
+            let response = match decode_response(self, cmd.response) {
                 Ok(r) => r,
                 Err(err) => {
                     // Park the FSM in Failed before propagating: bare `?` would
@@ -114,26 +201,79 @@ impl DwMmc {
                     return Err(err);
                 }
             };
+            if matches!(cmd.response, ResponseType::R1b) {
+                return self.advance_r1b_busy(cmd, response, 0);
+            }
             self.command_state = CommandState::Complete { response };
-            return Ok(CommandPoll::Complete);
+            return Ok(CommandProgress::Complete);
         }
-        Ok(CommandPoll::Pending)
+        if polls >= COMMAND_WAIT_POLLS {
+            let err = Error::Timeout(ErrorContext::for_cmd(Phase::ResponseWait, cmd.index));
+            self.log_command_error("response-timeout", cmd, raw_status, err);
+            self.command_state = CommandState::Failed { error: err };
+            return Err(err);
+        }
+        self.command_state = CommandState::Issued {
+            cmd,
+            polls: polls + 1,
+        };
+        Ok(CommandProgress::Pending)
+    }
+
+    fn advance_r1b_busy(
+        &mut self,
+        cmd: ProtoCmd,
+        response: Response,
+        polls: u32,
+    ) -> Result<CommandProgress, Error> {
+        let raw_status = self.take_command_irq_status();
+        if raw_status & crate::DWMMC_LATCH_IDMAC_ERROR != 0 {
+            let err = Error::BusError(ErrorContext::for_cmd(Phase::BusyWait, cmd.index));
+            self.command_state = CommandState::Failed { error: err };
+            return Err(err);
+        }
+        let status = crate::regs::RIntSts::from_bits(raw_status);
+        if status.error() {
+            let err = self.translate_int_error(status, Phase::BusyWait, cmd.index);
+            self.command_state = CommandState::Failed { error: err };
+            return Err(err);
+        }
+        if !self.regs.status().read().data_busy() {
+            self.command_state = CommandState::Complete { response };
+            return Ok(CommandProgress::Complete);
+        }
+        if polls >= COMMAND_BUSY_POLLS {
+            let err = Error::Timeout(ErrorContext::for_cmd(Phase::BusyWait, cmd.index));
+            self.command_state = CommandState::Failed { error: err };
+            return Err(err);
+        }
+        self.command_state = CommandState::WaitingBusy {
+            cmd,
+            response,
+            polls: polls + 1,
+        };
+        Ok(CommandProgress::Pending)
     }
 
     pub fn take_command_response(&mut self) -> Result<Response, Error> {
         match self.command_state {
             CommandState::Complete { response } => {
                 self.command_state = CommandState::Idle;
+                if self.data_cmd_index == 0 {
+                    self.irq.state.end_request();
+                }
                 Ok(response)
             }
             CommandState::Failed { error } => {
                 self.command_state = CommandState::Idle;
+                self.irq.state.end_request();
                 Err(error)
             }
             CommandState::Idle
             | CommandState::WaitingInhibit { .. }
             | CommandState::WaitingStart { .. }
-            | CommandState::Issued { .. } => Err(Error::InvalidArgument),
+            | CommandState::Issued { .. }
+            | CommandState::WaitingBusy { .. } => Err(Error::InvalidArgument),
         }
     }
 
@@ -145,29 +285,26 @@ impl DwMmc {
 
     fn program_command(&mut self, cmd: &ProtoCmd, data: Option<crate::host::PendingData>) {
         if data.is_some() {
-            self.data_cmd_index = cmd.cmd;
+            self.data_cmd_index = cmd.index;
         }
-        self.clear_command_int_status();
         let data_dir = data.map(|d| {
             self.program_data_phase(d.block_size, d.block_count);
             d.direction
         });
-        self.regs.cmdarg().write(cmd.arg);
+        self.regs.cmdarg().write(cmd.argument);
         self.regs.cmd().write(encode_command(cmd, data_dir));
-        self.command_state = CommandState::WaitingStart { cmd: *cmd };
+        self.command_state = CommandState::WaitingStart {
+            cmd: *cmd,
+            polls: 0,
+        };
     }
 
     fn take_command_irq_status(&mut self) -> u32 {
-        let raw_status = self.regs.rintsts().read().into_bits();
-        let consume = raw_status & (crate::DWMMC_INT_COMMAND_DONE | crate::DWMMC_INT_ERROR_MASK);
-        if consume != 0 {
-            self.regs
-                .rintsts()
-                .write(crate::regs::RIntSts::from_bits(consume));
-        }
-        let status = self.irq_pending_status | raw_status;
-        self.irq_pending_status &= !(crate::DWMMC_INT_COMMAND_DONE | crate::DWMMC_INT_ERROR_MASK);
-        status
+        self.take_task_irq_status(
+            crate::DWMMC_INT_COMMAND_DONE
+                | crate::DWMMC_INT_ERROR_MASK
+                | crate::DWMMC_LATCH_IDMAC_ERROR,
+        )
     }
 
     fn clear_command_int_status(&mut self) {
@@ -178,9 +315,99 @@ impl DwMmc {
                 .rintsts()
                 .write(crate::regs::RIntSts::from_bits(raw_status));
         }
-        self.irq_pending_status &= !(crate::DWMMC_INT_COMMAND_DONE | crate::DWMMC_INT_ERROR_MASK);
+        self.irq
+            .state
+            .clear(crate::DWMMC_INT_COMMAND_DONE | crate::DWMMC_INT_ERROR_MASK);
+    }
+
+    fn log_command_timeout(&self, stage: &str, cmd: ProtoCmd) {
+        warn!(
+            "dwmmc-command: {stage} timeout cmd={} arg={:#010x} resp={:?} cmdreg={:#010x} \
+             status={:#010x} rintsts={:#010x} mintsts={:#010x} intmask={:#010x} ctrl={:#010x} \
+             pwren={:#010x} cdetect={:#010x} clkena={:#010x} clksrc={:#010x} clkdiv={:#010x} \
+             ctype={:#010x} uhs={:#010x} rst={:#010x}",
+            cmd.index,
+            cmd.argument,
+            cmd.response,
+            self.regs.cmd().read().into_bits(),
+            self.regs.status().read().into_bits(),
+            self.regs.rintsts().read().into_bits(),
+            self.regs.mintsts().read(),
+            self.regs.intmask().read(),
+            self.regs.ctrl().read().into_bits(),
+            self.regs.pwren().read(),
+            self.regs.cdetect().read(),
+            self.regs.clkena().read().into_bits(),
+            self.regs.clksrc().read(),
+            self.regs.clkdiv().read().into_bits(),
+            self.regs.ctype().read().into_bits(),
+            self.regs.uhs().read().into_bits(),
+            self.regs.rst().read(),
+        );
+    }
+
+    fn log_command_error(&self, stage: &str, cmd: ProtoCmd, raw_status: u32, err: Error) {
+        warn!(
+            "dwmmc-command: {stage} cmd={} arg={:#010x} resp={:?} raw={:#010x} err={:?} \
+             cmdreg={:#010x} status={:#010x} rintsts={:#010x} mintsts={:#010x} intmask={:#010x} \
+             ctrl={:#010x} pwren={:#010x} cdetect={:#010x} clkena={:#010x} clksrc={:#010x} \
+             clkdiv={:#010x} ctype={:#010x} uhs={:#010x} rst={:#010x}",
+            cmd.index,
+            cmd.argument,
+            cmd.response,
+            raw_status,
+            err,
+            self.regs.cmd().read().into_bits(),
+            self.regs.status().read().into_bits(),
+            self.regs.rintsts().read().into_bits(),
+            self.regs.mintsts().read(),
+            self.regs.intmask().read(),
+            self.regs.ctrl().read().into_bits(),
+            self.regs.pwren().read(),
+            self.regs.cdetect().read(),
+            self.regs.clkena().read().into_bits(),
+            self.regs.clksrc().read(),
+            self.regs.clkdiv().read().into_bits(),
+            self.regs.ctype().read().into_bits(),
+            self.regs.uhs().read().into_bits(),
+            self.regs.rst().read(),
+        );
+    }
+
+    fn prepare_irq_for_request(&mut self) {
+        self.clear_all_int_status();
+        self.irq.state.begin_request();
+    }
+
+    pub(crate) fn abort_command(&mut self) -> Result<(), Error> {
+        self.clear_command_int_status();
+        for _ in 0..COMMAND_WAIT_POLLS {
+            if !self.regs.cmd().read().start_cmd() {
+                self.clear_all_int_status();
+                self.reset_and_init_preserving_irq()?;
+                self.pending_data = None;
+                self.data_blocks_remaining = 0;
+                self.data_cmd_index = 0;
+                self.controller_data_complete = false;
+                self.idmac_data_complete = false;
+                self.command_state = CommandState::Idle;
+                return Ok(());
+            }
+            core::hint::spin_loop();
+        }
+        self.reset_and_init_preserving_irq()?;
+        self.pending_data = None;
+        self.data_blocks_remaining = 0;
+        self.data_cmd_index = 0;
+        self.controller_data_complete = false;
+        self.idmac_data_complete = false;
+        self.command_state = CommandState::Idle;
+        Ok(())
     }
 }
+
+const COMMAND_WAIT_POLLS: u32 = 1_000_000;
+const COMMAND_BUSY_POLLS: u32 = 1_000_000;
 
 /// Build the CMD register value for a single command.
 ///
@@ -195,9 +422,9 @@ fn encode_command(cmd: &ProtoCmd, data_dir: Option<DataDirection>) -> Cmd {
         .with_start_cmd(true)
         .with_use_hold_reg(true)
         .with_wait_prvdata_complete(true)
-        .with_cmd_index(cmd.cmd & 0x3F);
+        .with_cmd_index(cmd.index & 0x3F);
 
-    match cmd.resp_type {
+    match cmd.response {
         ResponseType::None => {
             // No response_expect; no CRC check.
         }
@@ -229,7 +456,7 @@ fn encode_command(cmd: &ProtoCmd, data_dir: Option<DataDirection>) -> Cmd {
         _ => {}
     }
 
-    if cmd.cmd == 0 {
+    if cmd.index == 0 {
         // Power-up cards need 80 init clocks before CMD0.
         c = c.with_send_initialization(true);
     }
@@ -240,7 +467,7 @@ fn encode_command(cmd: &ProtoCmd, data_dir: Option<DataDirection>) -> Cmd {
         // some indices are overloaded (CMD6 = ACMD6 SET_BUS_WIDTH no-data /
         // SWITCH_FUNC read; CMD8 = SEND_IF_COND no-data on SD /
         // SEND_EXT_CSD read on MMC). We trust that signal here rather than
-        // inferring from `cmd.cmd`.
+        // inferring from `cmd.index`.
         if matches!(dir, DataDirection::Write) {
             c = c.with_read_write(true);
         }
@@ -250,20 +477,39 @@ fn encode_command(cmd: &ProtoCmd, data_dir: Option<DataDirection>) -> Cmd {
 }
 
 fn decode_response(host: &DwMmc, resp_type: ResponseType) -> Result<Response, Error> {
-    let resp = host.regs.resp().read();
     Ok(match resp_type {
         ResponseType::None => Response::Empty,
-        ResponseType::R1 => Response::R1(R1Response { raw: resp[0] }),
-        ResponseType::R1b => Response::R1b(R1Response { raw: resp[0] }),
-        ResponseType::R2 => Response::R2(read_r2(resp)),
-        ResponseType::R3 => Response::R3(OcrResponse::from_raw(resp[0])),
-        ResponseType::R4 => Response::R4(SdioOcrResponse::from_raw(resp[0])),
-        ResponseType::R5 => Response::R5(SdioRwResponse::from_raw(resp[0])),
-        ResponseType::R6 => Response::R6(RcaResponse::from_raw(resp[0])),
-        ResponseType::R7 => Response::R7(IfCondResponse::from_raw(resp[0])),
+        ResponseType::R1 => Response::R1(R1Response {
+            raw: read_short_response(host),
+        }),
+        ResponseType::R1b => Response::R1b(R1Response {
+            raw: read_short_response(host),
+        }),
+        ResponseType::R2 => Response::R2(read_r2(read_long_response(host))),
+        ResponseType::R3 => Response::R3(OcrResponse::from_raw(read_short_response(host))),
+        ResponseType::R4 => Response::R4(SdioOcrResponse::from_raw(read_short_response(host))),
+        ResponseType::R5 => Response::R5(SdioRwResponse::from_raw(read_short_response(host))),
+        ResponseType::R6 => Response::R6(RcaResponse::from_raw(read_short_response(host))),
+        ResponseType::R7 => Response::R7(IfCondResponse::from_raw(read_short_response(host))),
         // Future ResponseType variants are not decoded by this controller.
         _ => return Err(Error::UnsupportedCommand),
     })
+}
+
+fn read_short_response(host: &DwMmc) -> u32 {
+    host.regs.resp0().read()
+}
+
+fn read_long_response(host: &DwMmc) -> [u32; 4] {
+    // Keep each response slot as a separate 32-bit volatile access. Some
+    // DW_mshc integrations reject the 64-bit MMIO loads that an aggregate
+    // volatile read may generate.
+    [
+        host.regs.resp0().read(),
+        host.regs.resp1().read(),
+        host.regs.resp2().read(),
+        host.regs.resp3().read(),
+    ]
 }
 
 /// Reorder the four 32-bit response slots into the 16-byte buffer the

@@ -187,37 +187,23 @@ Examples are given below and in the [app-helloworld](https://github.com/arceos-o
     # more args: LOG=<log> SMP=<smp> NET=[y|n] ...
     ```
 
-## How to build ArceOS for specific platforms and devices
+## How to build ArceOS for specific devices
 
-You need to manually link your application with the appropriate platform packages:
+ArceOS now uses the mandatory `axplat-dyn` platform path for supported
+architectures. Board-specific support should extend the runtime discovery path
+through `somehal`, firmware tables, FDT/ACPI data, or device probes instead of
+selecting a platform crate or platform config file in the in-tree build flow.
 
-```rs
-// Add this line to your application (for raspi4 platform)
-extern crate axplat_aarch64_raspi;
-```
-
-Then set the `MYPLAT` variable when run `make`:
-
-```bash
-# Build helloworld for raspi4
-make MYPLAT=axplat-aarch64-raspi SMP=4 A=examples/helloworld
-```
-
-You may also need to select the corrsponding device drivers by setting the `FEATURES` variable:
-
-```bash
-# Build the shell app for raspi4, and use the SD card driver
-make MYPLAT=axplat-aarch64-raspi SMP=4 A=examples/shell FEATURES=page-alloc-4g,driver-bcm2835-sdhci BUS=mmio
-# Build httpserver for the bare-metal x86_64 platform, and use the ixgbe and ramdisk driver
-make PLAT_CONFIG=$(pwd)/configs/custom/x86_64-pc-oslab.toml A=examples/httpserver FEATURES=page-alloc-4g,driver-ixgbe,driver-ramdisk SMP=4
-```
+You may need to select the corresponding device drivers by setting the
+`FEATURES` variable. For x86_64 QEMU builds, prefer the `cargo xtask`
+`axplat-dyn` flow instead of the removed in-tree static PC platform.
 
 ## How to reuse ArceOS modules in your own project
 
 ```toml
 # In Cargo.toml
  [dependencies]
-ax-alloc = { git = "https://github.com/arceos-org/arceos.git", tag = "v0.2.0" } # modules/axalloc
+ax-alloc = { git = "https://github.com/arceos-org/arceos.git", tag = "v0.2.0" } # ax-alloc
 ax-hal = { git = "https://github.com/arceos-org/arceos.git", tag = "v0.2.0" } # modules/axhal
 ```
 

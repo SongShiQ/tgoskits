@@ -1,9 +1,11 @@
 use crate::{
     Mmio, USBHost,
-    backend::kmod::hub::{Hub, HubInfo},
+    backend::kmod::hub::{HubId, HubInfo},
 };
 
 mod dwc;
+mod dwc2;
+mod ehci;
 mod hub;
 mod kcore;
 pub mod osal;
@@ -15,10 +17,15 @@ use alloc::{boxed::Box, collections::btree_map::BTreeMap};
 
 use dwc::Dwc;
 pub use dwc::{
-    CruOp, DwcNewParams, DwcParams, UdphyParam, Usb2PhyParam, UsbPhyInterfaceMode,
-    usb2phy::Usb2PhyPortId,
+    DwcNewParams, DwcParams, NamedResetLine, ResetLine, UdphyParam, Usb2PhyParam,
+    UsbPhyInterfaceMode, usb2phy::Usb2PhyPortId,
 };
-use id_arena::Id;
+use dwc2::Dwc2;
+pub use dwc2::{
+    Dwc2FifoSizes, Dwc2HostParams, Dwc2NewParams, Dwc2Quirks, Dwc2TransferStats, Dwc2UtmiWidth,
+};
+use ehci::Ehci;
+pub use ehci::EhciNewParams;
 use kcore::*;
 pub use osal::*;
 use usb_if::Speed;
@@ -31,22 +38,31 @@ impl USBHost {
         Ok(USBHost::new(Xhci::new(mmio, kernel)?))
     }
 
-    pub fn new_dwc(params: DwcNewParams<'_, impl CruOp>) -> Result<USBHost> {
+    pub fn new_dwc(params: DwcNewParams<'_>) -> Result<USBHost> {
         Ok(USBHost::new(Dwc::new(params)?))
+    }
+
+    pub fn new_dwc2(params: Dwc2NewParams) -> Result<USBHost> {
+        Ok(USBHost::new(Dwc2::new(params)?))
+    }
+
+    pub fn new_ehci(params: EhciNewParams) -> Result<USBHost> {
+        Ok(USBHost::new(Ehci::new(params)?))
     }
 
     pub(crate) fn new(backend: impl CoreOp) -> Self {
         let b = Core::new(backend);
         Self {
             backend: Box::new(b),
+            initialized: false,
         }
     }
 }
 
 pub struct DeviceAddressInfo {
     pub root_port_id: u8,
-    pub parent_hub: Option<Id<Hub>>,
+    pub parent_hub: Option<HubId>,
     pub port_speed: Speed,
     pub port_id: u8,
-    pub infos: BTreeMap<Id<Hub>, HubInfo>,
+    pub infos: BTreeMap<HubId, HubInfo>,
 }

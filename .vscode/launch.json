@@ -42,7 +42,7 @@
         "gdb-remote 127.0.0.1:1234"
       ],
       "postRunCommands": [
-        // "breakpoint set --file ${workspaceFolder}/components/axplat_crates/platforms/axplat-aarch64-qemu-virt/src/boot.rs --line 76",
+        // "breakpoint set --file ${workspaceFolder}/platforms/axplat-dyn/src/boot.rs --line 8",
         "breakpoint set --name ax_plat::call_main",
         "breakpoint set --file ${workspaceFolder}/os/arceos/modules/axruntime/src/lib.rs --line 141",
         "breakpoint set --file ${workspaceFolder}/os/arceos/examples/helloworld/src/main.rs --line 8"
@@ -57,7 +57,7 @@
       "request": "custom",
       "initCommands": [
         "process handle SIGINT -p false -s false -n false",
-        "settings set target.process.thread.step-avoid-regexp ^(core::|alloc::|bitflags::|ax_page_table_entry::|page_table_multiarch::)"
+        "settings set target.process.thread.step-avoid-regexp ^(core::|alloc::|bitflags::|page_table_generic::)"
       ],
       "preLaunchTask": "TGOS: Prepare Axvisor QEMU debug",
       "postDebugTask": "TGOS: Stop Axvisor QEMU debug",
@@ -82,7 +82,7 @@
       "request": "custom",
       "initCommands": [
         "process handle SIGINT -p false -s false -n false",
-        "settings set target.process.thread.step-avoid-regexp ^(core::|alloc::|bitflags::|ax_page_table_entry::|page_table_multiarch::)"
+        "settings set target.process.thread.step-avoid-regexp ^(core::|alloc::|bitflags::|page_table_generic::)"
       ],
       "preLaunchTask": "TGOS: Prepare Axvisor QEMU debug",
       "postDebugTask": "TGOS: Stop Axvisor QEMU debug",
@@ -94,7 +94,7 @@
         "gdb-remote 127.0.0.1:1234"
       ],
       "postRunCommands": [
-        "breakpoint set --file ${workspaceFolder}/platform/axplat-dyn/src/boot.rs --line 8",
+        "breakpoint set --file ${workspaceFolder}/platforms/axplat-dyn/src/boot.rs --line 8",
         "breakpoint set --file ${workspaceFolder}/os/axvisor/src/main.rs --line 42"
       ],
       "sourceLanguages": [
@@ -142,7 +142,7 @@
         "gdb-remote 127.0.0.1:1234"
       ],
       "postRunCommands": [
-        // "breakpoint set --file ${workspaceFolder}/components/axplat_crates/platforms/axplat-aarch64-qemu-virt/src/boot.rs --line 76",
+        // "breakpoint set --file ${workspaceFolder}/platforms/axplat-dyn/src/boot.rs --line 8",
         "breakpoint set --name ax_plat::call_main",
         "breakpoint set --file ${workspaceFolder}/os/arceos/modules/axruntime/src/lib.rs --line 141",
         "breakpoint set --name starry_kernel::entry::init",

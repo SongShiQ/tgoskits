@@ -1,7 +1,7 @@
 use core::{ops::Deref, time::Duration};
 
 use dma_api::DeviceDma;
-pub use dma_api::{DmaAddr, DmaDirection, DmaError, DmaHandle, DmaMapHandle, DmaOp};
+pub use dma_api::{DmaAddr, DmaDirection, DmaError, DmaMapHandle, DmaOp};
 
 #[derive(Clone)]
 pub(crate) struct Kernel {
@@ -12,7 +12,7 @@ pub(crate) struct Kernel {
 impl Kernel {
     pub fn new(dma_mask: u64, osal: &'static dyn KernelOp) -> Self {
         Self {
-            dma: DeviceDma::new(dma_mask, osal),
+            dma: DeviceDma::new_legacy(dma_mask, osal),
             osal,
         }
     }

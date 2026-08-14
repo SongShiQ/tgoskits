@@ -7,24 +7,30 @@ use core::{
 };
 
 use ax_errno::{AxError, AxResult};
-use ax_fs::{FS_CONTEXT, FileBackend, FileFlags, FsContext};
+use ax_fs_ng::vfs::{FileBackend, FileFlags, FsContext};
 use ax_io::{Seek, SeekFrom};
-use ax_sync::Mutex;
 use ax_task::future::{block_on, poll_io};
-use axfs_ng_vfs::{Location, Metadata, NodeFlags};
+use axfs_ng_vfs::{FsIoEvents, FsPollable, Location, Metadata, NodeFlags};
 use axpoll::{IoEvents, Pollable};
-use linux_raw_sys::general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, O_APPEND, O_EXCL};
+use linux_raw_sys::{
+    general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, O_APPEND, O_EXCL},
+    ioctl::TIOCSCTTY,
+};
+use starry_vm::VmPtr;
 
 use super::{FileLike, Kstat, get_file_like};
-#[cfg(feature = "kcov")]
-use crate::pseudofs::DeviceMmap;
 use crate::{
     file::{IoDst, IoSrc},
     pseudofs::Device,
+    sync::Mutex,
 };
 
+// FusionIO/directFS atomic-write toggle used by MySQL.
+const DFS_IOCTL_ATOMIC_WRITE_SET: u32 = 0x4004_9502;
+
 pub fn with_fs<R>(dirfd: c_int, f: impl FnOnce(&mut FsContext) -> AxResult<R>) -> AxResult<R> {
-    let mut fs = FS_CONTEXT.lock();
+    let fs_context = ax_fs_ng::vfs::current_fs_context();
+    let mut fs = fs_context.lock();
     if dirfd == AT_FDCWD {
         f(&mut fs)
     } else {
@@ -113,63 +119,31 @@ pub fn metadata_to_kstat(metadata: &Metadata) -> Kstat {
     }
 }
 
-/// File wrapper for `ax_fs::fops::File`.
+/// File wrapper for `ax_fs_ng::fops::File`.
 pub struct File {
-    inner: ax_fs::File,
+    inner: ax_fs_ng::File,
     open_flags: u32,
     nonblock: AtomicBool,
     append: AtomicBool,
-    /// Per-fd kcov state, created when opening `/dev/kcov`.
-    #[cfg(feature = "kcov")]
-    kcov_state: Option<Arc<crate::kcov::KcovFdState>>,
 }
 
 impl File {
-    pub fn new(inner: ax_fs::File, open_flags: u32) -> Self {
-        #[cfg(feature = "kcov")]
-        let kcov_state = Self::detect_kcov(&inner);
+    pub fn new(inner: ax_fs_ng::File, open_flags: u32) -> Self {
         Self {
             inner,
             open_flags,
             nonblock: AtomicBool::new(false),
             append: AtomicBool::new(open_flags & O_APPEND != 0),
-            #[cfg(feature = "kcov")]
-            kcov_state,
         }
     }
 
-    pub fn inner(&self) -> &ax_fs::File {
+    pub fn inner(&self) -> &ax_fs_ng::File {
         &self.inner
-    }
-
-    /// Detect if this file is backed by the kcov device and create per-fd state.
-    #[cfg(feature = "kcov")]
-    fn detect_kcov(inner: &ax_fs::File) -> Option<Arc<crate::kcov::KcovFdState>> {
-        let backend = inner.backend().ok()?;
-        let FileBackend::Direct(loc) = backend else {
-            return None;
-        };
-        let device = loc.entry().downcast::<Device>().ok()?;
-        if device
-            .inner()
-            .as_any()
-            .downcast_ref::<crate::kcov::KcovDevice>()
-            .is_some()
-        {
-            Some(Arc::new(crate::kcov::KcovFdState::new()))
-        } else {
-            None
-        }
     }
 }
 
 impl Drop for File {
     fn drop(&mut self) {
-        #[cfg(feature = "kcov")]
-        if let Some(ref kcov_state) = self.kcov_state {
-            kcov_state.on_close();
-        }
-
         if let Ok(device) = self.inner.location().entry().downcast::<Device>() {
             device.inner().close(self.open_flags & O_EXCL != 0);
         }
@@ -185,6 +159,14 @@ impl File {
 fn path_for(loc: &Location) -> Cow<'static, str> {
     loc.absolute_path()
         .map_or_else(|_| "<error>".into(), |f| Cow::Owned(f.to_string()))
+}
+
+fn fs_events_to_io(events: FsIoEvents) -> IoEvents {
+    IoEvents::from_bits_truncate(events.bits())
+}
+
+fn io_events_to_fs(events: IoEvents) -> FsIoEvents {
+    FsIoEvents::from_bits_truncate(events.bits())
 }
 
 impl FileLike for File {
@@ -204,13 +186,20 @@ impl FileLike for File {
         if self.append() {
             inner.seek(SeekFrom::End(0))?;
         }
-        if likely(self.is_blocking()) {
+        let result = if likely(self.is_blocking()) {
             inner.write(src)
         } else {
             block_on(poll_io(self, IoEvents::OUT, self.nonblocking(), || {
                 inner.write(&mut *src)
             }))
+        };
+        if let Ok(bytes) = result
+            && bytes > 0
+        {
+            let path = path_for(inner.location()).into_owned();
+            crate::file::inotify::notify_modify_path(&path);
         }
+        result
     }
 
     fn stat(&self) -> AxResult<Kstat> {
@@ -223,19 +212,19 @@ impl FileLike for File {
     }
 
     fn ioctl(&self, cmd: u32, arg: usize) -> AxResult<usize> {
-        #[cfg(feature = "kcov")]
-        if let Some(ref kcov_state) = self.kcov_state {
-            return kcov_state.ioctl(cmd, arg);
+        let loc = self.inner().backend()?.location();
+        if cmd == TIOCSCTTY
+            && let Some(result) = crate::pseudofs::dev::tty::bind_pty_at_location(loc.clone())
+        {
+            return result;
         }
-        self.inner().backend()?.location().ioctl(cmd, arg)
-    }
-
-    #[cfg(feature = "kcov")]
-    fn device_mmap(&self, offset: u64) -> AxResult<DeviceMmap> {
-        if let Some(ref kcov_state) = self.kcov_state {
-            return Ok(kcov_state.mmap(offset));
+        match cmd {
+            DFS_IOCTL_ATOMIC_WRITE_SET => {
+                let _enabled: u32 = (arg as *const u32).vm_read()?;
+                Ok(0)
+            }
+            _ => loc.ioctl(cmd, arg),
         }
-        Err(AxError::BadFileDescriptor)
     }
 
     fn file_mmap(&self) -> AxResult<(FileBackend, FileFlags)> {
@@ -285,6 +274,9 @@ impl FileLike for File {
         if let Ok(memfd) = any.clone().downcast_arc::<crate::file::memfd::Memfd>() {
             return Ok(memfd.inner().clone());
         }
+        if let Ok(mount_table) = any.clone().downcast_arc::<crate::file::MountTableFile>() {
+            return Ok(mount_table.inner().clone());
+        }
         Err(if any.is::<Directory>() {
             AxError::IsADirectory
         } else {
@@ -294,31 +286,55 @@ impl FileLike for File {
 }
 impl Pollable for File {
     fn poll(&self) -> IoEvents {
-        self.inner().location().poll()
+        fs_events_to_io(self.inner().location().poll())
     }
 
     fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        self.inner().location().register(context, events);
+        self.inner()
+            .location()
+            .register(context, io_events_to_fs(events));
     }
 }
 
-/// Directory wrapper for `ax_fs::fops::Directory`.
+/// Directory wrapper for `ax_fs_ng::fops::Directory`.
 pub struct Directory {
     inner: Location,
     pub offset: Mutex<u64>,
+    /// Original open flags (used by fd_is_path / sys_fchmodat to detect
+    /// O_PATH on directory descriptors — open(dir, O_PATH|O_DIRECTORY)
+    /// must reject fchmod just like O_PATH on a regular file).
+    open_flags: u32,
+    /// Whether this is the original handle returned by fsmount(2).
+    /// Reopening it as a normal directory deliberately drops this authority.
+    detached_mount_handle: bool,
 }
 
 impl Directory {
-    pub fn new(inner: Location) -> Self {
+    pub fn new(inner: Location, open_flags: u32) -> Self {
         Self {
             inner,
             offset: Mutex::new(0),
+            open_flags,
+            detached_mount_handle: false,
+        }
+    }
+
+    pub(crate) fn new_detached_mount(inner: Location, open_flags: u32) -> Self {
+        Self {
+            inner,
+            offset: Mutex::new(0),
+            open_flags,
+            detached_mount_handle: true,
         }
     }
 
     /// Get the inner node of the directory.
     pub fn inner(&self) -> &Location {
         &self.inner
+    }
+
+    pub(crate) fn is_detached_mount_handle(&self) -> bool {
+        self.detached_mount_handle
     }
 }
 
@@ -343,6 +359,10 @@ impl FileLike for Directory {
         Some((m.device, m.inode))
     }
 
+    fn open_flags(&self) -> u32 {
+        self.open_flags
+    }
+
     fn path(&self) -> Cow<'_, str> {
         path_for(&self.inner)
     }
@@ -355,8 +375,46 @@ impl FileLike for Directory {
 }
 impl Pollable for Directory {
     fn poll(&self) -> IoEvents {
-        IoEvents::IN | IoEvents::OUT
+        fs_events_to_io(FsIoEvents::IN | FsIoEvents::OUT)
     }
 
     fn register(&self, _context: &mut Context<'_>, _events: IoEvents) {}
+}
+#[cfg(axtest)]
+pub(crate) fn metadata_to_kstat_conversion_rules_hold_for_test() -> bool {
+    use core::time::Duration;
+
+    use axfs_ng_vfs::{DeviceId, Metadata};
+
+    // Create a Metadata with known values.
+    let meta = Metadata {
+        device: 42,
+        inode: 100,
+        nlink: 3,
+        mode: axfs_ng_vfs::NodePermission::from_bits_truncate(0o644),
+        node_type: axfs_ng_vfs::NodeType::RegularFile,
+        uid: 1000,
+        gid: 1000,
+        size: 4096,
+        block_size: 512,
+        blocks: 8,
+        rdev: DeviceId::default(),
+        atime: Duration::from_secs(1000),
+        mtime: Duration::from_millis(2000500),
+        ctime: Duration::from_nanos(3000999999000),
+    };
+
+    let kstat = metadata_to_kstat(&meta);
+
+    // Verify key fields are correctly transferred.
+    kstat.dev == 42
+        && kstat.ino == 100
+        && kstat.nlink == 3
+        && kstat.uid == 1000
+        && kstat.gid == 1000
+        && kstat.size == 4096
+        && kstat.blksize == 512
+        && kstat.blocks == 8
+        // mode should have type bits (S_IFREG=0100000) OR'd with 0644.
+        && (kstat.mode >> 12) == (axfs_ng_vfs::NodeType::RegularFile as u32)
 }

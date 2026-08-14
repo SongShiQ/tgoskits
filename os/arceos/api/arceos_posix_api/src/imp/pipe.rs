@@ -3,10 +3,9 @@ use core::ffi::c_int;
 
 use ax_errno::{LinuxError, LinuxResult};
 use ax_io::PollState;
-use ax_sync::Mutex;
 
 use super::fd_ops::{FileLike, add_file_like, close_file_like};
-use crate::ctypes;
+use crate::{ctypes, sync::Mutex};
 
 #[derive(Copy, Clone, PartialEq)]
 enum RingBufferStatus {
@@ -22,6 +21,8 @@ pub struct PipeRingBuffer {
     head: usize,
     tail: usize,
     status: RingBufferStatus,
+    read_readiness_version: u64,
+    write_readiness_version: u64,
 }
 
 impl PipeRingBuffer {
@@ -31,26 +32,49 @@ impl PipeRingBuffer {
             head: 0,
             tail: 0,
             status: RingBufferStatus::Empty,
+            read_readiness_version: 0,
+            write_readiness_version: 0,
         }
     }
 
     pub fn write_byte(&mut self, byte: u8) {
+        let old_status = self.status;
         self.status = RingBufferStatus::Normal;
         self.arr[self.tail] = byte;
         self.tail = (self.tail + 1) % RING_BUFFER_SIZE;
         if self.tail == self.head {
             self.status = RingBufferStatus::Full;
         }
+        self.refresh_readiness_versions(old_status);
     }
 
     pub fn read_byte(&mut self) -> u8 {
+        let old_status = self.status;
         self.status = RingBufferStatus::Normal;
         let c = self.arr[self.head];
         self.head = (self.head + 1) % RING_BUFFER_SIZE;
         if self.head == self.tail {
             self.status = RingBufferStatus::Empty;
         }
+        self.refresh_readiness_versions(old_status);
         c
+    }
+
+    fn refresh_readiness_versions(&mut self, old_status: RingBufferStatus) {
+        if Self::is_readable(old_status) != Self::is_readable(self.status) {
+            self.read_readiness_version = self.read_readiness_version.wrapping_add(1);
+        }
+        if Self::is_writable(old_status) != Self::is_writable(self.status) {
+            self.write_readiness_version = self.write_readiness_version.wrapping_add(1);
+        }
+    }
+
+    const fn is_readable(status: RingBufferStatus) -> bool {
+        !matches!(status, RingBufferStatus::Empty)
+    }
+
+    const fn is_writable(status: RingBufferStatus) -> bool {
+        !matches!(status, RingBufferStatus::Full)
     }
 
     /// Get the length of remaining data in the buffer
@@ -70,6 +94,14 @@ impl PipeRingBuffer {
             0
         } else {
             RING_BUFFER_SIZE - self.available_read()
+        }
+    }
+
+    pub const fn readiness_version(&self, readable_end: bool) -> u64 {
+        if readable_end {
+            self.read_readiness_version
+        } else {
+            self.write_readiness_version
         }
     }
 }
@@ -111,6 +143,9 @@ impl FileLike for Pipe {
         if !self.readable() {
             return Err(LinuxError::EPERM);
         }
+        if buf.is_empty() {
+            return Ok(0);
+        }
         let mut read_size = 0usize;
         let max_len = buf.len();
         loop {
@@ -131,6 +166,12 @@ impl FileLike for Pipe {
                 }
                 buf[read_size] = ring_buffer.read_byte();
                 read_size += 1;
+                if read_size == max_len {
+                    return Ok(read_size);
+                }
+            }
+            if read_size > 0 {
+                return Ok(read_size);
             }
         }
     }
@@ -138,6 +179,9 @@ impl FileLike for Pipe {
     fn write(&self, buf: &[u8]) -> LinuxResult<usize> {
         if !self.writable() {
             return Err(LinuxError::EPERM);
+        }
+        if buf.is_empty() {
+            return Ok(0);
         }
         let mut write_size = 0usize;
         let max_len = buf.len();
@@ -156,6 +200,9 @@ impl FileLike for Pipe {
                 }
                 ring_buffer.write_byte(buf[write_size]);
                 write_size += 1;
+                if write_size == max_len {
+                    return Ok(write_size);
+                }
             }
         }
     }
@@ -182,6 +229,7 @@ impl FileLike for Pipe {
         Ok(PollState {
             readable: self.readable() && buf.available_read() > 0,
             writable: self.writable() && buf.available_write() > 0,
+            readiness_version: buf.readiness_version(self.readable()),
         })
     }
 

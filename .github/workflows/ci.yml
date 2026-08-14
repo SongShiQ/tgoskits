@@ -2,6 +2,9 @@ name: CI
 
 on:
   push:
+    branches:
+      - main
+      - dev
     paths-ignore:
       - "**/*.md"
       - "**/*.rst"
@@ -19,15 +22,28 @@ on:
       - "**/doc/**"
   workflow_dispatch:
     inputs:
+      run_target:
+        description: Run CI checks or publish container images.
+        required: false
+        default: container
+        type: choice
+        options:
+          - container
+          - ci
       container_target:
         description: Container image(s) to publish manually.
-        required: true
+        required: false
         default: both
         type: choice
         options:
           - base
           - axvisor-lvz
           - both
+      since_sha:
+        description: Base commit for CI diff checks when run_target is ci.
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -37,19 +53,98 @@ env:
   CARGO_TERM_COLOR: always
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: >-
+    ${{
+      github.event_name != 'pull_request' && github.ref == 'refs/heads/dev'
+      && format('ci-{0}-{1}', github.workflow, github.ref)
+      || format('ci-{0}-{1}', github.workflow, github.run_id)
+    }}
+  queue: max
 
 jobs:
+  cancel_stale_runs:
+    name: Cancel stale CI runs
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Cancel older queued or running runs
+        if: github.event_name == 'pull_request' || github.ref != 'refs/heads/dev'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_RUN_NUMBER: ${{ github.run_number }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number || '' }}
+        run: |
+          set -uo pipefail
+
+          statuses=(queued in_progress waiting requested)
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            selector='select(
+              .run_number < (env.CURRENT_RUN_NUMBER | tonumber)
+              and any(.pull_requests[]?; .number == (env.PR_NUMBER | tonumber))
+            )'
+          else
+            selector='select(
+              .run_number < (env.CURRENT_RUN_NUMBER | tonumber)
+              and .head_branch == env.REF_NAME
+              and .event != "pull_request"
+              and .event != "pull_request_target"
+            )'
+          fi
+
+          cancel_run() {
+            local run_id="$1"
+            local run_number="$2"
+            local run_url="$3"
+
+            if gh api \
+              --method POST \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/cancel" >/dev/null; then
+              echo "Canceled stale CI run #${run_number}: ${run_url}"
+            else
+              echo "::warning::Failed to cancel stale CI run #${run_number}: ${run_url}"
+            fi
+          }
+
+          for status in "${statuses[@]}"; do
+            runs="$(
+              gh api \
+                --paginate \
+                "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?status=${status}&per_page=100" \
+                --jq ".workflow_runs[] | ${selector} | [.id, .run_number, .html_url] | @tsv" 2>api-error.log
+            )"
+            gh_status=$?
+
+            if [ "$gh_status" -ne 0 ]; then
+              while IFS= read -r line; do
+                echo "::warning::Failed to query stale CI runs with status '${status}': ${line}"
+              done < api-error.log
+              rm -f api-error.log
+              continue
+            fi
+            rm -f api-error.log
+
+            while IFS=$'\t' read -r run_id run_number run_url; do
+              if [ -n "$run_id" ]; then
+                cancel_run "$run_id" "$run_number" "$run_url"
+              fi
+            done <<< "$runs"
+          done
+
   detect_changes:
     name: Detect changed paths
+    needs: cancel_stale_runs
     runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: read
     outputs:
       ci_checks: ${{ steps.outputs.outputs.ci_checks }}
-      skip_duplicate_push_ci: ${{ steps.outputs.outputs.skip_duplicate_push_ci }}
+      since_ref: ${{ steps.outputs.outputs.since_ref }}
       base_container_publish: ${{ steps.outputs.outputs.base_container_publish }}
       axvisor_lvz_container_publish: ${{ steps.outputs.outputs.axvisor_lvz_container_publish }}
       base_container_image: ${{ steps.outputs.outputs.base_container_image }}
@@ -60,28 +155,44 @@ jobs:
         with:
           fetch-depth: 2
 
+      - name: Validate CI source paths
+        run: |
+          python3 scripts/test/check_ci_paths.py
+
+      - name: Validate CI routing
+        run: |
+          python3 scripts/test/check_ci_routing.py
+
       - name: Detect CI-relevant changes
         id: filter
         if: github.event_name != 'workflow_dispatch'
         uses: dorny/paths-filter@v4
         with:
           base: ${{ github.event_name == 'push' && github.ref || '' }}
+          token: ""
           filters: |
             ci_checks:
               - ".cargo/**"
+              - ".github/workflows/ci-branch-push.yml"
               - ".github/workflows/container-publish.yml"
               - ".github/workflows/ci.yml"
               - ".github/workflows/reusable-command.yml"
               - "Cargo.toml"
               - "Cargo.lock"
               - "rust-toolchain.toml"
+              - "apps/**"
+              - "bootloader/**"
               - "components/**"
               - "drivers/**"
-              - "examples/**"
+              - "fs/**"
+              - "memory/**"
+              - "net/**"
               - "os/**"
-              - "platform/**"
+              - "platforms/**"
               - "scripts/**"
               - "test-suit/**"
+              - "tools/**"
+              - "virtualization/**"
               - "xtask/**"
             base_container_publish:
               - "container/Dockerfile"
@@ -95,58 +206,91 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
+          RUN_TARGET: ${{ github.event.inputs.run_target || 'container' }}
           MANUAL_TARGET: ${{ github.event.inputs.container_target }}
+          SINCE_SHA: ${{ github.event.inputs.since_sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before || '' }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
           FILTER_CI_CHECKS: ${{ steps.filter.outputs.ci_checks }}
           FILTER_BASE_CONTAINER_PUBLISH: ${{ steps.filter.outputs.base_container_publish }}
           FILTER_AXVISOR_LVZ_CONTAINER_PUBLISH: ${{ steps.filter.outputs.axvisor_lvz_container_publish }}
-          GH_TOKEN: ${{ github.token }}
         run: |
           repository="$(printf '%s' "$GITHUB_REPOSITORY" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
           base_container_image="ghcr.io/${repository}-container"
           axvisor_lvz_container_image="ghcr.io/${repository}-container-axvisor-lvz"
-          skip_duplicate_push_ci=false
 
-          if [ "$EVENT_NAME" = "push" ] \
-            && [ "$REF_NAME" != "main" ] \
-            && [ "$REF_NAME" != "dev" ]; then
-            open_pr_count="$(
-              gh pr list \
-                --repo "$GITHUB_REPOSITORY" \
-                --head "$REF_NAME" \
-                --state open \
-                --json number \
-                --jq 'length'
-            )"
+          is_empty_or_zero_sha() {
+            local value="$1"
+            [ -z "$value" ] || [ "$value" = "0000000000000000000000000000000000000000" ]
+          }
 
-            if [ "$open_pr_count" != "0" ]; then
-              skip_duplicate_push_ci=true
+          resolve_since_ref() {
+            if [ "$EVENT_NAME" = "pull_request" ]; then
+              printf '%s\n' "$PR_BASE_SHA"
+              return
             fi
-          fi
 
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ "$EVENT_NAME" = "push" ]; then
+              if ! is_empty_or_zero_sha "$PUSH_BEFORE_SHA"; then
+                printf '%s\n' "$PUSH_BEFORE_SHA"
+                return
+              fi
+            elif [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$RUN_TARGET" = "ci" ]; then
+              if ! is_empty_or_zero_sha "$SINCE_SHA"; then
+                printf '%s\n' "$SINCE_SHA"
+                return
+              fi
+            fi
+
+            if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+              git rev-parse HEAD~1
+              return
+            fi
+
+            git fetch --no-tags --depth=1 origin dev:refs/remotes/origin/dev >/dev/null 2>&1 || true
+            merge_base="$(git merge-base HEAD origin/dev 2>/dev/null || true)"
+            if [ -n "$merge_base" ]; then
+              printf '%s\n' "$merge_base"
+              return
+            fi
+
+            git rev-parse HEAD
+          }
+
+          since_ref="$(resolve_since_ref)"
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$RUN_TARGET" = "ci" ]; then
+            ci_checks=true
+            base_container_publish=false
+            axvisor_lvz_container_publish=false
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             ci_checks=false
-            case "$MANUAL_TARGET" in
-              base)
-                base_container_publish=true
-                axvisor_lvz_container_publish=false
-                ;;
-              axvisor-lvz)
-                base_container_publish=false
-                axvisor_lvz_container_publish=true
-                ;;
-              both)
-                base_container_publish=true
-                axvisor_lvz_container_publish=true
+            case "$RUN_TARGET" in
+              container)
+                case "$MANUAL_TARGET" in
+                  base)
+                    base_container_publish=true
+                    axvisor_lvz_container_publish=false
+                    ;;
+                  axvisor-lvz)
+                    base_container_publish=false
+                    axvisor_lvz_container_publish=true
+                    ;;
+                  both)
+                    base_container_publish=true
+                    axvisor_lvz_container_publish=true
+                    ;;
+                  *)
+                    echo "Unexpected container_target: $MANUAL_TARGET" >&2
+                    exit 1
+                    ;;
+                esac
                 ;;
               *)
-                echo "Unexpected container_target: $MANUAL_TARGET" >&2
+                echo "Unexpected run_target: $RUN_TARGET" >&2
                 exit 1
                 ;;
             esac
-          elif [ "$skip_duplicate_push_ci" = "true" ]; then
-            ci_checks=false
-            base_container_publish=false
-            axvisor_lvz_container_publish=false
           else
             if [ "$EVENT_NAME" = "push" ] && { [ "$REF_NAME" = "main" ] || [ "$REF_NAME" = "dev" ]; }; then
               ci_checks=true
@@ -159,7 +303,7 @@ jobs:
 
           {
             echo "ci_checks=${ci_checks}"
-            echo "skip_duplicate_push_ci=${skip_duplicate_push_ci}"
+            echo "since_ref=${since_ref}"
             echo "base_container_publish=${base_container_publish}"
             echo "axvisor_lvz_container_publish=${axvisor_lvz_container_publish}"
             echo "base_container_image=${base_container_image}"
@@ -170,15 +314,12 @@ jobs:
         if: steps.outputs.outputs.ci_checks != 'true'
         env:
           EVENT_NAME: ${{ github.event_name }}
-          SKIP_DUPLICATE_PUSH_CI: ${{ steps.outputs.outputs.skip_duplicate_push_ci }}
         run: |
           {
             echo "## CI checks skipped"
             echo ""
             if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
               echo "This manual run is scoped to container publishing, so static checks and follow-up CI checks were skipped."
-            elif [ "$SKIP_DUPLICATE_PUSH_CI" = "true" ]; then
-              echo "This branch already has an open pull request. The duplicate push CI was skipped; the pull_request CI run will validate the same commit."
             else
               echo "Changed files do not match the test-relevant path set, so static checks and follow-up CI checks were skipped."
             fi
@@ -188,6 +329,7 @@ jobs:
         if: >-
           ${{
             github.event_name == 'workflow_dispatch'
+            && (github.event.inputs.run_target || 'container') == 'container'
             && github.ref_name != 'main'
             && github.ref_name != 'dev'
           }}
@@ -208,48 +350,46 @@ jobs:
         include:
           - name: Check formatting
             use_container: false
-            runs_on: '["ubuntu-latest"]'
-            command: cargo fmt --all -- --check
+            runs_on: '["self-hosted","linux","qcs"]'
+            self_hosted_owner: rcore-os
+            command: |
+              cargo fmt --all -- --check
+              cargo publish --workspace --dry-run --no-verify
             cache_key: ""
-            container_image: ""
+            container_image: base
             fetch_depth: "1"
           - name: Run sync-lint
             use_container: true
             runs_on: '["ubuntu-latest"]'
-            command: |
-              set -eux
-              git_cmd() {
-                git -c safe.directory="${GITHUB_WORKSPACE}" "$@"
-              }
-              ensure_since_ref() {
-                ref="$1"
-                git_cmd cat-file -e "${ref}^{commit}" 2>/dev/null && return 0
-                git_cmd fetch --no-tags --depth=1 origin "${ref}" || true
-                git_cmd cat-file -e "${ref}^{commit}" 2>/dev/null
-              }
-
-              if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
-                cargo xtask sync-lint --since "${{ github.event.pull_request.base.sha }}"
-              elif [ "${GITHUB_EVENT_NAME}" = "push" ]; then
-                before="${{ github.event.before }}"
-                if [ "${before}" = "0000000000000000000000000000000000000000" ]; then
-                  cargo xtask sync-lint
-                elif ensure_since_ref "${before}"; then
-                  cargo xtask sync-lint --since "${before}"
-                else
-                  echo "::notice::before commit ${before} is unavailable; running full sync-lint"
-                  cargo xtask sync-lint
-                fi
-              else
-                cargo xtask sync-lint
-              fi
-            cache_key: sync-lint
+            command: cargo xtask sync-lint --since "${{ needs.detect_changes.outputs.since_ref }}"
+            cache_key: ""
             container_image: base
             fetch_depth: full
+            upload_xtask_bin_artifact: true
+          - name: Run lock-lint
+            use_container: true
+            runs_on: '["ubuntu-latest"]'
+            command: cargo xtask lock-lint
+            cache_key: ""
+            container_image: base
+            fetch_depth: "1"
     uses: ./.github/workflows/reusable-command.yml
     with:
-      runs_on: ${{ matrix.runs_on }}
-      use_container: ${{ matrix.use_container }}
+      runs_on: >-
+        ${{
+          matrix.self_hosted_owner != ''
+          && github.repository_owner != matrix.self_hosted_owner
+          && '["ubuntu-latest"]'
+          || matrix.runs_on
+        }}
+      use_container: >-
+        ${{
+          matrix.use_container
+          || (
+            matrix.self_hosted_owner != ''
+            && github.repository_owner != matrix.self_hosted_owner
+          )
+        }}
       command: ${{ matrix.command }}
       cache_key: ${{ matrix.cache_key }}
       container_image: >-
@@ -258,7 +398,19 @@ jobs:
           && format('{0}:latest', needs.detect_changes.outputs.base_container_image)
           || matrix.container_image
         }}
-      fetch_depth: ${{ matrix.fetch_depth == 'full' && '0' || '1' }}
+      fetch_depth: >-
+        ${{
+          contains(matrix.runs_on, 'self-hosted')
+          && !(
+            matrix.self_hosted_owner != ''
+            && github.repository_owner != matrix.self_hosted_owner
+          )
+          && matrix.fetch_depth == 'full'
+          && '2'
+          || (matrix.fetch_depth == 'full' && '0' || '1')
+        }}
+      upload_xtask_bin_artifact: ${{ matrix.upload_xtask_bin_artifact || false }}
+      xtask_bin_artifact_name: tg-xtask-bin
 
   test_checks:
     name: ${{ matrix.name }}
@@ -271,214 +423,321 @@ jobs:
       matrix:
         include:
           - name: Run clippy
-            use_container: true
-            runs_on: '["ubuntu-latest"]'
-            command: |
-              set -eux
-              git_cmd() {
-                git -c safe.directory="${GITHUB_WORKSPACE}" "$@"
-              }
-              ensure_since_ref() {
-                ref="$1"
-                git_cmd cat-file -e "${ref}^{commit}" 2>/dev/null && return 0
-                git_cmd fetch --no-tags --depth=1 origin "${ref}" || true
-                git_cmd cat-file -e "${ref}^{commit}" 2>/dev/null
-              }
-
-              if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
-                cargo xtask clippy --since "${{ github.event.pull_request.base.sha }}"
-              elif [ "${GITHUB_EVENT_NAME}" = "push" ]; then
-                before="${{ github.event.before }}"
-                if [ "${before}" = "0000000000000000000000000000000000000000" ]; then
-                  cargo xtask clippy
-                elif ensure_since_ref "${before}"; then
-                  cargo xtask clippy --since "${before}"
-                else
-                  echo "::notice::before commit ${before} is unavailable; running full clippy"
-                  cargo xtask clippy
-                fi
-              else
-                cargo xtask clippy
-              fi
-            cache_key: clippy
+            use_container: false
+            runs_on: '["self-hosted","linux","qcs"]'
+            self_hosted_owner: rcore-os
+            command: cargo xtask clippy --since "${{ needs.detect_changes.outputs.since_ref }}"
+            cache_key: ""
             container_image: base
             fetch_depth: full
-            required_repository_owner: ""
+            download_xtask_bin_artifact: true
+            limit_to_owner: ""
             main_pr_only: false
           - name: Test with std
-            use_container: true
-            runs_on: '["ubuntu-latest"]'
+            use_container: false
+            runs_on: '["self-hosted","linux","qcs"]'
+            self_hosted_owner: rcore-os
             command: cargo xtask test
-            cache_key: test-std
+            cache_key: ""
             container_image: base
-            required_repository_owner: ""
+            limit_to_owner: ""
             main_pr_only: false
-          - name: Test axvisor aarch64 qemu
-            use_container: true
-            runs_on: '["ubuntu-latest"]'
-            command: cargo xtask axvisor test qemu --arch aarch64
-            cache_key: test-axvisor-aarch64
+          - name: Test axvisor aarch64 qemu (smoke + axtest + timer stress)
+            use_container: false
+            runs_on: '["self-hosted","linux","qcs"]'
+            self_hosted_owner: rcore-os
+            timeout_minutes: 30
+            command: |
+              echo "==> axvisor aarch64 smoke"
+              cargo xtask axvisor test qemu --arch aarch64 --test-case smoke
+              echo "==> axvisor aarch64 virtio-blk ArceOS guest"
+              timeout 240s apps/arceos/virtio-blk-test/run.sh
+              echo "==> axvisor aarch64 axtest"
+              cargo xtask ktest qemu -p axvisor --test axtest --arch aarch64
+              echo "==> pull qemu-aarch64 image"
+              cargo xtask image pull qemu-aarch64 --output-dir tmp/axbuild/images
+              echo "==> axvisor aarch64 gicv2 timer stress"
+              cargo xtask axvisor test qemu --arch aarch64 --test-case gicv2-timer-stress
+              echo "==> axvisor aarch64 gicv3 timer stress"
+              cargo xtask axvisor test qemu --arch aarch64 --test-case gicv3-timer-stress
+            cache_key: ""
             container_image: base
-            apk_region: us
-            required_repository_owner: ""
+            limit_to_owner: ""
             main_pr_only: false
-          - name: Test axvisor riscv64 qemu
-            use_container: true
-            runs_on: '["ubuntu-latest"]'
-            command: cargo xtask axvisor test qemu --arch riscv64
-            cache_key: test-axvisor-riscv64
+          - name: Test axvisor aarch64 qemu (panic modes)
+            use_container: false
+            runs_on: '["self-hosted","linux","qcs"]'
+            self_hosted_owner: rcore-os
+            timeout_minutes: 30
+            command: |
+              echo "==> axvisor aarch64 backtrace panic"
+              cargo xtask axvisor test qemu --arch aarch64 --test-case backtrace-panic
+              echo "==> axvisor aarch64 no-backtrace panic"
+              cargo xtask axvisor test qemu --arch aarch64 --test-case no-backtrace
+            cache_key: ""
             container_image: base
-            apk_region: us
-            required_repository_owner: ""
+            limit_to_owner: ""
+            main_pr_only: false
+          - name: Test axvisor riscv64 qemu (smoke + panic modes)
+            use_container: false
+            runs_on: '["self-hosted","linux","qcs"]'
+            self_hosted_owner: rcore-os
+            timeout_minutes: 30
+            command: |
+              echo "==> axvisor riscv64 smoke"
+              cargo xtask axvisor test qemu --arch riscv64 --test-case smoke
+              echo "==> axvisor riscv64 IPI cross-test"
+              cargo xtask cross-test --arch riscv64 \
+                --package riscv_vcpu --package axvm \
+                --features axvm/host-test --no-default-features --lib ipi
+              echo "==> axvisor riscv64 backtrace panic"
+              cargo xtask axvisor test qemu --arch riscv64 --test-case backtrace-panic
+              echo "==> axvisor riscv64 no-backtrace panic"
+              cargo xtask axvisor test qemu --arch riscv64 --test-case no-backtrace
+            cache_key: ""
+            container_image: base
+            limit_to_owner: ""
             main_pr_only: false
           - name: Test axvisor loongarch64 qemu
             use_container: true
             runs_on: '["ubuntu-latest"]'
-            command: cargo xtask axvisor test qemu --arch loongarch64
+            command: target/debug/tg-xtask axvisor test qemu --arch loongarch64
             cache_key: test-axvisor-loongarch64
             container_image: axvisor-lvz
-            apk_region: us
-            required_repository_owner: ""
+            limit_to_owner: ""
+            main_pr_only: false
+            download_xtask_bin_artifact: true
+          - name: Test axvisor qemu ivc
+            use_container: false
+            runs_on: '["self-hosted","linux","qcs"]'
+            self_hosted_owner: rcore-os
+            command: cargo xtask axvisor test qemu --arch aarch64 --test-group normal --test-case qemu-ivc
+            cache_key: ""
+            container_image: base
+            limit_to_owner: ""
             main_pr_only: false
           - name: Test starry riscv64 qemu
             use_container: true
             runs_on: '["ubuntu-latest"]'
-            command: cargo xtask starry test qemu --arch riscv64
+            command: target/debug/tg-xtask starry test qemu --arch riscv64
             cache_key: test-starry-riscv64
             container_image: base
             apk_region: us
-            required_repository_owner: ""
+            limit_to_owner: ""
             main_pr_only: false
+            download_xtask_bin_artifact: true
           - name: Test starry aarch64 qemu
             use_container: true
             runs_on: '["ubuntu-latest"]'
-            command: cargo xtask starry test qemu --arch aarch64
+            command: |
+              echo "==> starry aarch64 GICv2 SMP4 boot"
+              target/debug/tg-xtask starry qemu --arch aarch64 --smp 4 \
+                --qemu-config os/StarryOS/configs/qemu/qemu-aarch64-gicv2-boot.toml
+              echo "==> starry aarch64 test suites"
+              target/debug/tg-xtask starry test qemu --arch aarch64
             cache_key: test-starry-aarch64
             container_image: base
             apk_region: us
-            required_repository_owner: ""
+            limit_to_owner: ""
             main_pr_only: false
+            download_xtask_bin_artifact: true
           - name: Test starry loongarch64 qemu
             use_container: true
             runs_on: '["ubuntu-latest"]'
-            command: cargo xtask starry test qemu --arch loongarch64
+            command: target/debug/tg-xtask starry test qemu --arch loongarch64
             cache_key: test-starry-loongarch64
             container_image: base
             apk_region: us
-            required_repository_owner: ""
+            limit_to_owner: ""
             main_pr_only: false
+            download_xtask_bin_artifact: true
           - name: Test starry x86_64 qemu
             use_container: true
             runs_on: '["ubuntu-latest"]'
-            command: cargo xtask starry test qemu --arch x86_64
+            command: target/debug/tg-xtask starry test qemu --arch x86_64
             cache_key: test-starry-x86_64
             container_image: base
             apk_region: us
-            required_repository_owner: ""
+            limit_to_owner: ""
             main_pr_only: false
+            download_xtask_bin_artifact: true
           - name: Test arceos x86_64 qemu
             use_container: false
             runs_on: '["self-hosted","linux","qcs"]'
+            self_hosted_owner: rcore-os
             command: cargo xtask arceos test qemu --arch x86_64
             cache_key: ""
-            container_image: ""
-            apk_region: us
-            required_repository_owner: rcore-os
+            container_image: base
+            limit_to_owner: ""
             main_pr_only: false
           - name: Test arceos riscv64 qemu
             use_container: false
             runs_on: '["self-hosted","linux","qcs"]'
+            self_hosted_owner: rcore-os
             command: cargo xtask arceos test qemu --arch riscv64
             cache_key: ""
-            container_image: ""
-            apk_region: us
-            required_repository_owner: rcore-os
+            container_image: base
+            limit_to_owner: ""
             main_pr_only: false
-          - name: Test arceos aarch64 qemu
+          - name: Test arceos aarch64 qemu (app + suites)
             use_container: false
             runs_on: '["self-hosted","linux","qcs"]'
-            command: cargo xtask arceos test qemu --arch aarch64
+            self_hosted_owner: rcore-os
+            command: |
+              echo "==> arceos aarch64 GICv2 SMP4 default app boot"
+              cargo xtask arceos qemu --arch aarch64 --smp 4 \
+                --qemu-config os/arceos/configs/qemu/qemu-aarch64-gicv2-boot.toml
+              echo "==> arceos aarch64 test suites (Rust GICv2 SMP4 IPI + C GICv3 SMP4)"
+              cargo xtask arceos test qemu --arch aarch64
             cache_key: ""
-            container_image: ""
-            apk_region: us
-            required_repository_owner: rcore-os
+            container_image: base
+            limit_to_owner: ""
             main_pr_only: false
           - name: Test arceos loongarch64 qemu
             use_container: false
             runs_on: '["self-hosted","linux","qcs"]'
+            self_hosted_owner: rcore-os
             command: cargo xtask arceos test qemu --arch loongarch64
             cache_key: ""
-            container_image: ""
-            apk_region: us
-            required_repository_owner: rcore-os
+            container_image: base
+            limit_to_owner: ""
             main_pr_only: false
+          # Visual regression matrix: re-enable per arch once at least one
+          # scenario has that arch listed in its `arches` file and a verified
+          # golden is committed. Until then run_all.sh exits 1 (no scenarios
+          # ran), so the matrix would be uniformly red. The DRM card0 PR (#506)
+          # is the current prerequisite for weston_shm_baseline / xwayland_xeyes.
+          # - name: Visual starry riscv64
+          #   use_container: true
+          #   runs_on: '["ubuntu-latest"]'
+          #   command: |
+          #     apt-get update && apt-get install -y --no-install-recommends e2tools
+          #     cargo xtask starry build --arch riscv64
+          #     cargo xtask starry rootfs --arch riscv64
+          #     python3 scripts/visual-test/prepare_rootfs_extras.py --arch riscv64 --scenario xwayland_xeyes
+          #     bash scripts/visual-test/run_all.sh --arch riscv64
+          #   cache_key: test-visual-riscv64
+          #   container_image: base
+          #   apk_region: us
+          #   limit_to_owner: ""
+          #   main_pr_only: false
+          # - name: Visual starry aarch64
+          #   use_container: true
+          #   runs_on: '["ubuntu-latest"]'
+          #   command: |
+          #     apt-get update && apt-get install -y --no-install-recommends e2tools
+          #     cargo xtask starry build --arch aarch64
+          #     cargo xtask starry rootfs --arch aarch64
+          #     python3 scripts/visual-test/prepare_rootfs_extras.py --arch aarch64 --scenario xwayland_xeyes
+          #     bash scripts/visual-test/run_all.sh --arch aarch64
+          #   cache_key: test-visual-aarch64
+          #   container_image: base
+          #   apk_region: us
+          #   limit_to_owner: ""
+          #   main_pr_only: false
+          # - name: Visual starry x86_64
+          #   use_container: true
+          #   runs_on: '["ubuntu-latest"]'
+          #   command: |
+          #     apt-get update && apt-get install -y --no-install-recommends e2tools
+          #     cargo xtask starry build --arch x86_64
+          #     cargo xtask starry rootfs --arch x86_64
+          #     python3 scripts/visual-test/prepare_rootfs_extras.py --arch x86_64 --scenario xwayland_xeyes
+          #     bash scripts/visual-test/run_all.sh --arch x86_64
+          #   cache_key: test-visual-x86_64
+          #   container_image: base
+          #   apk_region: us
+          #   limit_to_owner: ""
+          #   main_pr_only: false
           # Stress tests: uncomment to enable (runs only on PRs targeting main).
           # - name: Stress starry aarch64
           #   use_container: true
           #   runs_on: '["ubuntu-latest"]'
-          #   command: cargo xtask starry test qemu --arch aarch64 --test-group stress
+          #   command: cargo xtask starry app qemu -t stress/git --arch aarch64
           #   cache_key: test-starry-stress-aarch64
           #   container_image: base
           #   apk_region: us
-          #   required_repository_owner: ""
+          #   limit_to_owner: ""
           #   main_pr_only: true
           # - name: Stress starry riscv64
           #   use_container: true
           #   runs_on: '["ubuntu-latest"]'
-          #   command: cargo xtask starry test qemu --arch riscv64 --test-group stress
+          #   command: cargo xtask starry app qemu -t stress/git --arch riscv64
           #   cache_key: test-starry-stress-riscv64
           #   container_image: base
           #   apk_region: us
-          #   required_repository_owner: ""
+          #   limit_to_owner: ""
           #   main_pr_only: true
           # - name: Stress starry loongarch64
           #   use_container: true
           #   runs_on: '["ubuntu-latest"]'
-          #   command: cargo xtask starry test qemu --arch loongarch64 --test-group stress
+          #   command: cargo xtask starry app qemu -t stress/git --arch loongarch64
           #   cache_key: test-starry-stress-loongarch64
           #   container_image: base
           #   apk_region: us
-          #   required_repository_owner: ""
+          #   limit_to_owner: ""
           #   main_pr_only: true
           # - name: Stress starry x86_64
           #   use_container: true
           #   runs_on: '["ubuntu-latest"]'
-          #   command: cargo xtask starry test qemu --arch x86_64 --test-group stress
+          #   command: cargo xtask starry app qemu -t stress/git --arch x86_64
           #   cache_key: test-starry-stress-x86_64
           #   container_image: base
           #   apk_region: us
-          #   required_repository_owner: ""
+          #   limit_to_owner: ""
           #   main_pr_only: true
-          - name: Test axvisor self-hosted x86_64
+          - name: Test axvisor self-hosted x86_64 (svm smoke + ACPI)
+            use_container: false
+            runs_on: '["self-hosted","linux","amd","kvm"]'
+            require_kvm: true
+            timeout_minutes: 30
+            command: |
+              echo "==> axvisor x86_64 svm smoke"
+              cargo xtask axvisor test qemu --arch x86_64 --test-case smoke-svm
+              echo "==> pull qemu-x86_64 image"
+              cargo xtask image pull qemu-x86_64 --output-dir tmp/axbuild/images
+              echo "==> axvisor x86_64 svm direct ACPI boot"
+              cargo xtask axvisor test qemu --arch x86_64 --test-case direct-acpi-svm
+              echo "==> axvisor x86_64 svm nested OVMF ACPI boot"
+              cargo xtask axvisor test qemu --arch x86_64 --test-case ovmf-acpi-svm
+            cache_key: ""
+            container_image: ""
+            limit_to_owner: rcore-os
+            main_pr_only: false
+          - name: Test axvisor self-hosted x86_64(vmx)
             use_container: false
             runs_on: '["self-hosted","linux","intel","kvm"]'
-            command: cargo xtask axvisor test qemu --arch x86_64
+            require_kvm: true
+            command: cargo xtask axvisor test qemu --arch x86_64 --test-case smoke-vmx
             cache_key: ""
             container_image: ""
-            required_repository_owner: rcore-os
+            limit_to_owner: rcore-os
             main_pr_only: false
-          - name: Test axvisor x86_64 svm hosted
+          - name: Test axloader HTTP smoke
             use_container: false
-            runs_on: '["ubuntu-latest"]'
+            runs_on: '["self-hosted","linux","intel","kvm"]'
+            require_kvm: true
+            timeout_minutes: 25
             command: |
-              cpu_vendor="$(awk -F ': *' '/^vendor_id/ { print $2; exit }' /proc/cpuinfo)"
-              if [ "$cpu_vendor" = "GenuineIntel" ]; then
-                echo "::notice::Skipping axvisor x86_64 SVM hosted test on Intel CPU; SVM requires an AMD CPU."
-                {
-                  echo "## Axvisor SVM hosted test skipped"
-                  echo ""
-                  echo "Runner CPU vendor is \`GenuineIntel\`; AMD SVM tests require an AMD CPU."
-                } >> "$GITHUB_STEP_SUMMARY"
-                exit 0
-              fi
-
-              sudo apt-get update
-              sudo apt-get install -y libudev-dev pkg-config qemu-system-x86
-              sudo usermod -aG kvm $USER
-              sg kvm -c "cargo xtask axvisor test qemu --arch x86_64 --test-group svm --test-case smoke"
+              rustup target add x86_64-unknown-uefi
+              cargo xtask axloader test qemu --target x86_64-unknown-uefi
             cache_key: ""
             container_image: ""
-            required_repository_owner: ""
+            limit_to_owner: rcore-os
+            main_pr_only: false
+          - name: Test axvisor x86_64 ACPI direct and OVMF boot (vmx)
+            use_container: false
+            runs_on: '["self-hosted","linux","intel","kvm"]'
+            require_kvm: true
+            timeout_minutes: 45
+            command: |
+              cargo xtask image pull qemu-x86_64 --output-dir tmp/axbuild/images
+              cargo xtask axvisor test qemu --arch x86_64 --test-case direct-acpi-vmx
+              cargo xtask axvisor test qemu --arch x86_64 --test-case mp-fallback-vmx
+              cargo xtask axvisor test qemu --arch x86_64 --test-case ovmf-acpi-vmx
+            cache_key: ""
+            container_image: ""
+            limit_to_owner: rcore-os
             main_pr_only: false
           - name: Test axvisor self-hosted board orangepi-5-plus-linux
             use_container: false
@@ -486,7 +745,47 @@ jobs:
             command: cargo xtask axvisor test board --board orangepi-5-plus-linux
             cache_key: ""
             container_image: ""
-            required_repository_owner: rcore-os
+            limit_to_owner: rcore-os
+            main_pr_only: false
+          - name: Test axvisor self-hosted board orangepi-5-plus-starry
+            use_container: false
+            runs_on: '["self-hosted","linux","board"]'
+            command: cargo xtask axvisor test board --board orangepi-5-plus-starry
+            cache_key: ""
+            container_image: ""
+            limit_to_owner: rcore-os
+            main_pr_only: false
+          - name: Test axvisor self-hosted board roc-rk3568-pc-linux
+            use_container: false
+            runs_on: '["self-hosted","linux","board"]'
+            command: cargo xtask axvisor test board --board roc-rk3568-pc-linux
+            cache_key: ""
+            container_image: ""
+            limit_to_owner: rcore-os
+            main_pr_only: false
+          - name: Test axvisor self-hosted board phytiumpi-linux
+            use_container: false
+            runs_on: '["self-hosted","linux","board"]'
+            command: cargo xtask axvisor test board --board phytiumpi-linux
+            cache_key: ""
+            container_image: ""
+            limit_to_owner: rcore-os
+            main_pr_only: false
+          - name: Test axvisor self-hosted board asus-nuc15crh-linux
+            use_container: false
+            runs_on: '["self-hosted","linux","board"]'
+            timeout_minutes: 20
+            command: |
+              mkdir -p tmp
+              cargo xtask image pull qemu-x86_64 --output-dir tmp
+              cargo xtask image pull initramfs-x86_64-busybox.cpio.gz --output-dir tmp
+              gzip -dc \
+                tmp/initramfs-x86_64-busybox.cpio.gz/initramfs-x86_64-busybox.cpio.gz \
+                > tmp/initramfs-x86_64-busybox.cpio
+              cargo xtask axvisor test board --board asus-nuc15crh-linux
+            cache_key: ""
+            container_image: ""
+            limit_to_owner: rcore-os
             main_pr_only: false
           - name: Test starry self-hosted board orangepi-5-plus
             use_container: false
@@ -494,12 +793,84 @@ jobs:
             command: cargo xtask starry test board --board orangepi-5-plus
             cache_key: ""
             container_image: ""
-            required_repository_owner: rcore-os
+            limit_to_owner: rcore-os
+            main_pr_only: false
+          - name: Test OrangePi 5 Plus robot native StarryOS
+            use_container: false
+            runs_on: '["self-hosted","linux","board"]'
+            timeout_minutes: 90
+            command: cargo xtask starry test board --board orangepi-5-plus-robot
+            cache_key: ""
+            container_image: ""
+            limit_to_owner: rcore-os
+            main_pr_only: false
+          - name: Test OrangePi 5 Plus robot AxVisor StarryOS guest
+            use_container: false
+            runs_on: '["self-hosted","linux","board"]'
+            timeout_minutes: 90
+            command: cargo xtask axvisor test board --board orangepi-5-plus-robot-starry
+            cache_key: ""
+            container_image: ""
+            limit_to_owner: rcore-os
+            main_pr_only: false
+          - name: Test OrangePi 5 Plus robot AxVisor Linux guest
+            use_container: false
+            runs_on: '["self-hosted","linux","board"]'
+            timeout_minutes: 90
+            command: cargo xtask axvisor test board --board orangepi-5-plus-robot-linux
+            cache_key: ""
+            container_image: ""
+            limit_to_owner: rcore-os
+            main_pr_only: false
+          # - name: Test starry self-hosted board rock-4d
+          #   use_container: false
+          #   runs_on: '["self-hosted","linux","board"]'
+          #   command: cargo xtask starry test board --board rock-4d
+          #   cache_key: ""
+          #   container_image: ""
+          #   limit_to_owner: rcore-os
+          #   main_pr_only: false
+          - name: Test starry self-hosted board aka-00-sg2002
+            use_container: false
+            runs_on: '["self-hosted","linux","board"]'
+            command: cargo xtask starry test board --board aka-00-sg2002
+            cache_key: ""
+            container_image: ""
+            limit_to_owner: rcore-os
+            main_pr_only: false
+          - name: Test starry self-hosted board visionfive2
+            use_container: false
+            runs_on: '["self-hosted","linux","board"]'
+            command: cargo xtask starry test board --board visionfive2
+            cache_key: ""
+            container_image: ""
+            limit_to_owner: rcore-os
+            main_pr_only: false
+          - name: Test starry self-hosted board jl-lsgd2k10
+            use_container: false
+            runs_on: '["self-hosted","linux","board"]'
+            command: cargo xtask starry test board --board jl-lsgd2k10
+            cache_key: ""
+            container_image: ""
+            limit_to_owner: rcore-os
             main_pr_only: false
     uses: ./.github/workflows/reusable-command.yml
     with:
-      runs_on: ${{ matrix.runs_on }}
-      use_container: ${{ matrix.use_container }}
+      runs_on: >-
+        ${{
+          matrix.self_hosted_owner != ''
+          && github.repository_owner != matrix.self_hosted_owner
+          && '["ubuntu-latest"]'
+          || matrix.runs_on
+        }}
+      use_container: >-
+        ${{
+          matrix.use_container
+          || (
+            matrix.self_hosted_owner != ''
+            && github.repository_owner != matrix.self_hosted_owner
+          )
+        }}
       command: ${{ matrix.command }}
       cache_key: ${{ matrix.cache_key }}
       container_image: >-
@@ -511,9 +882,32 @@ jobs:
           || matrix.container_image
         }}
       apk_region: ${{ matrix.apk_region || 'china' }}
-      required_repository_owner: ${{ matrix.required_repository_owner }}
+      limit_to_owner: ${{ matrix.limit_to_owner }}
       main_pr_only: ${{ matrix.main_pr_only }}
-      fetch_depth: ${{ matrix.fetch_depth == 'full' && '0' || '1' }}
+      fetch_depth: >-
+        ${{
+          contains(matrix.runs_on, 'self-hosted')
+          && !(
+            matrix.self_hosted_owner != ''
+            && github.repository_owner != matrix.self_hosted_owner
+          )
+          && matrix.fetch_depth == 'full'
+          && '2'
+          || (matrix.fetch_depth == 'full' && '0' || '1')
+        }}
+      timeout_minutes: ${{ matrix.timeout_minutes || 360 }}
+      require_kvm: ${{ matrix.require_kvm || false }}
+      download_xtask_bin_artifact: >-
+        ${{
+          matrix.download_xtask_bin_artifact
+          || (
+            matrix.self_hosted_owner != ''
+            && github.repository_owner != matrix.self_hosted_owner
+          )
+        }}
+      xtask_bin_artifact_name: tg-xtask-bin
+    secrets:
+      CLAW_API_KEY: ${{ secrets.CLAW_API_KEY }}
 
   publish_base_container:
     name: Publish base container image

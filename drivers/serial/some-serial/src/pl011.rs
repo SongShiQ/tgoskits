@@ -1,14 +1,16 @@
-use core::{num::NonZeroU32, ptr::NonNull};
+use core::ptr::NonNull;
 
 use rdif_serial::{
-    BSerial, InterfaceRaw, SerialDyn, SetBackError, TIrqHandler, TSender, TransBytesError,
-    TransferError,
+    Config, ConfigError, DataBits, IrqRxSink, Parity, RxErrorFlags, RxFlag, RxSample,
+    SerialEventSet, SerialIrqEvent, SplitUart, StopBits, UartInfo, UartIrq, UartParts, UartPort,
 };
-use tock_registers::{interfaces::*, register_bitfields, register_structs, registers::*};
+use tock_registers::{
+    LocalRegisterCopy, interfaces::*, register_bitfields, register_structs, registers::*,
+};
 
-use crate::{
-    Config, ConfigError, DataBits, InterruptMask, Parity, RawReciever, RawSender, StopBits,
-};
+use crate::{PollingUart, SerialDirection, SerialEvent, TransBytesError, TransferError};
+
+const OPEN_BUSY_POLL_BUDGET: usize = 1 << 20;
 
 register_bitfields! [
     u32,
@@ -144,9 +146,7 @@ unsafe impl Sync for Pl011Registers {}
 pub struct Pl011 {
     base: Reg,
     clock_freq: u32,
-    tx: Option<Pl011Sender>,
-    rx: Option<Pl011Reciever>,
-    irq: Option<Pl011IrqHandler>,
+    saved_rx_status: Pl011RxStatus,
 }
 
 impl Pl011 {
@@ -166,20 +166,33 @@ impl Pl011 {
         Self {
             base,
             clock_freq,
-            tx: Some(Pl011Sender { base }),
-            rx: Some(Pl011Reciever { base }),
-            irq: Some(Pl011IrqHandler { base }),
+            saved_rx_status: Pl011RxStatus::empty(),
         }
-    }
-
-    pub fn new_boxed(base: NonNull<u8>, clock_freq: u32) -> BSerial {
-        let mut serial = Self::new(base, clock_freq);
-        serial.open();
-        SerialDyn::new_boxed(serial)
     }
 
     fn registers(&self) -> &Pl011Registers {
         unsafe { &*self.base.0.as_ptr() }
+    }
+
+    fn wait_until_idle(&self) -> bool {
+        for _ in 0..OPEN_BUSY_POLL_BUDGET {
+            if !self.registers().uartfr.is_set(UARTFR::BUSY) {
+                return true;
+            }
+            core::hint::spin_loop();
+        }
+        false
+    }
+
+    fn current_baudrate(&self) -> u32 {
+        let ibrd = self.registers().uartibrd.read(UARTIBRD::BAUD_DIVINT);
+        let fbrd = self.registers().uartfbrd.read(UARTFBRD::BAUD_DIVFRAC);
+        let divisor = ibrd * 64 + fbrd;
+        if divisor == 0 {
+            0
+        } else {
+            self.clock_freq * 64 / (16 * divisor)
+        }
     }
 
     /// 自动检测或确定合理的时钟频率
@@ -287,14 +300,20 @@ impl Pl011 {
         Ok(())
     }
 
-    /// 初始化 PL011 UART
-    fn init(&self) {
+    /// Initializes the PL011 UART.
+    ///
+    /// Returns [`ConfigError::Timeout`] if an in-flight transfer does not
+    /// finish within the fixed early-boot polling budget.
+    pub fn open(&mut self) -> Result<(), ConfigError> {
+        let original_uartcr = self.registers().uartcr.get();
+
         // 禁用 UART
         self.registers().uartcr.modify(UARTCR::UARTEN::CLEAR);
 
         // 等待当前传输完成
-        while self.registers().uartfr.is_set(UARTFR::BUSY) {
-            core::hint::spin_loop();
+        if !self.wait_until_idle() {
+            self.registers().uartcr.set(original_uartcr);
+            return Err(ConfigError::Timeout);
         }
 
         // 清除发送 FIFO
@@ -318,93 +337,94 @@ impl Pl011 {
         self.registers()
             .uartcr
             .modify(UARTCR::UARTEN::SET + UARTCR::TXE::SET + UARTCR::RXE::SET);
+        Ok(())
     }
 
-    pub fn task_tx(&mut self) -> Option<crate::Sender> {
-        self.tx.take().map(crate::Sender::Pl011Sender)
+    pub fn set_irq_mask(&mut self, events: SerialEventSet) {
+        self.registers().uartimsc.set(imsc_for_events(events));
     }
 
-    pub fn task_rx(&mut self) -> Option<crate::Reciever> {
-        self.rx.take().map(crate::Reciever::Pl011Reciever)
-    }
-}
+    pub fn get_irq_mask(&self) -> SerialEventSet {
+        let imsc = self.registers().uartimsc.extract();
+        let mut events = SerialEventSet::empty();
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Reg(NonNull<Pl011Registers>);
-
-unsafe impl Send for Reg {}
-
-impl Reg {
-    fn registers(&self) -> &Pl011Registers {
-        unsafe { self.0.as_ref() }
-    }
-}
-
-pub struct Pl011Sender {
-    base: Reg,
-}
-
-impl TSender for Pl011Sender {
-    fn write_byte(&mut self, byte: u8) -> bool {
-        RawSender::write_byte(self, byte)
-    }
-}
-
-impl RawSender for Pl011Sender {
-    fn write_byte(&mut self, byte: u8) -> bool {
-        if self.base.registers().uartfr.is_set(UARTFR::TXFF) {
-            return false;
+        if imsc.is_set(UARTIS::RX)
+            || imsc.is_set(UARTIS::RT)
+            || imsc.is_set(UARTIS::FE)
+            || imsc.is_set(UARTIS::PE)
+            || imsc.is_set(UARTIS::BE)
+            || imsc.is_set(UARTIS::OE)
+        {
+            events |= SerialEventSet::RX;
+        }
+        if imsc.is_set(UARTIS::TX) {
+            events |= SerialEventSet::TX_SPACE;
         }
 
-        self.base.registers().uartdr.set(byte as _);
-
-        true
-    }
-}
-
-pub struct Pl011Reciever {
-    base: Reg,
-}
-
-impl RawReciever for Pl011Reciever {
-    fn read_byte(&mut self) -> Option<Result<u8, TransferError>> {
-        if self.base.registers().uartfr.is_set(UARTFR::RXFE) {
-            return None;
-        }
-
-        let dr = self.base.registers().uartdr.extract();
-        let data = dr.read(UARTDR::DATA) as u8;
-
-        if dr.is_set(UARTDR::FE) {
-            return Some(Err(TransferError::Framing));
-        }
-
-        if dr.is_set(UARTDR::PE) {
-            return Some(Err(TransferError::Parity));
-        }
-
-        if dr.is_set(UARTDR::OE) {
-            return Some(Err(TransferError::Overrun(data)));
-        }
-
-        if dr.is_set(UARTDR::BE) {
-            return Some(Err(TransferError::Break));
-        }
-
-        Some(Ok(data))
+        events
     }
 
-    fn read_bytes(&mut self, bytes: &mut [u8]) -> Result<usize, TransBytesError> {
+    pub fn pending(&mut self, direction: SerialDirection) -> bool {
+        match direction {
+            SerialDirection::Input => !self.registers().uartfr.is_set(UARTFR::RXFE),
+            SerialDirection::Output => !self.registers().uartfr.is_set(UARTFR::TXFF),
+        }
+    }
+
+    pub fn poll_status(&mut self) -> SerialEvent {
+        let mut event = SerialEvent::empty();
+        let fr = self.registers().uartfr.extract();
+        if !fr.is_set(UARTFR::RXFE) {
+            event |= SerialEvent::RX_READY;
+        }
+        if !fr.is_set(UARTFR::TXFF) {
+            event |= SerialEvent::TX_READY;
+        }
+
+        let status =
+            self.saved_rx_status | Pl011RxStatus::from_rsr(self.registers().uartrsr_ecr.extract());
+        if status.intersects(Pl011RxStatus::FRAMING | Pl011RxStatus::PARITY | Pl011RxStatus::BREAK)
+        {
+            event |= SerialEvent::RX_ERROR;
+        }
+        if status.contains(Pl011RxStatus::OVERRUN) {
+            event |= SerialEvent::RX_ERROR | SerialEvent::OVERRUN;
+        }
+
+        event
+    }
+
+    pub fn try_write(&mut self, bytes: &[u8]) -> usize {
+        let mut written = 0;
+        for &byte in bytes {
+            let status = self.poll_status();
+            if !status.tx_ready() {
+                break;
+            }
+            self.write_byte(byte);
+            written += 1;
+        }
+        written
+    }
+
+    pub fn try_read(&mut self, bytes: &mut [u8]) -> Result<usize, TransBytesError> {
         let mut count = 0;
-        let mut overrun_data = None;
         for byte in bytes.iter_mut() {
-            match self.read_byte() {
+            let status = self.poll_status();
+            if !status.rx_ready() && !status.rx_error() {
+                break;
+            }
+            match self.read_byte(status) {
                 Some(Ok(b)) => {
                     *byte = b;
                 }
                 Some(Err(TransferError::Overrun(b))) => {
-                    overrun_data = Some(b);
                     *byte = b;
+                    count += 1;
+                    return Err(TransBytesError {
+                        bytes_transferred: count,
+                        kind: TransferError::Overrun(b),
+                    });
                 }
                 Some(Err(e)) => {
                     return Err(TransBytesError {
@@ -412,57 +432,264 @@ impl RawReciever for Pl011Reciever {
                         kind: e,
                     });
                 }
-                None => {
-                    if let Some(data) = overrun_data {
-                        count = count.saturating_sub(1);
-
-                        return Err(TransBytesError {
-                            bytes_transferred: count,
-                            kind: TransferError::Overrun(data),
-                        });
-                    }
-                    break;
-                }
+                None => break,
             }
             count += 1;
         }
         Ok(count)
     }
-}
 
-pub struct Pl011IrqHandler {
-    base: Reg,
-}
+    pub fn write_byte(&mut self, byte: u8) {
+        self.registers().uartdr.set(byte as _);
+    }
 
-unsafe impl Sync for Pl011IrqHandler {}
-
-impl TIrqHandler for Pl011IrqHandler {
-    fn clean_interrupt_status(&self) -> InterruptMask {
-        let mis = self.base.registers().uartmis.extract();
-        let mut mask = InterruptMask::empty();
-
-        if mis.is_set(UARTIS::RX) {
-            mask |= InterruptMask::RX_AVAILABLE;
-        }
-        if mis.is_set(UARTIS::TX) {
-            mask |= InterruptMask::TX_EMPTY;
+    pub fn read_byte(&mut self, status: SerialEvent) -> Option<Result<u8, TransferError>> {
+        if !status.rx_ready() && !status.rx_error() {
+            return None;
         }
 
-        self.base.registers().uarticr.set(mis.get());
+        let sample = self.read_rx()?;
+        if sample.overrun {
+            return Some(Err(TransferError::Overrun(sample.byte.unwrap_or(0))));
+        }
+        match sample.flag {
+            RxFlag::Normal => sample.byte.map(Ok),
+            RxFlag::Break => Some(Err(TransferError::Break)),
+            RxFlag::Parity => Some(Err(TransferError::Parity)),
+            RxFlag::Framing => Some(Err(TransferError::Framing)),
+        }
+    }
 
-        mask
+    pub fn read_rx(&mut self) -> Option<RxSample> {
+        let base = self.base;
+        // SAFETY: `base` is the mapped PL011 register block owned by this
+        // endpoint and remains valid for the endpoint lifetime.
+        let registers = unsafe { &*base.0.as_ptr() };
+        read_rx_sample(registers, &mut self.saved_rx_status)
     }
 }
 
-impl InterfaceRaw for Pl011 {
-    type IrqHandler = Pl011IrqHandler;
+fn read_rx_sample(
+    registers: &Pl011Registers,
+    saved_status: &mut Pl011RxStatus,
+) -> Option<RxSample> {
+    if registers.uartfr.is_set(UARTFR::RXFE) {
+        *saved_status |= Pl011RxStatus::from_rsr(registers.uartrsr_ecr.extract());
+        return saved_status.take_status_sample();
+    }
 
-    type Sender = crate::Sender;
+    let dr = registers.uartdr.extract();
+    let data = dr.read(UARTDR::DATA) as u8;
+    let status = Pl011RxStatus::from_data(dr);
+    if !status.is_empty() {
+        saved_status.remove(status);
+    }
 
-    type Reciever = crate::Reciever;
+    Some(RxSample {
+        byte: Some(data),
+        flag: status.flag(),
+        overrun: status.contains(Pl011RxStatus::OVERRUN),
+    })
+}
 
-    fn name(&self) -> &str {
-        "PL011 UART"
+fn rx_errors_from_sample(sample: RxSample) -> RxErrorFlags {
+    let mut errors = match sample.flag {
+        RxFlag::Normal => RxErrorFlags::empty(),
+        RxFlag::Break => RxErrorFlags::BREAK,
+        RxFlag::Parity => RxErrorFlags::PARITY,
+        RxFlag::Framing => RxErrorFlags::FRAMING,
+    };
+    if sample.overrun {
+        errors |= RxErrorFlags::OVERRUN;
+    }
+    errors
+}
+
+bitflags::bitflags! {
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct Pl011RxStatus: u32 {
+        const FRAMING = 1 << 0;
+        const PARITY  = 1 << 1;
+        const BREAK   = 1 << 2;
+        const OVERRUN = 1 << 3;
+    }
+}
+
+impl Pl011RxStatus {
+    fn to_irq_errors(self) -> RxErrorFlags {
+        let mut errors = RxErrorFlags::empty();
+        if self.contains(Self::BREAK) {
+            errors |= RxErrorFlags::BREAK;
+        }
+        if self.contains(Self::PARITY) {
+            errors |= RxErrorFlags::PARITY;
+        }
+        if self.contains(Self::FRAMING) {
+            errors |= RxErrorFlags::FRAMING;
+        }
+        if self.contains(Self::OVERRUN) {
+            errors |= RxErrorFlags::OVERRUN;
+        }
+        errors
+    }
+
+    fn from_data(dr: LocalRegisterCopy<u32, UARTDR::Register>) -> Self {
+        let mut status = Self::empty();
+        if dr.is_set(UARTDR::FE) {
+            status |= Self::FRAMING;
+        }
+        if dr.is_set(UARTDR::PE) {
+            status |= Self::PARITY;
+        }
+        if dr.is_set(UARTDR::BE) {
+            status |= Self::BREAK;
+        }
+        if dr.is_set(UARTDR::OE) {
+            status |= Self::OVERRUN;
+        }
+        status
+    }
+
+    fn from_irq_status(mis: LocalRegisterCopy<u32, UARTIS::Register>) -> Self {
+        let mut status = Self::empty();
+        if mis.is_set(UARTIS::FE) {
+            status |= Self::FRAMING;
+        }
+        if mis.is_set(UARTIS::PE) {
+            status |= Self::PARITY;
+        }
+        if mis.is_set(UARTIS::BE) {
+            status |= Self::BREAK;
+        }
+        if mis.is_set(UARTIS::OE) {
+            status |= Self::OVERRUN;
+        }
+        status
+    }
+
+    fn from_rsr(rsr: LocalRegisterCopy<u32, UARTRSR_ECR::Register>) -> Self {
+        let mut status = Self::empty();
+        if rsr.is_set(UARTRSR_ECR::FE) {
+            status |= Self::FRAMING;
+        }
+        if rsr.is_set(UARTRSR_ECR::PE) {
+            status |= Self::PARITY;
+        }
+        if rsr.is_set(UARTRSR_ECR::BE) {
+            status |= Self::BREAK;
+        }
+        if rsr.is_set(UARTRSR_ECR::OE) {
+            status |= Self::OVERRUN;
+        }
+        status
+    }
+
+    fn flag(self) -> RxFlag {
+        if self.contains(Self::BREAK) {
+            RxFlag::Break
+        } else if self.contains(Self::PARITY) {
+            RxFlag::Parity
+        } else if self.contains(Self::FRAMING) {
+            RxFlag::Framing
+        } else {
+            RxFlag::Normal
+        }
+    }
+
+    fn take_status_sample(&mut self) -> Option<RxSample> {
+        if self.is_empty() {
+            return None;
+        }
+
+        let status = *self;
+        *self = Self::empty();
+        Some(RxSample {
+            byte: None,
+            flag: status.flag(),
+            overrun: status.contains(Self::OVERRUN),
+        })
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Reg(NonNull<Pl011Registers>);
+
+unsafe impl Send for Reg {}
+unsafe impl Sync for Reg {}
+
+/// IRQ-only endpoint for a PL011 UART.
+pub struct Pl011Irq {
+    base: Reg,
+    saved_rx_status: Pl011RxStatus,
+}
+
+impl Pl011Irq {
+    fn registers(&self) -> &Pl011Registers {
+        // SAFETY: `base` points at the mapped PL011 register block. The IRQ
+        // endpoint intentionally exposes no FIFO data methods.
+        unsafe { &*self.base.0.as_ptr() }
+    }
+}
+
+impl UartIrq for Pl011Irq {
+    fn handle(&mut self, rx: &mut dyn IrqRxSink) -> Option<SerialIrqEvent> {
+        const RX_SAMPLE_BUDGET: usize = 256;
+
+        let mis = self.registers().uartmis.extract();
+        let active = mis.get();
+        if active == 0 {
+            return None;
+        }
+
+        let mut events = events_from_mis(mis);
+        if active & !0x7ff != 0 {
+            events |= SerialEventSet::FAULT;
+        }
+        let mut rx_errors = rx_errors_from_mis(mis);
+        if events.intersects(SerialEventSet::RX) {
+            let base = self.base;
+            // SAFETY: `base` is the mapped PL011 register block shared with
+            // the task endpoint under the runtime's same-CPU exclusion rule.
+            let registers = unsafe { &*base.0.as_ptr() };
+            for _ in 0..RX_SAMPLE_BUDGET {
+                let Some(sample) = read_rx_sample(registers, &mut self.saved_rx_status) else {
+                    break;
+                };
+                rx_errors |= rx_errors_from_sample(sample);
+                rx.push(sample);
+            }
+        }
+
+        let rearm = events & SerialEventSet::TX_SPACE;
+        if events.contains(SerialEventSet::FAULT) {
+            self.registers().uartimsc.set(0);
+        } else if !rearm.is_empty() {
+            let enabled = self.registers().uartimsc.get();
+            self.registers()
+                .uartimsc
+                .set(enabled & !imsc_for_events(rearm));
+        }
+        self.registers().uarticr.set(active);
+
+        Some(SerialIrqEvent {
+            events,
+            rx_errors,
+            rearm,
+        })
+    }
+}
+
+impl UartPort for Pl011 {
+    fn startup(&mut self, config: &Config) -> Result<(), ConfigError> {
+        self.open()?;
+        self.set_config(config)?;
+        self.mask_all();
+        Ok(())
+    }
+
+    fn shutdown(&mut self) {
+        self.registers().uartimsc.set(0);
+        self.registers().uartcr.modify(UARTCR::UARTEN::CLEAR);
     }
 
     fn set_config(&mut self, config: &Config) -> Result<(), ConfigError> {
@@ -470,7 +697,7 @@ impl InterfaceRaw for Pl011 {
 
         // 根据ARM文档的建议配置流程：
         // 1. 禁用UART
-        let original_enable = self.registers().uartcr.is_set(UARTCR::UARTEN); // 保存原始使能状态
+        let original_cr = self.registers().uartcr.extract(); // 保存原始使能状态
         self.registers().uartcr.modify(UARTCR::UARTEN::CLEAR); // 禁用UART
 
         // 2. 等待当前字符传输完成
@@ -499,175 +726,169 @@ impl InterfaceRaw for Pl011 {
         self.registers().uartlcr_h.modify(UARTLCR_H::FEN::SET);
 
         // 6. 恢复UART使能状态
-        if original_enable {
-            self.registers().uartcr.modify(UARTCR::UARTEN::SET); // 重新启用UART
+        if original_cr.is_set(UARTCR::UARTEN) {
+            self.registers().uartcr.modify(
+                UARTCR::UARTEN.val(original_cr.read(UARTCR::UARTEN))
+                    + UARTCR::TXE.val(original_cr.read(UARTCR::TXE))
+                    + UARTCR::RXE.val(original_cr.read(UARTCR::RXE)),
+            );
         }
 
         Ok(())
     }
 
-    fn baudrate(&self) -> u32 {
-        let ibrd = self.registers().uartibrd.read(UARTIBRD::BAUD_DIVINT);
-        let fbrd = self.registers().uartfbrd.read(UARTFBRD::BAUD_DIVFRAC);
-
-        // 反向计算波特率
-        // Baud rate = FUARTCLK / (16 * (IBRD + FBRD/64))
-        let divisor = ibrd * 64 + fbrd;
-        if divisor == 0 {
-            return 0;
-        }
-
-        self.clock_freq * 64 / (16 * divisor)
+    fn read_rx(&mut self) -> Option<RxSample> {
+        Pl011::read_rx(self)
     }
 
-    fn data_bits(&self) -> DataBits {
-        let wlen = self.registers().uartlcr_h.read(UARTLCR_H::WLEN);
-
-        match wlen {
-            0 => DataBits::Five,
-            1 => DataBits::Six,
-            2 => DataBits::Seven,
-            3 => DataBits::Eight,
-            _ => DataBits::Eight, // 默认值
+    fn discard_rx(&mut self) {
+        while !self.registers().uartfr.is_set(UARTFR::RXFE) {
+            let _ = self.registers().uartdr.get();
         }
+        self.saved_rx_status = Pl011RxStatus::empty();
+        self.registers().uartrsr_ecr.set(0);
+        self.registers()
+            .uarticr
+            .set(imsc_for_events(SerialEventSet::RX));
     }
 
-    fn stop_bits(&self) -> StopBits {
-        if self.registers().uartlcr_h.is_set(UARTLCR_H::STP2) {
-            StopBits::Two
-        } else {
-            StopBits::One
-        }
-    }
-
-    fn parity(&self) -> Parity {
-        if !self.registers().uartlcr_h.is_set(UARTLCR_H::PEN) {
-            Parity::None
-        } else if self.registers().uartlcr_h.is_set(UARTLCR_H::SPS) {
-            // Stick parity
-            if self.registers().uartlcr_h.is_set(UARTLCR_H::EPS) {
-                Parity::Space
-            } else {
-                Parity::Mark
+    fn write_tx(&mut self, bytes: &[u8]) -> usize {
+        let mut written = 0;
+        for &byte in bytes {
+            if self.registers().uartfr.is_set(UARTFR::TXFF) {
+                break;
             }
-        } else {
-            // Normal parity
-            if self.registers().uartlcr_h.is_set(UARTLCR_H::EPS) {
-                Parity::Even
-            } else {
-                Parity::Odd
-            }
+            self.registers().uartdr.set(byte as u32);
+            written += 1;
+        }
+        written
+    }
+
+    fn discard_tx(&mut self) -> bool {
+        false
+    }
+
+    fn tx_idle(&mut self) -> bool {
+        let fr = self.registers().uartfr.extract();
+        !fr.is_set(UARTFR::BUSY) && !fr.is_set(UARTFR::TXFF)
+    }
+
+    fn mask_all(&mut self) {
+        self.registers().uartimsc.set(0);
+    }
+
+    fn rearm(&mut self, sources: SerialEventSet) -> SerialEventSet {
+        let enabled = self.registers().uartimsc.get() | imsc_for_events(sources);
+        self.registers().uartimsc.set(enabled);
+
+        let fr = self.registers().uartfr.extract();
+        let rsr = self.registers().uartrsr_ecr.extract();
+        let mut ready = SerialEventSet::empty();
+        if sources.intersects(SerialEventSet::RX) && !fr.is_set(UARTFR::RXFE) {
+            ready |= SerialEventSet::RX_DATA;
+        }
+        if sources.contains(SerialEventSet::RX_STATUS) && !Pl011RxStatus::from_rsr(rsr).is_empty() {
+            ready |= SerialEventSet::RX_STATUS;
+        }
+        if sources.contains(SerialEventSet::TX_SPACE) && !fr.is_set(UARTFR::TXFF) {
+            ready |= SerialEventSet::TX_SPACE;
+        }
+        if !ready.is_empty() {
+            self.registers()
+                .uartimsc
+                .set(enabled & !imsc_for_events(ready));
+        }
+        ready
+    }
+}
+
+impl SplitUart for Pl011 {
+    type Port = Self;
+    type Irq = Pl011Irq;
+
+    fn runtime_info(&self) -> UartInfo {
+        UartInfo {
+            name: "PL011 UART",
+            register_base: self.base.0.as_ptr() as usize,
+            initial_baudrate: self.current_baudrate(),
         }
     }
 
-    fn open(&mut self) {
-        self.init()
-    }
-
-    fn close(&mut self) {
-        // 禁用 UART
-        self.registers().uartcr.modify(UARTCR::UARTEN::CLEAR);
-    }
-
-    fn clock_freq(&self) -> Option<NonZeroU32> {
-        self.clock_freq.try_into().ok()
-    }
-
-    fn enable_loopback(&mut self) {
-        self.registers().uartcr.modify(UARTCR::LBE::SET);
-    }
-
-    fn disable_loopback(&mut self) {
-        self.registers().uartcr.modify(UARTCR::LBE::CLEAR);
-    }
-
-    fn is_loopback_enabled(&self) -> bool {
-        self.registers().uartcr.is_set(UARTCR::LBE)
-    }
-
-    fn set_irq_mask(&mut self, mask: InterruptMask) {
-        let mut imsc = 0;
-        if mask.contains(InterruptMask::RX_AVAILABLE) {
-            imsc += UARTIS::RX::SET.value;
-        }
-        if mask.contains(InterruptMask::TX_EMPTY) {
-            imsc += UARTIS::TX::SET.value;
-        }
-
-        self.registers().uartimsc.set(imsc);
-    }
-
-    fn get_irq_mask(&self) -> InterruptMask {
-        let imsc = self.registers().uartimsc.extract();
-        let mut mask = InterruptMask::empty();
-
-        if imsc.is_set(UARTIS::RX) {
-            mask |= InterruptMask::RX_AVAILABLE;
-        }
-        if imsc.is_set(UARTIS::TX) {
-            mask |= InterruptMask::TX_EMPTY;
-        }
-
-        mask
-    }
-
-    fn base_addr(&self) -> usize {
-        self.base.0.as_ptr() as usize
-    }
-
-    fn irq_handler(&mut self) -> Option<Self::IrqHandler> {
-        self.irq.take()
-    }
-
-    fn take_tx(&mut self) -> Option<Self::Sender> {
-        self.task_tx()
-    }
-
-    fn take_rx(&mut self) -> Option<Self::Reciever> {
-        self.task_rx()
-    }
-
-    fn set_tx(&mut self, tx: Self::Sender) -> Result<(), SetBackError> {
-        let tx = match tx {
-            crate::Sender::Pl011Sender(s) => s,
-            _ => {
-                return Err(SetBackError::new(
-                    self.base.0.as_ptr() as _,
-                    0, // 不匹配的发送器类型
-                ));
-            }
+    fn split(self) -> UartParts<Self::Port, Self::Irq> {
+        let irq = Pl011Irq {
+            base: self.base,
+            saved_rx_status: Pl011RxStatus::empty(),
         };
+        UartParts::new(self, irq)
+    }
+}
 
-        if self.base != tx.base {
-            return Err(SetBackError::new(
-                self.base.0.as_ptr() as _,
-                tx.base.0.as_ptr() as _,
-            ));
-        }
-
-        self.tx = Some(tx);
-        Ok(())
+impl PollingUart for Pl011 {
+    fn poll_status(&mut self) -> SerialEvent {
+        Pl011::poll_status(self)
     }
 
-    fn set_rx(&mut self, rx: Self::Reciever) -> Result<(), SetBackError> {
-        let rx = match rx {
-            crate::Reciever::Pl011Reciever(r) => r,
-            _ => {
-                return Err(SetBackError::new(
-                    self.base.0.as_ptr() as _,
-                    0, // 不匹配的接收器类型
-                ));
-            }
-        };
-        if self.base != rx.base {
-            return Err(SetBackError::new(
-                self.base.0.as_ptr() as _,
-                rx.base.0.as_ptr() as _,
-            ));
-        }
-        self.rx = Some(rx);
-        Ok(())
+    fn write_byte(&mut self, byte: u8) {
+        Pl011::write_byte(self, byte);
     }
+
+    fn read_byte(&mut self, status: SerialEvent) -> Option<Result<u8, TransferError>> {
+        Pl011::read_byte(self, status)
+    }
+}
+
+fn events_from_mis(mis: LocalRegisterCopy<u32, UARTIS::Register>) -> SerialEventSet {
+    let mut events = SerialEventSet::empty();
+    if mis.is_set(UARTIS::RX) {
+        events |= SerialEventSet::RX_DATA;
+    }
+    if mis.is_set(UARTIS::RT) {
+        events |= SerialEventSet::RX_TIMEOUT;
+    }
+    if mis.is_set(UARTIS::FE)
+        || mis.is_set(UARTIS::PE)
+        || mis.is_set(UARTIS::BE)
+        || mis.is_set(UARTIS::OE)
+    {
+        events |= SerialEventSet::RX_STATUS;
+    }
+    if mis.is_set(UARTIS::TX) {
+        events |= SerialEventSet::TX_SPACE;
+    }
+    if mis.is_set(UARTIS::CTSM)
+        || mis.is_set(UARTIS::DSRM)
+        || mis.is_set(UARTIS::DCDM)
+        || mis.is_set(UARTIS::RIM)
+    {
+        events |= SerialEventSet::MODEM_STATUS;
+    }
+    events
+}
+
+fn rx_errors_from_mis(mis: LocalRegisterCopy<u32, UARTIS::Register>) -> RxErrorFlags {
+    Pl011RxStatus::from_irq_status(mis).to_irq_errors()
+}
+
+fn imsc_for_events(events: SerialEventSet) -> u32 {
+    let mut imsc = 0;
+    if events.intersects(SerialEventSet::RX) {
+        imsc |= UARTIS::RX::SET.value
+            | UARTIS::RT::SET.value
+            | UARTIS::FE::SET.value
+            | UARTIS::PE::SET.value
+            | UARTIS::BE::SET.value
+            | UARTIS::OE::SET.value;
+    }
+    if events.contains(SerialEventSet::TX_SPACE) {
+        imsc |= UARTIS::TX::SET.value;
+    }
+    if events.contains(SerialEventSet::MODEM_STATUS) {
+        imsc |= UARTIS::RIM::SET.value
+            | UARTIS::CTSM::SET.value
+            | UARTIS::DCDM::SET.value
+            | UARTIS::DSRM::SET.value;
+    }
+    imsc
 }
 
 // 额外的便利方法，用于 FIFO 和流控制
@@ -713,3 +934,324 @@ impl Pl011 {
 }
 
 // ModemStatus 现在在 lib.rs 中定义，这里只是导出
+
+#[cfg(test)]
+mod tests {
+    use core::ptr::NonNull;
+    use std::{boxed::Box, vec::Vec};
+
+    use super::*;
+
+    // This adapter keeps the regression runnable against both the old `()`
+    // API and the new `Result` API, so the same test exposes the old hang.
+    trait AssertOpenTimeout {
+        fn assert_timeout(self);
+    }
+
+    impl AssertOpenTimeout for () {
+        fn assert_timeout(self) {
+            panic!("unbounded PL011 open returned without reporting a timeout");
+        }
+    }
+
+    impl AssertOpenTimeout for Result<(), ConfigError> {
+        fn assert_timeout(self) {
+            assert_eq!(self, Err(ConfigError::Timeout));
+        }
+    }
+
+    #[derive(Default)]
+    struct CollectRx(Vec<RxSample>);
+
+    impl IrqRxSink for CollectRx {
+        fn push(&mut self, sample: RxSample) {
+            self.0.push(sample);
+        }
+    }
+
+    fn handle_irq(irq: &mut impl UartIrq) -> (Option<SerialIrqEvent>, Vec<RxSample>) {
+        let mut rx = CollectRx::default();
+        let event = irq.handle(&mut rx);
+        (event, rx.0)
+    }
+
+    fn pl011_with_registers() -> (Box<Pl011Registers>, Pl011) {
+        let mut regs = Box::new(unsafe { core::mem::zeroed::<Pl011Registers>() });
+        let ptr = NonNull::from(regs.as_mut()).cast::<u8>();
+        let uart = Pl011::new(ptr, 24_000_000);
+        (regs, uart)
+    }
+
+    fn pl011_with_overrun_data() -> (Box<Pl011Registers>, Pl011) {
+        let (regs, uart) = pl011_with_registers();
+        regs.uartdr
+            .set((UARTDR::DATA.val(0xab) + UARTDR::OE::SET).into());
+        (regs, uart)
+    }
+
+    fn write_test_reg(regs: &mut Pl011Registers, offset: usize, value: u32) {
+        unsafe {
+            (regs as *mut Pl011Registers)
+                .cast::<u32>()
+                .add(offset / core::mem::size_of::<u32>())
+                .write_volatile(value);
+        }
+    }
+
+    fn read_test_reg(regs: &Pl011Registers, offset: usize) -> u32 {
+        unsafe {
+            (regs as *const Pl011Registers)
+                .cast::<u32>()
+                .add(offset / core::mem::size_of::<u32>())
+                .read_volatile()
+        }
+    }
+
+    fn started_parts(uart: Pl011) -> UartParts<Pl011, Pl011Irq> {
+        let mut parts = uart.split();
+        parts.port.startup(&Config::new()).unwrap();
+        parts
+    }
+
+    #[test]
+    fn early_console_open_has_a_bounded_busy_failure() {
+        let (mut regs, mut uart) = pl011_with_registers();
+        let original_uartcr = (UARTCR::UARTEN::SET
+            + UARTCR::SIREN::SET
+            + UARTCR::LBE::SET
+            + UARTCR::TXE::SET
+            + UARTCR::DTR::SET
+            + UARTCR::OUT2::SET
+            + UARTCR::CTSEN::SET)
+            .value;
+        write_test_reg(&mut regs, 0x018, UARTFR::BUSY::SET.value);
+        write_test_reg(&mut regs, 0x030, original_uartcr);
+
+        uart.open().assert_timeout();
+
+        assert_eq!(read_test_reg(&regs, 0x030), original_uartcr);
+    }
+
+    #[test]
+    fn raw_rx_reports_overrun_instead_of_swallowing_it() {
+        let (_regs, mut uart) = pl011_with_overrun_data();
+
+        let mut buf = [0];
+        let err = uart
+            .try_read(&mut buf)
+            .expect_err("overrun must be reported to the caller");
+
+        assert_eq!(buf[0], 0xab);
+        assert_eq!(err.bytes_transferred, 1);
+        assert_eq!(err.kind, TransferError::Overrun(0xab));
+    }
+
+    #[test]
+    fn raw_rx_sample_reports_overrun_instead_of_swallowing_it() {
+        let (mut regs, uart) = pl011_with_overrun_data();
+        let mut parts = uart.split();
+
+        write_test_reg(&mut regs, 0x040, UARTIS::OE::SET.value);
+        let (event, samples) = handle_irq(&mut parts.irq);
+        let event = event.unwrap();
+        assert!(event.events.contains(SerialEventSet::RX_STATUS));
+        assert!(event.rx_errors.contains(RxErrorFlags::OVERRUN));
+        assert_eq!(
+            samples.len(),
+            256,
+            "the hard IRQ must enforce its RX budget"
+        );
+        let sample = samples[0];
+        assert_eq!(sample.byte, Some(0xab));
+        assert_eq!(sample.flag, RxFlag::Normal);
+        assert!(sample.overrun);
+    }
+
+    #[test]
+    fn rx_irq_keeps_source_enabled_after_bounded_fifo_drain() {
+        let (mut regs, uart) = pl011_with_registers();
+        let mut irq = uart.split().irq;
+        let rx_mask = imsc_for_events(SerialEventSet::RX);
+        write_test_reg(&mut regs, 0x038, rx_mask);
+        write_test_reg(&mut regs, 0x040, UARTIS::RX::SET.value);
+        write_test_reg(&mut regs, 0x018, 0);
+        regs.uartdr.set(UARTDR::DATA.val(b'r' as u32).into());
+
+        let (event, samples) = handle_irq(&mut irq);
+        let event = event.unwrap();
+
+        assert!(event.events.contains(SerialEventSet::RX_DATA));
+        assert!(!event.rearm.intersects(SerialEventSet::RX));
+        assert_eq!(samples.len(), 256);
+        assert_eq!(read_test_reg(&regs, 0x038) & rx_mask, rx_mask);
+    }
+
+    #[test]
+    fn irq_status_without_rx_byte_is_preserved_after_irq_ack() {
+        let (mut regs, uart) = pl011_with_registers();
+        let mut parts = uart.split();
+
+        write_test_reg(
+            &mut regs,
+            0x040,
+            UARTIS::OE::SET.value | UARTIS::PE::SET.value,
+        );
+        write_test_reg(&mut regs, 0x018, UARTFR::RXFE::SET.value);
+
+        let event = handle_irq(&mut parts.irq).0.unwrap();
+        assert!(event.events.contains(SerialEventSet::RX_STATUS));
+        assert!(event.rx_errors.contains(RxErrorFlags::PARITY));
+        assert!(event.rx_errors.contains(RxErrorFlags::OVERRUN));
+        assert!(parts.port.read_rx().is_none());
+    }
+
+    #[test]
+    fn tx_irq_exposes_space_without_owning_a_software_fifo() {
+        let (mut regs, uart) = pl011_with_registers();
+        let mut parts = started_parts(uart);
+
+        write_test_reg(&mut regs, 0x018, 0);
+        write_test_reg(&mut regs, 0x040, UARTIS::TX::SET.value);
+        let event = handle_irq(&mut parts.irq).0.unwrap();
+        assert!(event.events.contains(SerialEventSet::TX_SPACE));
+        assert_eq!(parts.port.write_tx(b"x"), 1);
+        assert_eq!(regs.uartdr.get() as u8, b'x');
+    }
+
+    #[test]
+    fn discard_rx_clears_saved_status_without_touching_tx_data() {
+        let (mut regs, mut uart) = pl011_with_registers();
+        uart.saved_rx_status = Pl011RxStatus::PARITY;
+        regs.uartdr.set(UARTDR::DATA.val(b'x' as u32).into());
+        write_test_reg(&mut regs, 0x018, UARTFR::RXFE::SET.value);
+
+        UartPort::discard_rx(&mut uart);
+
+        assert!(uart.saved_rx_status.is_empty());
+        assert_eq!(regs.uartdr.get() as u8, b'x');
+        assert_eq!(
+            read_test_reg(&regs, 0x044) & imsc_for_events(SerialEventSet::RX),
+            imsc_for_events(SerialEventSet::RX),
+        );
+    }
+
+    #[test]
+    fn discard_tx_reports_unsupported_without_touching_rx_data() {
+        let (mut regs, mut uart) = pl011_with_registers();
+        regs.uartlcr_h.modify(UARTLCR_H::FEN::SET);
+        regs.uartdr.set(UARTDR::DATA.val(b'r' as u32).into());
+        write_test_reg(&mut regs, 0x018, 0);
+        let lcr_h = regs.uartlcr_h.get();
+
+        assert!(!UartPort::discard_tx(&mut uart));
+        assert_eq!(regs.uartlcr_h.get(), lcr_h);
+        assert_eq!(uart.read_rx().unwrap().byte, Some(b'r'));
+    }
+
+    #[test]
+    fn tx_irq_endpoint_acknowledges_tx_interrupt() {
+        let (mut regs, uart) = pl011_with_registers();
+        let mut irq = uart.split().irq;
+
+        write_test_reg(&mut regs, 0x000, 0x5a);
+        write_test_reg(&mut regs, 0x038, UARTIS::TX::SET.value);
+        write_test_reg(&mut regs, 0x040, UARTIS::TX::SET.value);
+        let event = handle_irq(&mut irq).0.unwrap();
+
+        assert!(event.events.contains(SerialEventSet::TX_SPACE));
+        assert_eq!(event.rearm, SerialEventSet::TX_SPACE);
+        assert_eq!(
+            read_test_reg(&regs, 0x044) & UARTIS::TX::SET.value,
+            UARTIS::TX::SET.value
+        );
+        assert_eq!(read_test_reg(&regs, 0x038) & UARTIS::TX::SET.value, 0);
+        assert_eq!(read_test_reg(&regs, 0x000), 0x5a);
+    }
+
+    #[test]
+    fn set_config_preserves_enabled_tx_and_rx_paths() {
+        let (regs, mut uart) = pl011_with_registers();
+        regs.uartcr
+            .write(UARTCR::UARTEN::SET + UARTCR::TXE::SET + UARTCR::RXE::SET);
+
+        uart.set_config(&Config::new()).unwrap();
+
+        let cr = regs.uartcr.extract();
+        assert!(cr.is_set(UARTCR::UARTEN));
+        assert!(cr.is_set(UARTCR::TXE));
+        assert!(cr.is_set(UARTCR::RXE));
+    }
+
+    #[test]
+    fn rx_available_mask_enables_timeout_and_error_interrupts() {
+        let (regs, mut uart) = pl011_with_registers();
+
+        uart.set_irq_mask(SerialEventSet::RX);
+
+        let imsc = regs.uartimsc.extract();
+        assert!(imsc.is_set(UARTIS::RX));
+        assert!(imsc.is_set(UARTIS::RT));
+        assert!(imsc.is_set(UARTIS::FE));
+        assert!(imsc.is_set(UARTIS::PE));
+        assert!(imsc.is_set(UARTIS::BE));
+        assert!(imsc.is_set(UARTIS::OE));
+        assert_eq!(uart.get_irq_mask(), SerialEventSet::RX);
+    }
+
+    #[test]
+    fn hard_irq_does_not_claim_rx_ready_without_mis() {
+        let (mut regs, uart) = pl011_with_registers();
+        let mut parts = uart.split();
+
+        parts.port.set_irq_mask(SerialEventSet::RX);
+        write_test_reg(&mut regs, 0x040, 0);
+        write_test_reg(&mut regs, 0x018, 0);
+
+        assert!(handle_irq(&mut parts.irq).0.is_none());
+    }
+
+    #[test]
+    fn port_rx_ready_is_visible_without_irq_event() {
+        let (mut regs, mut uart) = pl011_with_registers();
+
+        uart.set_irq_mask(SerialEventSet::RX);
+        write_test_reg(&mut regs, 0x040, 0);
+        write_test_reg(&mut regs, 0x018, 0);
+        regs.uartdr.set(UARTDR::DATA.val(b'r' as u32).into());
+
+        let status = uart.poll_status();
+        assert!(status.rx_ready());
+        let sample = uart.read_rx().expect("RX sample should be available");
+        assert_eq!(sample.byte, Some(b'r'));
+        assert_eq!(sample.flag, RxFlag::Normal);
+    }
+
+    #[test]
+    fn rearm_remasks_rx_when_fifo_is_already_ready() {
+        let (mut regs, mut uart) = pl011_with_registers();
+        write_test_reg(&mut regs, 0x018, 0);
+
+        let ready = uart.rearm(SerialEventSet::RX);
+
+        assert_eq!(ready, SerialEventSet::RX_DATA);
+        assert_eq!(
+            read_test_reg(&regs, 0x038) & imsc_for_events(SerialEventSet::RX),
+            0
+        );
+    }
+
+    #[test]
+    fn unknown_irq_source_masks_all_without_fifo_access() {
+        let (mut regs, uart) = pl011_with_registers();
+        let mut irq = uart.split().irq;
+        write_test_reg(&mut regs, 0x000, 0x5a);
+        write_test_reg(&mut regs, 0x038, u32::MAX);
+        write_test_reg(&mut regs, 0x040, 1 << 31);
+
+        let event = handle_irq(&mut irq).0.unwrap();
+
+        assert!(event.events.contains(SerialEventSet::FAULT));
+        assert_eq!(read_test_reg(&regs, 0x038), 0);
+        assert_eq!(read_test_reg(&regs, 0x000), 0x5a);
+    }
+}

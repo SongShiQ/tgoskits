@@ -179,7 +179,7 @@ impl<T: SpiTransport, D: DelayNs> SpiSdmmc<T, D> {
 
             // ACMD41 returns R3 (R1 + OCR) in native mode but a single-byte
             // R1 in SPI mode. Override the response type for this transport.
-            let acmd41 = crate::cmd::cmd41(self.sd_v2, 0xFF8000).with_resp_type(ResponseType::R1);
+            let acmd41 = crate::cmd::cmd41(self.sd_v2, 0xFF8000).with_response(ResponseType::R1);
             match self.send_command_raw(&acmd41)? {
                 Response::R1(r1) => {
                     if !r1.idle() {
@@ -298,7 +298,7 @@ impl<T: SpiTransport, D: DelayNs> SpiSdmmc<T, D> {
             Response::R1(r1) | Response::R1b(r1) => Ok(r1),
             _ => Err(Error::BadResponse(ErrorContext::for_cmd(
                 Phase::ResponseWait,
-                cmd.cmd,
+                cmd.index,
             ))),
         }
     }
@@ -310,7 +310,7 @@ impl<T: SpiTransport, D: DelayNs> SpiSdmmc<T, D> {
             self.transport.send_byte(b)?;
         }
 
-        let response = match cmd.resp_type {
+        let response = match cmd.response {
             ResponseType::None => {
                 let r1 = self.read_r1()?;
                 Ok(Response::R1(r1))

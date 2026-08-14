@@ -8,6 +8,7 @@ use super::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CrossCompileSpec {
     pub(crate) llvm_target: &'static str,
+    pub(crate) rust_musl_target: &'static str,
     pub(crate) cmake_system_processor: &'static str,
     pub(crate) guest_tool_dir: &'static str,
     pub(crate) gnu_tool_prefix: &'static str,
@@ -19,7 +20,6 @@ pub(crate) struct ArchSpec {
     pub(crate) arch: &'static str,
     pub(crate) target: &'static str,
     pub(crate) default_rootfs_image: &'static str,
-    pub(crate) starry_default_platform: &'static str,
     pub(crate) cross_compile: CrossCompileSpec,
 }
 
@@ -28,9 +28,9 @@ const ARCH_SPECS: &[ArchSpec] = &[
         arch: "aarch64",
         target: "aarch64-unknown-none-softfloat",
         default_rootfs_image: "rootfs-aarch64-alpine.img",
-        starry_default_platform: "aarch64-qemu-virt",
         cross_compile: CrossCompileSpec {
             llvm_target: "aarch64-linux-musl",
+            rust_musl_target: "aarch64-unknown-linux-musl",
             cmake_system_processor: "aarch64",
             guest_tool_dir: "usr/aarch64-alpine-linux-musl/bin",
             gnu_tool_prefix: "aarch64-linux-musl",
@@ -41,9 +41,9 @@ const ARCH_SPECS: &[ArchSpec] = &[
         arch: "x86_64",
         target: "x86_64-unknown-none",
         default_rootfs_image: "rootfs-x86_64-alpine.img",
-        starry_default_platform: "x86-pc",
         cross_compile: CrossCompileSpec {
             llvm_target: "x86_64-linux-musl",
+            rust_musl_target: "x86_64-unknown-linux-musl",
             cmake_system_processor: "x86_64",
             guest_tool_dir: "usr/x86_64-alpine-linux-musl/bin",
             gnu_tool_prefix: "x86_64-linux-musl",
@@ -54,9 +54,9 @@ const ARCH_SPECS: &[ArchSpec] = &[
         arch: "riscv64",
         target: "riscv64gc-unknown-none-elf",
         default_rootfs_image: "rootfs-riscv64-alpine.img",
-        starry_default_platform: "riscv64-qemu-virt",
         cross_compile: CrossCompileSpec {
             llvm_target: "riscv64-linux-musl",
+            rust_musl_target: "riscv64gc-unknown-linux-musl",
             cmake_system_processor: "riscv64",
             guest_tool_dir: "usr/riscv64-alpine-linux-musl/bin",
             gnu_tool_prefix: "riscv64-linux-musl",
@@ -67,9 +67,9 @@ const ARCH_SPECS: &[ArchSpec] = &[
         arch: "loongarch64",
         target: "loongarch64-unknown-none-softfloat",
         default_rootfs_image: "rootfs-loongarch64-alpine.img",
-        starry_default_platform: "loongarch64-qemu-virt",
         cross_compile: CrossCompileSpec {
             llvm_target: "loongarch64-linux-musl",
+            rust_musl_target: "loongarch64-unknown-linux-musl",
             cmake_system_processor: "loongarch64",
             guest_tool_dir: "usr/loongarch64-alpine-linux-musl/bin",
             gnu_tool_prefix: "loongarch64-linux-musl",
@@ -119,18 +119,12 @@ pub(crate) fn default_rootfs_image_for_arch(arch: &str) -> Option<&'static str> 
     arch_spec(arch).map(|spec| spec.default_rootfs_image)
 }
 
-pub(crate) fn starry_default_platform_for_arch_checked(arch: &str) -> anyhow::Result<&'static str> {
-    arch_spec(arch)
-        .map(|spec| spec.starry_default_platform)
-        .ok_or_else(|| unsupported_arch_error(arch, "Starry"))
-}
-
 pub(crate) fn cross_compile_spec_for_arch_checked(arch: &str) -> anyhow::Result<CrossCompileSpec> {
     arch_spec(arch)
         .map(|spec| spec.cross_compile)
         .ok_or_else(|| {
             anyhow!(
-                "C-based QEMU test cases are only supported on {SUPPORTED_ARCH_VALUES}, but got \
+                "cross-compiled tests are only supported on {SUPPORTED_ARCH_VALUES}, but got \
                  `{arch}`"
             )
         })

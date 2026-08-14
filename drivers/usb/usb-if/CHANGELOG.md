@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.5](https://github.com/rcore-os/tgoskits/compare/usb-if-v0.7.4...usb-if-v0.7.5) - 2026-08-09
+
+### Other
+
+- *(repo)* unify workspace dependencies ([#1860](https://github.com/rcore-os/tgoskits/pull/1860))
+
+## [0.7.4](https://github.com/rcore-os/tgoskits/compare/usb-if-v0.7.3...usb-if-v0.7.4) - 2026-07-23
+
+### Other
+
+- *(ci)* update Rust nightly to 2026-07-15 ([#1626](https://github.com/rcore-os/tgoskits/pull/1626))
+
+## [0.7.3](https://github.com/rcore-os/tgoskits/compare/usb-if-v0.7.2...usb-if-v0.7.3) - 2026-07-07
+
+### Other
+
+- update Cargo.toml dependencies
+
+## [0.7.2](https://github.com/rcore-os/tgoskits/compare/usb-if-v0.7.1...usb-if-v0.7.2) - 2026-06-03
+
+### Other
+
+- *(deps)* update spin 0.10→0.12, ostool 0.19→0.21 ([#978](https://github.com/rcore-os/tgoskits/pull/978))
+
 ## [0.7.1](https://github.com/rcore-os/tgoskits/compare/usb-if-v0.7.0...usb-if-v0.7.1) - 2026-05-18
 
 ### Other

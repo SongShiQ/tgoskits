@@ -225,10 +225,8 @@ A first subclass prototype was implemented with the following shape:
 The local verification for the revised packed-key implementation is:
 
 ```text
-cargo test -p ax-lockdep
-cargo xtask clippy --package ax-lockdep
+cargo test -p ax-sync --features "host-test,smp,sleep,lockdep,lock-api"
 cargo xtask clippy --package ax-sync
-cargo xtask clippy --package ax-kspin
 cargo xtask clippy --package starry-kernel
 ```
 
@@ -253,9 +251,9 @@ The run now stops later on a different lockdep report:
 ```text
 lockdep: lock order inversion detected
 requested:
-  kind=spin lock ... acquire_at=components/starry-process/src/process.rs:214:51
+  kind=spin lock ... acquire_at=os/StarryOS/process/src/process.rs:214:51
 conflicting held lock:
-  ... acquired_at=components/starry-process/src/process.rs:211:42
+  ... acquired_at=os/StarryOS/process/src/process.rs:211:42
 ```
 
 That new report is in `Process::exit()`:
@@ -283,7 +281,7 @@ stack=[0xffffffc080520000..0xffffffc080524000), expected magic=0x57acce1157acce1
 
 That is no longer a lockdep order report. It points at the 16 KiB primary idle
 task stack in `os/arceos/modules/axtask/src/run_queue.rs`. Further work should
-separate that stack-canary issue from the subclass implementation.
+separate that stack canary issue from the subclass implementation.
 
 ## Instance identity cleanup
 
@@ -325,7 +323,7 @@ The reproduced failure pattern is:
 - the test prints the first seven PASS lines through `clone shmget_thread`;
 - it does not print the final `no deadlock detected` PASS line;
 - it does not print a lockdep report;
-- it does not print a panic or stack-canary diagnostic;
+- it does not print a panic or stack canary diagnostic;
 - the QEMU harness eventually reports `QEMU timed out after 120s`.
 
 The relevant C test code is:
@@ -363,20 +361,20 @@ Current status:
 There is another possible filesystem lock-order issue that is not currently
 covered by lockdep.
 
-The relevant FAT32 implementation uses the project-local kernel spin lock:
+The relevant FAT32 implementation uses the project-local `ax-sync` spin lock:
 
 ```text
-os/arceos/modules/axfs-ng/src/fs/fat/fs.rs:
-  use ax_kspin::{SpinNoPreempt as Mutex, SpinNoPreemptGuard as MutexGuard};
+fs/ax-fs-ng/src/fs/fat/fs.rs:
+  use ax_sync::{SpinLock as Mutex, SpinLockGuard as MutexGuard};
 ```
 
-So the FAT filesystem lock is visible to lockdep when `ax-kspin/lockdep` is
-enabled.
+So the FAT filesystem lock is visible to lockdep when `ax-sync/lockdep` is enabled.
 
-However, the VFS layer still imports the third-party `spin` crate directly:
+At the time of this analysis, the VFS layer still imported the third-party
+`spin` crate directly:
 
 ```text
-components/axfs-ng-vfs/src/lib.rs:
+fs/axfs-ng-vfs/src/lib.rs:
   use spin::{Mutex, MutexGuard};
 ```
 
@@ -384,20 +382,19 @@ That dependency was already present when `axfs-ng-vfs` was imported as a
 subtree:
 
 ```text
-components/axfs-ng-vfs/Cargo.toml:
+fs/axfs-ng-vfs/Cargo.toml:
   spin = { version = "0.10", default-features = false, features = ["mutex"] }
 ```
 
-`ax-kspin` is related but not identical to this external `spin` crate. Its
-`BaseSpinLock` is explicitly based on `spin::Mutex`, but it is a separate
-project-local implementation that adds kernel guard semantics and, with the
-current lockdep work, lockdep acquire/release hooks.
+That `spin::Mutex` use has since been migrated to project-local `ax-sync`
+locks. `ax-sync` owns the spin algorithm, acquisition-context guards and lockdep
+acquire/release hooks.
 
-This creates a lockdep blind spot:
+Before that migration, this created a lockdep blind spot:
 
-- `ax_kspin::SpinNoPreempt` locks are visible to lockdep;
-- `spin::Mutex` locks in `axfs-ng-vfs` are not visible to lockdep;
-- any dependency edge involving a VFS `spin::Mutex` therefore cannot be
+- `ax_sync::SpinLock` locks are visible to lockdep;
+- `spin::Mutex` locks in `axfs-ng-vfs` were not visible to lockdep;
+- any dependency edge involving a VFS `spin::Mutex` therefore could not be
   recorded.
 
 The suspected FAT32/VFS ordering is:
@@ -431,25 +428,23 @@ parent/child entry lock report. The reason current lockdep may not report it is
 that one side of the pair, `DirNode.cache`, is outside the lockdep-visible lock
 set.
 
-Current implication:
+Historical implication:
 
-- a missing lockdep report does not prove the FAT32/VFS ordering is safe;
-- the current lockdep coverage is incomplete for `axfs-ng-vfs` internals;
+- a missing lockdep report did not prove the FAT32/VFS ordering was safe;
+- lockdep coverage was incomplete for `axfs-ng-vfs` internals before the
+  migration;
 - FAT32-specific testing may also be absent from the normal Starry QEMU path,
   so the code path might not be exercised even if all locks were visible.
 
-Future work should consider migrating suitable `axfs-ng-vfs` internal locks
-from third-party `spin::Mutex` to `ax_kspin`.
+The migration was not treated as a mechanical rename. The chosen lock type must
+continue to match the context:
 
-That migration should not be treated as a mechanical rename. The lock type must
-match the context:
-
-- `SpinNoPreempt` is probably the first candidate for VFS cache locks if they
-  are only used in task context;
-- `SpinNoIrq` may be needed only for locks that can be taken from IRQ-enabled
-  contexts where interrupt-side reentry is possible;
-- `SpinRaw` should remain reserved for contexts that already guarantee the
-  necessary preemption/IRQ state externally.
+- `SpinLock::lock()` is the first candidate for VFS cache locks used only in
+  task context;
+- `SpinLock::lock_irqsave()` is needed only for locks that can be taken from
+  IRQ-enabled contexts where interrupt-side reentry is possible;
+- `unsafe SpinLock::lock_raw()` remains reserved for contexts that already
+  guarantee the necessary preemption/IRQ state externally.
 
 Before changing the VFS lock type, the code paths that access `DirNode.cache`
 and `DirEntry` user data should be checked for:

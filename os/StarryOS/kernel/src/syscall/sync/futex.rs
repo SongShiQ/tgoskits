@@ -1,15 +1,18 @@
 use core::mem::align_of;
 
 use ax_errno::{AxError, AxResult};
-use ax_hal::time::{TimeValue, monotonic_time, wall_time};
+use ax_runtime::hal::time::{TimeValue, monotonic_time, wall_time};
 use ax_task::current;
 use linux_raw_sys::general::{
-    FUTEX_CLOCK_REALTIME, FUTEX_CMP_REQUEUE, FUTEX_REQUEUE, FUTEX_WAIT, FUTEX_WAIT_BITSET,
-    FUTEX_WAKE, FUTEX_WAKE_BITSET, robust_list_head, timespec,
+    FUTEX_CLOCK_REALTIME, FUTEX_CMP_REQUEUE, FUTEX_OP_ADD, FUTEX_OP_ANDN, FUTEX_OP_CMP_EQ,
+    FUTEX_OP_CMP_GE, FUTEX_OP_CMP_GT, FUTEX_OP_CMP_LE, FUTEX_OP_CMP_LT, FUTEX_OP_CMP_NE,
+    FUTEX_OP_OPARG_SHIFT, FUTEX_OP_OR, FUTEX_OP_SET, FUTEX_OP_XOR, FUTEX_REQUEUE, FUTEX_WAIT,
+    FUTEX_WAIT_BITSET, FUTEX_WAKE, FUTEX_WAKE_BITSET, FUTEX_WAKE_OP, robust_list_head, timespec,
 };
 use starry_vm::{VmMutPtr, VmPtr};
 
 use crate::{
+    mm::atomic_update_user_u32,
     task::{AsThread, FutexKey, FutexKeyMode, futex_table_for, get_task},
     time::TimeValueLike,
 };
@@ -26,6 +29,7 @@ enum FutexCommand {
     WakeBitset,
     Requeue,
     CmpRequeue,
+    WakeOp,
 }
 
 struct ParsedFutexOp {
@@ -50,6 +54,61 @@ fn validate_futex_word(uaddr: *const u32) -> AxResult<()> {
     Ok(())
 }
 
+fn sign_extend_12(value: u32) -> i32 {
+    ((value << 20) as i32) >> 20
+}
+
+fn futex_wake_op_arg(raw_op: u32, encoded_op: u32) -> i32 {
+    let mut oparg = sign_extend_12((encoded_op >> 12) & 0xfff);
+    if raw_op & FUTEX_OP_OPARG_SHIFT != 0 {
+        oparg = (1u32 << ((oparg & 31) as u32)) as i32;
+    }
+    oparg
+}
+
+fn apply_futex_wake_op(old_value: u32, raw_op: u32, oparg: i32) -> AxResult<u32> {
+    let op = raw_op & !FUTEX_OP_OPARG_SHIFT;
+    let new_value = match op {
+        FUTEX_OP_SET => oparg as u32,
+        FUTEX_OP_ADD => (old_value as i32).wrapping_add(oparg) as u32,
+        FUTEX_OP_OR => old_value | oparg as u32,
+        FUTEX_OP_ANDN => old_value & !(oparg as u32),
+        FUTEX_OP_XOR => old_value ^ oparg as u32,
+        _ => return Err(AxError::Unsupported),
+    };
+    Ok(new_value)
+}
+
+fn compare_futex_wake_op(old_value: u32, raw_cmp: u32, cmparg: i32) -> AxResult<bool> {
+    let old_value = old_value as i32;
+    let matched = match raw_cmp {
+        FUTEX_OP_CMP_EQ => old_value == cmparg,
+        FUTEX_OP_CMP_NE => old_value != cmparg,
+        FUTEX_OP_CMP_LT => old_value < cmparg,
+        FUTEX_OP_CMP_LE => old_value <= cmparg,
+        FUTEX_OP_CMP_GT => old_value > cmparg,
+        FUTEX_OP_CMP_GE => old_value >= cmparg,
+        _ => return Err(AxError::Unsupported),
+    };
+    Ok(matched)
+}
+
+fn futex_atomic_op_in_user(uaddr: *mut u32, encoded_op: u32) -> AxResult<bool> {
+    if !uaddr.addr().is_multiple_of(align_of::<u32>()) {
+        return Err(AxError::InvalidInput);
+    }
+
+    let raw_op = (encoded_op >> 28) & 0xf;
+    let raw_cmp = (encoded_op >> 24) & 0xf;
+    let oparg = futex_wake_op_arg(raw_op, encoded_op);
+    let cmparg = sign_extend_12(encoded_op & 0xfff);
+
+    let old_value = atomic_update_user_u32(uaddr, |old_value| {
+        apply_futex_wake_op(old_value, raw_op, oparg)
+    })?;
+    compare_futex_wake_op(old_value, raw_cmp, cmparg)
+}
+
 fn parse_futex_op(futex_op: u32) -> AxResult<ParsedFutexOp> {
     let flags = futex_op & !FUTEX_COMMAND_MASK;
     if flags & !SUPPORTED_FLAGS != 0 {
@@ -63,10 +122,14 @@ fn parse_futex_op(futex_op: u32) -> AxResult<ParsedFutexOp> {
         FUTEX_WAKE_BITSET => FutexCommand::WakeBitset,
         FUTEX_REQUEUE => FutexCommand::Requeue,
         FUTEX_CMP_REQUEUE => FutexCommand::CmpRequeue,
+        FUTEX_WAKE_OP => FutexCommand::WakeOp,
         _ => return Err(AxError::Unsupported),
     };
 
     let clock_realtime = flags & FUTEX_CLOCK_REALTIME != 0;
+    if clock_realtime && command == FutexCommand::WakeOp {
+        return Err(AxError::Unsupported);
+    }
     if clock_realtime && !matches!(command, FutexCommand::Wait | FutexCommand::WaitBitset) {
         return Err(AxError::InvalidInput);
     }
@@ -224,6 +287,25 @@ pub fn sys_futex(
             }
             Ok(count as _)
         }
+        FutexCommand::WakeOp => {
+            let wake_count = value as usize;
+            let wake2_count = timeout.addr();
+            validate_futex_word(uaddr)?;
+
+            let key2 = FutexKey::new_current(uaddr2.addr(), op.key_mode);
+            let table2 = futex_table_for(&key2);
+
+            let source = futex_table.get_or_insert(&key);
+            let target = table2.get_or_insert(&key2);
+            let count = source.wq.wake_op(wake_count, &target.wq, wake2_count, || {
+                futex_atomic_op_in_user(uaddr2, value3)
+            })?;
+
+            if count > 0 {
+                ax_task::yield_now();
+            }
+            Ok(count as _)
+        }
     }
 }
 
@@ -246,4 +328,42 @@ pub fn sys_set_robust_list(head: *const robust_list_head, size: usize) -> AxResu
     current().as_thread().set_robust_list_head(head.addr());
 
     Ok(0)
+}
+
+#[cfg(axtest)]
+pub(crate) fn futex_op_and_compare_rules_hold_for_test() -> bool {
+    // sign_extend_12: sign-extends a 12-bit value.
+    assert!(sign_extend_12(0x000) == 0);
+    assert!(sign_extend_12(0x7FF) == 2047); // max positive
+    assert!(sign_extend_12(0x800) == -2048); // min negative
+    assert!(sign_extend_12(0xFFF) == -1);
+
+    // futex_wake_op_arg: extracts oparg from encoded_op, optionally shifts.
+    let raw_op_set = FUTEX_OP_SET;
+    let encoded_no_shift = (5u32) << 12; // oparg=5, no shift
+    assert!(futex_wake_op_arg(raw_op_set, encoded_no_shift) == 5);
+
+    let raw_op_shift = FUTEX_OP_SET | FUTEX_OP_OPARG_SHIFT;
+    let encoded_shift = (3u32) << 12; // oparg=3, shift by 3
+    assert!(futex_wake_op_arg(raw_op_shift, encoded_shift) == 8); // 1 << 3 = 8
+
+    // apply_futex_wake_op: applies the operation to old_value.
+    assert!(apply_futex_wake_op(10, FUTEX_OP_SET, 42).unwrap() == 42);
+    assert!(apply_futex_wake_op(10, FUTEX_OP_ADD, 5).unwrap() == 15);
+    assert!(apply_futex_wake_op(0b1100, FUTEX_OP_OR, 0b1010).unwrap() == 0b1110);
+    assert!(apply_futex_wake_op(0xFF, FUTEX_OP_ANDN, 0x0F).unwrap() == 0xF0);
+    assert!(apply_futex_wake_op(0xAA, FUTEX_OP_XOR, 0xFF).unwrap() == 0x55);
+    assert!(apply_futex_wake_op(0, 0xFFFF, 0).is_err()); // unsupported op
+
+    // compare_futex_wake_op: compares old_value with cmparg.
+    assert!(compare_futex_wake_op(5, FUTEX_OP_CMP_EQ, 5).unwrap() == true);
+    assert!(compare_futex_wake_op(5, FUTEX_OP_CMP_EQ, 6).unwrap() == false);
+    assert!(compare_futex_wake_op(5, FUTEX_OP_CMP_NE, 6).unwrap() == true);
+    assert!(compare_futex_wake_op(5, FUTEX_OP_CMP_LT, 10).unwrap() == true);
+    assert!(compare_futex_wake_op(5, FUTEX_OP_CMP_LE, 5).unwrap() == true);
+    assert!(compare_futex_wake_op(5, FUTEX_OP_CMP_GT, 3).unwrap() == true);
+    assert!(compare_futex_wake_op(5, FUTEX_OP_CMP_GE, 5).unwrap() == true);
+    assert!(compare_futex_wake_op(0, 0xFFFF, 0).is_err()); // unsupported cmp
+
+    true
 }

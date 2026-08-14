@@ -1,29 +1,28 @@
 use alloc::sync::Arc;
-use core::ffi::{c_char, c_int};
-#[cfg(not(feature = "use-hermit-types"))]
-use core::mem::size_of;
+use core::{
+    ffi::{c_char, c_int},
+    mem::size_of,
+    time::Duration,
+};
 
 use ax_errno::{LinuxError, LinuxResult};
-use ax_fs::fops::OpenOptions;
+use ax_fs_ng::fops::OpenOptions;
 use ax_io::{PollState, SeekFrom};
-use ax_sync::Mutex;
 
 use super::fd_ops::{FileLike, get_file_like};
-use crate::{ctypes, utils::char_ptr_to_str};
+use crate::{ctypes, sync::Mutex, utils::char_ptr_to_str};
+
+const UTIME_NOW: i64 = (1 << 30) - 1;
+const UTIME_OMIT: i64 = (1 << 30) - 2;
 
 pub struct File {
-    inner: Mutex<ax_fs::fops::File>,
+    inner: Mutex<ax_fs_ng::fops::File>,
 }
 
 pub struct Directory {
-    inner: Mutex<ax_fs::fops::Directory>,
+    inner: Mutex<ax_fs_ng::fops::Directory>,
 }
 
-// ============================================================================
-// Linux-style getdents64 implementation (for normal Linux targets)
-// ============================================================================
-
-#[cfg(not(feature = "use-hermit-types"))]
 #[repr(C, packed)]
 struct LinuxDirent64Head {
     d_ino: u64,
@@ -32,13 +31,11 @@ struct LinuxDirent64Head {
     d_type: u8,
 }
 
-#[cfg(not(feature = "use-hermit-types"))]
 struct DirBuffer<'a> {
     buf: &'a mut [u8],
     offset: usize,
 }
 
-#[cfg(not(feature = "use-hermit-types"))]
 impl<'a> DirBuffer<'a> {
     fn new(buf: &'a mut [u8]) -> Self {
         Self { buf, offset: 0 }
@@ -82,94 +79,43 @@ impl<'a> DirBuffer<'a> {
     }
 }
 
-// ============================================================================
-// Hermit-style getdents64 implementation (for hermit targets)
-// ============================================================================
-
-#[cfg(feature = "use-hermit-types")]
-use core::mem;
-
-#[cfg(feature = "use-hermit-types")]
-struct HermitDirBuffer<'a> {
-    buf: &'a mut [u8],
-    offset: usize,
-}
-
-#[cfg(feature = "use-hermit-types")]
-impl<'a> HermitDirBuffer<'a> {
-    fn new(buf: &'a mut [u8]) -> Self {
-        Self { buf, offset: 0 }
-    }
-
-    fn used_len(&self) -> usize {
-        self.offset
-    }
-
-    fn remaining_space(&self) -> usize {
-        self.buf.len().saturating_sub(self.offset)
-    }
-
-    fn write_entry(&mut self, d_ino: u64, d_type: u8, name: &[u8]) -> bool {
-        // Hermit dirent64 structure layout:
-        // offset 0: d_ino (u64, 8 bytes)
-        // offset 8: d_off (i64, 8 bytes)
-        // offset 16: d_reclen (u16, 2 bytes)
-        // offset 18: d_type (u8, 1 byte)
-        // offset 19: d_name (variable-length null-terminated c_char array)
-        const NAME_OFFSET: usize = 19;
-
-        let name_len = name.len().min(255);
-        // Total size: fixed header (19 bytes) + name + null terminator
-        let dirent_len = NAME_OFFSET + name_len + 1;
-        // Align to dirent64 struct alignment (8 bytes for u64)
-        let reclen = dirent_len.next_multiple_of(mem::align_of::<ctypes::dirent64>());
-
-        if self.remaining_space() < reclen {
-            return false;
-        }
-
-        unsafe {
-            let entry_ptr = self.buf.as_mut_ptr().add(self.offset);
-
-            // Write fixed fields
-            let d_ino_ptr = entry_ptr.cast::<u64>();
-            d_ino_ptr.write_unaligned(d_ino);
-
-            let d_off_ptr = entry_ptr.add(8).cast::<i64>();
-            d_off_ptr.write_unaligned(0); // d_off is not meaningful in Hermit
-
-            let d_reclen_ptr = entry_ptr.add(16).cast::<u16>();
-            d_reclen_ptr.write_unaligned(reclen as u16);
-
-            let d_type_ptr = entry_ptr.add(18);
-            d_type_ptr.write(d_type);
-
-            // Write d_name (starting at offset 19)
-            let name_ptr = entry_ptr.add(NAME_OFFSET);
-            name_ptr.copy_from_nonoverlapping(name.as_ptr(), name_len);
-            name_ptr.add(name_len).write(0); // null terminator
-        }
-
-        self.offset += reclen;
-        true
-    }
-}
-
-// ============================================================================
-// Common file type conversion
-// ============================================================================
-
-fn file_type_to_d_type(ty: ax_fs::fops::FileType) -> u8 {
+fn file_type_to_d_type(ty: ax_fs_ng::fops::FileType) -> u8 {
     match ty {
-        ax_fs::fops::FileType::Dir => 4,      // DT_DIR
-        ax_fs::fops::FileType::File => 8,     // DT_REG
-        ax_fs::fops::FileType::SymLink => 10, // DT_LNK
-        _ => 0,                               // DT_UNKNOWN
+        ax_fs_ng::fops::FileType::Directory => 4,   // DT_DIR
+        ax_fs_ng::fops::FileType::RegularFile => 8, // DT_REG
+        ax_fs_ng::fops::FileType::Symlink => 10,    // DT_LNK
+        _ => 0,                                     // DT_UNKNOWN
+    }
+}
+
+fn metadata_to_stat(metadata: ax_fs_ng::fops::FileAttr) -> ctypes::stat {
+    let st_mode = ((metadata.node_type as u32) << 12) | metadata.mode.bits() as u32;
+    ctypes::stat {
+        st_dev: metadata.device as _,
+        st_ino: metadata.inode as _,
+        st_nlink: metadata.nlink as _,
+        st_mode,
+        st_uid: metadata.uid as _,
+        st_gid: metadata.gid as _,
+        st_rdev: metadata.rdev.0 as _,
+        st_size: metadata.size as _,
+        st_blksize: metadata.block_size as _,
+        st_blocks: metadata.blocks as _,
+        st_atime: duration_to_timespec(metadata.atime),
+        st_mtime: duration_to_timespec(metadata.mtime),
+        st_ctime: duration_to_timespec(metadata.ctime),
+    }
+}
+
+fn duration_to_timespec(duration: Duration) -> ctypes::timespec {
+    ctypes::timespec {
+        tv_sec: duration.as_secs() as _,
+        tv_nsec: duration.subsec_nanos() as _,
     }
 }
 
 impl File {
-    fn new(inner: ax_fs::fops::File) -> Self {
+    fn new(inner: ax_fs_ng::fops::File) -> Self {
         Self {
             inner: Mutex::new(inner),
         }
@@ -188,7 +134,7 @@ impl File {
 }
 
 impl Directory {
-    fn new(inner: ax_fs::fops::Directory) -> Self {
+    fn new(inner: ax_fs_ng::fops::Directory) -> Self {
         Self {
             inner: Mutex::new(inner),
         }
@@ -217,20 +163,7 @@ impl FileLike for File {
 
     fn stat(&self) -> LinuxResult<ctypes::stat> {
         let metadata = self.inner.lock().get_attr()?;
-        let ty = metadata.file_type() as u8;
-        let perm = metadata.perm().bits() as u32;
-        let st_mode = ((ty as u32) << 12) | perm;
-        Ok(ctypes::stat {
-            st_ino: 1,
-            st_nlink: 1,
-            st_mode,
-            st_uid: 1000,
-            st_gid: 1000,
-            st_size: metadata.size() as _,
-            st_blocks: metadata.blocks() as _,
-            st_blksize: 512,
-            ..Default::default()
-        })
+        Ok(metadata_to_stat(metadata))
     }
 
     fn into_any(self: Arc<Self>) -> Arc<dyn core::any::Any + Send + Sync> {
@@ -241,6 +174,7 @@ impl FileLike for File {
         Ok(PollState {
             readable: true,
             writable: true,
+            readiness_version: 0,
         })
     }
 
@@ -281,6 +215,7 @@ impl FileLike for Directory {
         Ok(PollState {
             readable: true,
             writable: false,
+            readiness_version: 0,
         })
     }
 
@@ -310,7 +245,7 @@ fn flags_to_options(flags: c_int, _mode: ctypes::mode_t) -> OpenOptions {
     if flags & ctypes::O_CREAT != 0 {
         options.create(true);
     }
-    if flags & ctypes::O_EXEC != 0 {
+    if flags & ctypes::O_EXCL != 0 {
         options.create_new(true);
     }
     options
@@ -327,26 +262,21 @@ pub fn sys_open(filename: *const c_char, flags: c_int, mode: ctypes::mode_t) -> 
         let options = flags_to_options(flags, mode);
         let filename = filename?;
         if (flags as u32) & ctypes::O_DIRECTORY != 0 {
-            let dir = ax_fs::fops::Directory::open_dir(filename, &options)?;
+            let dir = ax_fs_ng::fops::Directory::open_dir(filename, &options)?;
             Directory::new(dir).add_to_fd_table()
         } else {
-            let file = ax_fs::fops::File::open(filename, &options)?;
+            let file = ax_fs_ng::fops::File::open(filename, &options)?;
             File::new(file).add_to_fd_table()
         }
     })
 }
 
-// ============================================================================
-// Linux-style sys_getdents64 (standard Linux targets)
-// ============================================================================
-
 /// Read directory entries from `fd` into Linux-style linux_dirent64 buffer.
 ///
 /// Reference: Starry OS implementation
 /// Return number of bytes written on success.
-#[cfg(not(feature = "use-hermit-types"))]
 pub unsafe fn sys_getdents64(fd: c_int, buf: *mut u8, len: usize) -> ctypes::ssize_t {
-    debug!("sys_getdents64 (Linux) <= {fd} {:#x} {len}", buf as usize);
+    debug!("sys_getdents64 <= {fd} {:#x} {len}", buf as usize);
     syscall_body!(sys_getdents64, {
         if buf.is_null() || len == 0 {
             return Err(LinuxError::EINVAL);
@@ -358,8 +288,8 @@ pub unsafe fn sys_getdents64(fd: c_int, buf: *mut u8, len: usize) -> ctypes::ssi
         let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
         let mut dir_buf = DirBuffer::new(out);
 
-        let mut entries: [ax_fs::fops::DirEntry; 16] =
-            core::array::from_fn(|_| ax_fs::fops::DirEntry::default());
+        let mut entries: [ax_fs_ng::fops::DirEntry; 16] =
+            core::array::from_fn(|_| ax_fs_ng::fops::DirEntry::default());
         loop {
             let nr = dir.read_dir(&mut entries)?;
             if nr == 0 {
@@ -370,60 +300,6 @@ pub unsafe fn sys_getdents64(fd: c_int, buf: *mut u8, len: usize) -> ctypes::ssi
                 let d_type = file_type_to_d_type(entry.entry_type());
                 // Linux style: d_ino, d_off both present
                 if !dir_buf.write_entry(1, 0, d_type, entry.name_as_bytes()) {
-                    return Ok(dir_buf.used_len() as ctypes::ssize_t);
-                }
-            }
-        }
-
-        Ok(dir_buf.used_len() as ctypes::ssize_t)
-    })
-}
-
-// ============================================================================
-// Hermit-style sys_getdents64 (Hermit/BSD-like targets)
-// ============================================================================
-
-/// Read directory entries from `fd` into Hermit-style dirent64 buffer.
-///
-/// Reference: Hermit OS official implementation
-/// Parameters:
-/// - `fd`: File Descriptor of the directory in question.
-/// - `buf`: Memory for the kernel to store the filled `Dirent64` objects including
-///   the c-strings with the filenames.
-/// - `len`: Size of the memory region described by `buf` in bytes.
-///
-/// Return:
-/// The number of bytes read into `buf` on success. Zero indicates that no more
-/// entries remain and the directory's read position needs to be reset using `sys_lseek`.
-/// Negative numbers encode errors.
-#[cfg(feature = "use-hermit-types")]
-pub unsafe fn sys_getdents64(fd: c_int, buf: *mut u8, len: usize) -> ctypes::ssize_t {
-    debug!("sys_getdents64 (Hermit) <= {fd} {:#x} {len}", buf as usize);
-    syscall_body!(sys_getdents64, {
-        // Hermit ABI: null buffer or zero-sized buffer are invalid
-        if buf.is_null() || len == 0 {
-            return Err(LinuxError::EINVAL);
-        }
-
-        // Hermit returns EINVAL for invalid directory objects
-        let dir = Directory::from_fd(fd).map_err(|_| LinuxError::EINVAL)?;
-        let mut dir = dir.inner.lock();
-
-        let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
-        let mut dir_buf = HermitDirBuffer::new(out);
-
-        let mut entries: [ax_fs::fops::DirEntry; 16] =
-            core::array::from_fn(|_| ax_fs::fops::DirEntry::default());
-        loop {
-            let nr = dir.read_dir(&mut entries)?;
-            if nr == 0 {
-                break;
-            }
-
-            for entry in entries.iter().take(nr) {
-                let d_type = file_type_to_d_type(entry.entry_type());
-                // Hermit style: only d_ino and d_type, d_off is not meaningful
-                if !dir_buf.write_entry(1, d_type, entry.name_as_bytes()) {
                     return Ok(dir_buf.used_len() as ctypes::ssize_t);
                 }
             }
@@ -460,10 +336,7 @@ pub unsafe fn sys_stat(path: *const c_char, buf: *mut ctypes::stat) -> c_int {
         if buf.is_null() {
             return Err(LinuxError::EFAULT);
         }
-        let mut options = OpenOptions::new();
-        options.read(true);
-        let file = ax_fs::fops::File::open(path?, &options)?;
-        let st = File::new(file).stat()?;
+        let st = metadata_to_stat(ax_fs_ng::api::metadata(path?)?);
         unsafe { *buf = st };
         Ok(0)
     })
@@ -484,6 +357,64 @@ pub unsafe fn sys_fstat(fd: c_int, buf: *mut ctypes::stat) -> c_int {
     })
 }
 
+/// Update the access and modification times of an open file descriptor.
+///
+/// A null `times` pointer sets both timestamps to the current wall-clock time.
+/// Individual timestamps also support the Linux `UTIME_NOW` and `UTIME_OMIT`
+/// values in `tv_nsec`.
+///
+/// # Safety
+///
+/// When non-null, `times` must point to two readable [`ctypes::timespec`]
+/// values for the duration of this call.
+pub unsafe fn sys_futimens(fd: c_int, times: *const ctypes::timespec) -> c_int {
+    debug!("sys_futimens <= {fd} {:#x}", times as usize);
+    syscall_body!(sys_futimens, {
+        let file = File::from_fd(fd)?;
+        let (atime, mtime) = unsafe { futimens_times(times)? };
+        if atime.is_none() && mtime.is_none() {
+            return Ok(0);
+        }
+        file.inner.lock().set_times(atime, mtime)?;
+        Ok(0)
+    })
+}
+
+unsafe fn futimens_times(
+    times: *const ctypes::timespec,
+) -> LinuxResult<(Option<Duration>, Option<Duration>)> {
+    let now = ax_hal::time::wall_time();
+    if times.is_null() {
+        return Ok((Some(now), Some(now)));
+    }
+
+    let times = unsafe { core::slice::from_raw_parts(times, 2) };
+    Ok((
+        file_time_from_timespec(times[0], now)?,
+        file_time_from_timespec(times[1], now)?,
+    ))
+}
+
+fn file_time_from_timespec(
+    timespec: ctypes::timespec,
+    now: Duration,
+) -> LinuxResult<Option<Duration>> {
+    match timespec.tv_nsec {
+        UTIME_NOW => Ok(Some(now)),
+        UTIME_OMIT => Ok(None),
+        nanoseconds
+            if (0..=u32::MAX as i64).contains(&timespec.tv_sec)
+                && (0..1_000_000_000).contains(&nanoseconds) =>
+        {
+            Ok(Some(Duration::new(
+                timespec.tv_sec as u64,
+                nanoseconds as u32,
+            )))
+        }
+        _ => Err(LinuxError::EINVAL),
+    }
+}
+
 /// Get the metadata of the symbolic link and write into `buf`.
 ///
 /// Return 0 if success.
@@ -494,11 +425,7 @@ pub unsafe fn sys_lstat(path: *const c_char, buf: *mut ctypes::stat) -> ctypes::
         if buf.is_null() {
             return Err(LinuxError::EFAULT);
         }
-        // ArceOS currently doesn't support symbolic links, so lstat behaves the same as stat
-        let mut options = OpenOptions::new();
-        options.read(true);
-        let file = ax_fs::fops::File::open(path?, &options)?;
-        let st = File::new(file).stat()?;
+        let st = metadata_to_stat(ax_fs_ng::api::symlink_metadata(path?)?);
         unsafe { *buf = st };
         Ok(0)
     })
@@ -513,7 +440,7 @@ pub fn sys_getcwd(buf: *mut c_char, size: usize) -> *mut c_char {
             return Ok(core::ptr::null::<c_char>() as _);
         }
         let dst = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, size as _) };
-        let cwd = ax_fs::api::current_dir()?;
+        let cwd = ax_fs_ng::api::current_dir()?;
         let cwd = cwd.as_bytes();
         if cwd.len() < size {
             dst[..cwd.len()].copy_from_slice(cwd);
@@ -534,7 +461,114 @@ pub fn sys_rename(old: *const c_char, new: *const c_char) -> c_int {
         let old_path = char_ptr_to_str(old)?;
         let new_path = char_ptr_to_str(new)?;
         debug!("sys_rename <= old: {old_path:?}, new: {new_path:?}");
-        ax_fs::api::rename(old_path, new_path)?;
+        ax_fs_ng::api::rename(old_path, new_path)?;
         Ok(0)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use ax_fs_ng::fops::{FileAttr, FilePerm, FileType};
+
+    use super::*;
+
+    #[test]
+    fn metadata_to_stat_preserves_filesystem_attributes() {
+        let metadata = FileAttr {
+            device: 3,
+            inode: 17,
+            nlink: 2,
+            mode: FilePerm::from_bits_retain(0o640),
+            node_type: FileType::RegularFile,
+            uid: 1001,
+            gid: 1002,
+            size: 4097,
+            block_size: 4096,
+            blocks: 16,
+            rdev: Default::default(),
+            atime: Duration::new(10, 11),
+            mtime: Duration::new(12, 13),
+            ctime: Duration::new(14, 15),
+        };
+
+        let stat = metadata_to_stat(metadata);
+
+        assert_eq!(stat.st_dev, 3);
+        assert_eq!(stat.st_ino, 17);
+        assert_eq!(stat.st_nlink, 2);
+        assert_eq!(stat.st_mode, 0o100640);
+        assert_eq!(stat.st_uid, 1001);
+        assert_eq!(stat.st_gid, 1002);
+        assert_eq!(stat.st_size, 4097);
+        assert_eq!(stat.st_blksize, 4096);
+        assert_eq!(stat.st_blocks, 16);
+        assert_eq!(stat.st_atime.tv_sec, 10);
+        assert_eq!(stat.st_atime.tv_nsec, 11);
+        assert_eq!(stat.st_mtime.tv_sec, 12);
+        assert_eq!(stat.st_mtime.tv_nsec, 13);
+        assert_eq!(stat.st_ctime.tv_sec, 14);
+        assert_eq!(stat.st_ctime.tv_nsec, 15);
+    }
+
+    #[test]
+    fn file_time_from_timespec_handles_linux_special_values() {
+        let now = Duration::new(30, 40);
+
+        assert_eq!(
+            file_time_from_timespec(
+                ctypes::timespec {
+                    tv_sec: 0,
+                    tv_nsec: UTIME_NOW as _,
+                },
+                now,
+            ),
+            Ok(Some(now))
+        );
+        assert_eq!(
+            file_time_from_timespec(
+                ctypes::timespec {
+                    tv_sec: 0,
+                    tv_nsec: UTIME_OMIT as _,
+                },
+                now,
+            ),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn file_time_from_timespec_rejects_invalid_values() {
+        let now = Duration::ZERO;
+
+        assert_eq!(
+            file_time_from_timespec(
+                ctypes::timespec {
+                    tv_sec: -1,
+                    tv_nsec: 0,
+                },
+                now,
+            ),
+            Err(LinuxError::EINVAL)
+        );
+        assert_eq!(
+            file_time_from_timespec(
+                ctypes::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 1_000_000_000,
+                },
+                now,
+            ),
+            Err(LinuxError::EINVAL)
+        );
+        assert_eq!(
+            file_time_from_timespec(
+                ctypes::timespec {
+                    tv_sec: u32::MAX as i64 + 1,
+                    tv_nsec: 0,
+                },
+                now,
+            ),
+            Err(LinuxError::EINVAL)
+        );
+    }
 }

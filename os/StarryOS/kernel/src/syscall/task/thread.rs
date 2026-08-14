@@ -3,18 +3,31 @@ use ax_task::current;
 
 use crate::task::AsThread;
 
+#[inline(never)]
 pub fn sys_getpid() -> AxResult<isize> {
-    Ok(current().as_thread().proc_data.proc.pid() as _)
+    let curr = current();
+    let thr = curr.as_thread();
+    let global_pid = thr.proc_data.proc.pid() as u64;
+    let nsproxy = thr.proc_data.nsproxy.lock();
+    let local = nsproxy.pid_ns.lock().local_pid(global_pid);
+    drop(nsproxy);
+    if let Some(local) = local {
+        Ok(local as isize)
+    } else {
+        Ok(global_pid as isize)
+    }
 }
 
 pub fn sys_getppid() -> AxResult<isize> {
-    current()
-        .as_thread()
-        .proc_data
-        .proc
-        .parent()
-        .ok_or(AxError::NoSuchProcess)
-        .map(|p| p.pid() as _)
+    let curr = current();
+    let thr = curr.as_thread();
+    let parent = thr.proc_data.proc.parent().ok_or(AxError::NoSuchProcess)?;
+    let parent_global_pid = parent.pid() as u64;
+    let nsproxy = thr.proc_data.nsproxy.lock();
+    match nsproxy.pid_ns.lock().local_pid(parent_global_pid) {
+        Some(local) => Ok(local as isize),
+        None => Ok(0),
+    }
 }
 
 pub fn sys_gettid() -> AxResult<isize> {
@@ -24,9 +37,27 @@ pub fn sys_gettid() -> AxResult<isize> {
     Ok(current().as_thread().tid() as _)
 }
 
+/// `getcpu(2)`: report the CPU and NUMA node the caller is running on.
+///
+/// glibc's `sched_getcpu` and NUMA-aware allocators query this. We report the
+/// current CPU id and node 0 (single NUMA node); the obsolete `tcache` arg is
+/// ignored. Either pointer may be NULL.
+pub fn sys_getcpu(cpu: *mut u32, node: *mut u32, _tcache: usize) -> AxResult<isize> {
+    use ax_runtime::hal::percpu::this_cpu_id;
+    use starry_vm::VmMutPtr;
+
+    if !cpu.is_null() {
+        cpu.vm_write(this_cpu_id() as u32)?;
+    }
+    if !node.is_null() {
+        node.vm_write(0)?;
+    }
+    Ok(0)
+}
+
 /// ARCH_PRCTL codes
 ///
-/// It is only avaliable on x86_64, and is not convenient
+/// It is only available on x86_64, and is not convenient
 /// to generate automatically via c_to_rust binding.
 #[cfg(target_arch = "x86_64")]
 #[derive(Debug, Eq, PartialEq, num_enum::TryFromPrimitive)]
@@ -59,7 +90,7 @@ pub fn sys_set_tid_address(clear_child_tid: usize) -> AxResult<isize> {
 
 #[cfg(target_arch = "x86_64")]
 pub fn sys_arch_prctl(
-    uctx: &mut ax_hal::uspace::UserContext,
+    uctx: &mut ax_runtime::hal::cpu::uspace::UserContext,
     code: i32,
     addr: usize,
 ) -> AxResult<isize> {
@@ -90,4 +121,26 @@ pub fn sys_arch_prctl(
         ArchPrctlCode::GetCpuid => Ok(0),
         ArchPrctlCode::SetCpuid => Err(ax_errno::AxError::NoSuchDevice),
     }
+}
+
+#[cfg(axtest)]
+pub(crate) fn thread_arch_prctl_code_rules_hold_for_test() -> bool {
+    // Test ArchPrctlCode enum values
+    #[cfg(target_arch = "x86_64")]
+    {
+        assert!(ArchPrctlCode::SetGs as i32 == 0x1001);
+        assert!(ArchPrctlCode::SetFs as i32 == 0x1002);
+        assert!(ArchPrctlCode::GetFs as i32 == 0x1003);
+        assert!(ArchPrctlCode::GetGs as i32 == 0x1004);
+        assert!(ArchPrctlCode::GetCpuid as i32 == 0x1011);
+        assert!(ArchPrctlCode::SetCpuid as i32 == 0x1012);
+
+        // Test TryFromPrimitive
+        use num_enum::TryFromPrimitive;
+        assert!(ArchPrctlCode::try_from_primitive(0x1001).is_ok());
+        assert!(ArchPrctlCode::try_from_primitive(0x1002).is_ok());
+        assert!(ArchPrctlCode::try_from_primitive(0xFFFF).is_err());
+    }
+
+    true
 }

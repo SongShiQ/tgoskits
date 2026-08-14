@@ -144,35 +144,27 @@ impl DistributorReg {
 
     /// Set default priorities for SPI (ID 32..max_interrupts-1)
     pub(crate) fn set_default_spi_priorities(&self, max_interrupts: u32) {
-        let total_regs = max_interrupts.div_ceil(4) as usize;
-        let total_regs = total_regs.min(self.IPRIORITYR.len());
-
-        // SPI starts from interrupt ID 32
-        let spi_start_id = 32;
-
-        for i in spi_start_id..total_regs {
+        let total_interrupts = (max_interrupts as usize).min(self.IPRIORITYR.len());
+        for i in 32..total_interrupts {
             self.IPRIORITYR[i].set(0xA0);
         }
     }
 
     /// Configure interrupt targets for SPIs (Shared Peripheral Interrupts)
-    pub(crate) fn configure_interrupt_targets(&self, max_interrupts: u32) {
+    pub(crate) fn configure_interrupt_targets(
+        &self,
+        max_interrupts: u32,
+        bsp_target: super::TargetList,
+    ) {
         // SGIs (0-15) and PPIs (16-31) don't use ITARGETSR
         // Only SPIs (32+) need target configuration
         if max_interrupts <= 32 {
             return;
         }
 
-        let spi_start = 32;
-        let num_spis = max_interrupts - spi_start;
-        let num_regs = num_spis.div_ceil(4) as usize;
-        let target_reg_start = (spi_start / 4) as usize;
-        let target_reg_end = target_reg_start + num_regs;
-        let target_reg_end = target_reg_end.min(self.ITARGETSR.len());
-
-        // Set all SPIs to target CPU 0 by default (0x01)
-        for i in target_reg_start..target_reg_end {
-            self.ITARGETSR[i].set(0x01);
+        let total_interrupts = (max_interrupts as usize).min(self.ITARGETSR.len());
+        for i in 32..total_interrupts {
+            self.ITARGETSR[i].set(bsp_target.as_u8());
         }
     }
 
@@ -192,6 +184,10 @@ impl DistributorReg {
     pub fn max_spi_num(&self) -> u32 {
         let it_lines_number = self.TYPER.read(TYPER::ITLinesNumber); // ITLinesNumber field
         (it_lines_number + 1) * 32
+    }
+
+    pub(crate) fn cpu_interface_count(&self) -> usize {
+        self.TYPER.read(TYPER::CPUNumber) as usize + 1
     }
 
     pub fn set_cfg(&self, id: IntId, cfg: Trigger) {

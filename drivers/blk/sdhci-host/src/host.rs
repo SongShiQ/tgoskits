@@ -1,15 +1,18 @@
 //! `Sdhci` core: MMIO accessors, reset, clock and bus-width setup.
 
-use core::ptr::NonNull;
+use alloc::{boxed::Box, sync::Arc};
+use core::{
+    ptr::NonNull,
+    sync::atomic::{AtomicU32, AtomicU64, Ordering},
+};
 
 use dma_api::DeviceDma;
 use mmio_api::MmioRaw;
 use sdmmc_protocol::error::{Error, ErrorContext, Phase};
 
-use crate::{command::CommandState, regs::*};
+use crate::{command::CommandState, dma::Adma2DescriptorTable, regs::*};
 
-/// Cached state for a single pending data phase, populated by the
-/// data-command submit path and consumed when that path issues the command.
+/// Shape of the single data phase carried by an in-flight command state.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PendingData {
     pub direction: sdmmc_protocol::DataDirection,
@@ -17,12 +20,15 @@ pub(crate) struct PendingData {
     pub block_count: u32,
 }
 
+mod irq_state;
+pub(crate) use irq_state::IrqCore;
+
 /// Generic SD Host Controller (SDHCI) backend.
 ///
 /// Owns the MMIO base address of one host controller instance and
 /// implements [`sdmmc_protocol::sdio::SdioHost`] so that the protocol
-/// driver in `sdmmc-protocol` can drive it. Data transfers can use either
-/// the controller FIFO or the ADMA2 state machine.
+/// driver in `sdmmc-protocol` can drive it. Data transfers use the ADMA2
+/// state machine exclusively.
 ///
 /// # Safety
 ///
@@ -30,18 +36,21 @@ pub(crate) struct PendingData {
 /// MMIO base address for an SDHCI v3.x compatible controller. Concurrent
 /// use of the same controller from multiple `Sdhci` instances is undefined.
 pub struct Sdhci {
-    base_addr: usize,
+    pub(crate) base_addr: usize,
     pub(crate) command_state: CommandState,
-    pub(crate) pending_data: Option<PendingData>,
-    /// When set, command submission programs the controller's transfer mode
-    /// register with `DMA_ENABLE`. Set by the ADMA2 wrapper just before it
-    /// fires off a command; default `false` keeps the FIFO path active.
-    pub(crate) use_dma: bool,
     /// Optional CRU-side clock callback. When set, the `SdioHost::set_clock`
     /// impl will route requests to this hook (and program the controller
     /// for 1:1 passthrough) instead of using the internal 10-bit divider.
     /// Used on controllers whose internal divider is unusable.
-    pub(crate) ext_clock: Option<&'static dyn HostClock>,
+    pub(crate) ext_clock: Option<Box<dyn HostClock>>,
+    /// Optional platform hook that runs after a controller-wide reset has
+    /// completed and before protocol commands are issued. DWCMSHC-style
+    /// integrations use this for vendor PHY/DLL defaults that reset does not
+    /// leave in a usable identification-mode state.
+    pub(crate) reset_hook: Option<Box<dyn HostResetHook>>,
+    /// Optional monotonic timer used by asynchronous bus-operation state
+    /// machines that have specification-defined wall-clock delays.
+    pub(crate) timer: Option<&'static dyn HostTimer>,
     /// Whether the platform has wired up the IO-domain regulator needed to
     /// actually run the bus at 1.8 V. Default `false` — toggling
     /// `HOST_CONTROL2.1V8_SIGNALING_ENABLE` alone changes the controller
@@ -50,12 +59,18 @@ pub struct Sdhci {
     /// fall back to a 3.3 V-compatible mode.
     pub(crate) support_1v8: bool,
     /// Command index for the data phase currently being drained by the
-    /// submit/poll data-command state machine.
+    /// IRQ-driven data-command state machine.
     pub(crate) active_data_cmd: u8,
     pub(crate) dma: Option<DeviceDma>,
+    /// Controller-lifetime ADMA2 table. Queue depth one guarantees that the
+    /// hardware and the maintenance thread never reuse it concurrently.
+    pub(crate) adma2_table: Option<Adma2DescriptorTable>,
     pub(crate) dma_mask: u64,
-    pub(crate) irq_pending_normal: u16,
-    pub(crate) irq_pending_error: u16,
+    pub(crate) v4_mode: bool,
+    pub(crate) dma_poisoned: bool,
+    pub(crate) irq: Arc<IrqCore>,
+    pub(crate) host2_next_id: u64,
+    pub(crate) host2_active_id: Option<u64>,
 }
 
 impl Sdhci {
@@ -69,15 +84,19 @@ impl Sdhci {
         Self {
             base_addr: base.as_ptr() as usize,
             command_state: CommandState::Idle,
-            pending_data: None,
-            use_dma: false,
             ext_clock: None,
+            reset_hook: None,
+            timer: None,
             support_1v8: false,
             active_data_cmd: 0,
             dma: None,
+            adma2_table: None,
             dma_mask: u32::MAX as u64,
-            irq_pending_normal: 0,
-            irq_pending_error: 0,
+            v4_mode: false,
+            dma_poisoned: false,
+            irq: Arc::new(IrqCore::new(base.as_ptr() as usize)),
+            host2_next_id: 0,
+            host2_active_id: None,
         }
     }
 
@@ -108,6 +127,11 @@ impl Sdhci {
         unsafe { Self::new(base) }
     }
 
+    /// Return the mapped MMIO base address owned by this driver instance.
+    pub fn mmio_base(&self) -> usize {
+        self.base_addr
+    }
+
     /// Install a CRU-side clock callback so subsequent `set_clock` calls
     /// retune the platform's reference clock instead of using the SDHCI
     /// internal divider. The callback receives the desired SD bus
@@ -117,11 +141,53 @@ impl Sdhci {
     /// After installing the callback, the host runs in "external clock"
     /// mode: the SDHCI internal divider stays at 1:1, all rate control
     /// is delegated to the platform.
-    pub fn set_external_clock<C>(&mut self, clock: &'static C)
+    pub fn set_external_clock<C>(&mut self, clock: C)
     where
         C: HostClock + 'static,
     {
-        self.ext_clock = Some(clock);
+        self.ext_clock = Some(Box::new(clock));
+    }
+
+    /// Remove the platform clock callback once the caller no longer wants
+    /// the host to borrow the probe-time clock device.
+    pub fn clear_external_clock(&mut self) {
+        self.ext_clock = None;
+    }
+
+    /// Install a platform post-reset hook. The hook is called after ResetAll
+    /// clears, both for the legacy blocking reset helper and for the native
+    /// `sdio-host2` bus-operation state machine.
+    pub fn set_reset_hook<H>(&mut self, hook: H)
+    where
+        H: HostResetHook + 'static,
+    {
+        self.reset_hook = Some(Box::new(hook));
+    }
+
+    pub(crate) fn call_before_reset_all_hook(&mut self) -> Result<(), Error> {
+        let Some(hook) = self.reset_hook.take() else {
+            return Ok(());
+        };
+        let result = hook.before_reset_all(self);
+        self.reset_hook = Some(hook);
+        result
+    }
+
+    pub(crate) fn call_after_reset_hook(&mut self) -> Result<(), Error> {
+        let Some(hook) = self.reset_hook.take() else {
+            return Ok(());
+        };
+        let result = hook.after_reset(self);
+        self.reset_hook = Some(hook);
+        result
+    }
+
+    /// Install a platform monotonic timer in milliseconds.
+    pub fn set_timer<T>(&mut self, timer: &'static T)
+    where
+        T: HostTimer + 'static,
+    {
+        self.timer = Some(timer);
     }
 
     /// Declare that the platform can switch the SD/eMMC IO rail to 1.8 V.
@@ -138,18 +204,65 @@ impl Sdhci {
 
     /// Install a DMA capability used by the high-level data-transfer hooks.
     ///
-    /// Once installed, `SdioHost::submit_read_data` and
-    /// `SdioHost::submit_write_data` try ADMA2 first for 512-byte block I/O
-    /// and fall back to the FIFO state machine if ADMA2 cannot be used.
-    pub fn set_dma(&mut self, dma: DeviceDma) {
-        self.dma_mask = dma.dma_mask();
+    /// Once installed, data transactions use ADMA2 for compatible block I/O.
+    /// Requests are rejected when DMA is unavailable or violates the host
+    /// limits; the driver never falls back to PIO.
+    pub fn configure_dma(&mut self, dma: DeviceDma) -> Result<(), Error> {
+        if !matches!(self.command_state, CommandState::Idle) {
+            return Err(Error::UnsupportedCommand);
+        }
+        if !self.supports_adma2() {
+            return Err(Error::UnsupportedCommand);
+        }
+        let hardware_mask = if self.supports_64bit_system_addressing() {
+            dma.dma_mask()
+        } else {
+            dma.dma_mask().min(u32::MAX as u64)
+        };
+        let mut constraints = dma.constraints();
+        constraints.addr_mask = hardware_mask;
+        constraints.align = constraints.align.max(4);
+        let dma = dma.with_constraints(constraints);
+        let use_64bit = hardware_mask > u32::MAX as u64 && self.supports_64bit_system_addressing();
+        let table = Adma2DescriptorTable::allocate(&dma, use_64bit)?;
+        self.dma_mask = hardware_mask;
         self.dma = Some(dma);
+        self.adma2_table = Some(table);
+        Ok(())
+    }
+
+    /// Enable SDHCI v4 register semantics before configuring DMA.
+    ///
+    /// Platforms opt in explicitly, matching Linux's `sdhci_enable_v4_mode`;
+    /// capability bits alone do not change descriptor format.
+    pub fn enable_v4_mode(&mut self) -> Result<(), Error> {
+        if self.dma.is_some() || !matches!(self.command_state, CommandState::Idle) {
+            return Err(Error::UnsupportedCommand);
+        }
+        let mut control = self.read_u16(REG_HOST_CONTROL2);
+        control |= HOST_CTRL2_V4_MODE;
+        self.write_u16(REG_HOST_CONTROL2, control);
+        self.v4_mode = true;
+        Ok(())
+    }
+
+    pub(crate) fn check_not_poisoned(&self) -> Result<(), Error> {
+        if self.dma_poisoned {
+            Err(Error::BusError(ErrorContext::new(Phase::DataRead)))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn poison_dma(&mut self) {
+        self.dma_poisoned = true;
     }
 
     /// Reset the controller (CMD line + DAT line + state) by writing the
     /// "Reset All" bit and waiting for it to clear.
     pub fn reset_all(&mut self) -> Result<(), Error> {
         self.reset_with_mask(RESET_ALL, Phase::Init)
+            .inspect(|_| self.dma_poisoned = false)
     }
 
     /// Reset the CMD line state machine (clears any stuck CMD inhibit).
@@ -163,9 +276,15 @@ impl Sdhci {
     }
 
     fn reset_with_mask(&mut self, mask: u8, phase: Phase) -> Result<(), Error> {
+        if mask == RESET_ALL {
+            self.call_before_reset_all_hook()?;
+        }
         self.write_u8(REG_SOFTWARE_RESET, mask);
         for _ in 0..1000 {
             if self.read_u8(REG_SOFTWARE_RESET) & mask == 0 {
+                if mask == RESET_ALL {
+                    self.call_after_reset_hook()?;
+                }
                 return Ok(());
             }
             spin_loop();
@@ -215,24 +334,33 @@ impl Sdhci {
         Err(Error::Timeout(ErrorContext::new(Phase::Init)))
     }
 
-    /// Bypass the internal divider and trust the platform-supplied ref
-    /// clock to already be at the SD bus frequency.
+    /// Enable SD clock after the platform-supplied input clock has been set.
     ///
     /// Use this on controllers whose internal 10-bit divider is unusable
     /// (e.g. DWC MSHC variants, or cores that report `BaseClockFreq = 0`
     /// in Capabilities and require the SoC's CRU to do all the frequency
     /// scaling). In that mode the caller is expected to:
     ///
-    /// 1. Reprogram the SoC clock controller so the controller's input
-    ///    reference clock equals the desired SD bus frequency.
-    /// 2. Call `enable_clock_external()` to gate the SD clock on with a
-    ///    1:1 divider.
+    /// 1. Reprogram the SoC clock controller to a usable input clock.
+    /// 2. Call `enable_clock_external()` to gate the SD clock on, usually
+    ///    with a 1:1 divider. Platforms that quantize low rates can pass the
+    ///    actual input rate so the standard divider avoids broken encodings.
     ///
     /// If `target_hz` is 0 the SD clock is left disabled.
-    pub fn enable_clock_external(&mut self) -> Result<(), Error> {
-        // Disable, then re-enable with divider = 0 (== 1:1 passthrough).
+    pub fn enable_clock_external(
+        &mut self,
+        input_hz: u32,
+        target_hz: u32,
+        div_zero_broken: bool,
+    ) -> Result<(), Error> {
+        // Disable, then re-enable with the smallest SDHCI divider that does
+        // not exceed the requested bus clock.
         self.write_u16(REG_CLOCK_CONTROL, 0);
-        let clk_ctrl = CLOCK_INTERNAL_ENABLE; // div=0
+        if target_hz == 0 {
+            return Ok(());
+        }
+        let div = crate::sdhci_clock_divisor_with_quirk(input_hz, target_hz, div_zero_broken);
+        let clk_ctrl = ((div & 0xFF) << 8) | ((div & 0x300) >> 2) | CLOCK_INTERNAL_ENABLE;
         self.write_u16(REG_CLOCK_CONTROL, clk_ctrl);
         for _ in 0..1000 {
             if self.read_u16(REG_CLOCK_CONTROL) & CLOCK_INTERNAL_STABLE != 0 {
@@ -243,6 +371,35 @@ impl Sdhci {
             spin_loop();
         }
         Err(Error::Timeout(ErrorContext::new(Phase::Init)))
+    }
+
+    /// Enable SDHCI internal/card clock without programming a divided
+    /// SDCLK value. Rockchip DWCMSHC follows Linux's `sdhci_enable_clk(host,
+    /// 0)` path after SoC-side clocking and DLL registers have already been
+    /// configured; applying the generic divider again can underclock
+    /// identification mode and leave the command FSM stuck.
+    pub fn enable_clock_passthrough(&mut self, target_hz: u32) -> Result<(), Error> {
+        self.write_u16(REG_CLOCK_CONTROL, 0);
+        if target_hz == 0 {
+            return Ok(());
+        }
+        self.write_u16(REG_CLOCK_CONTROL, CLOCK_INTERNAL_ENABLE);
+        for _ in 0..1000 {
+            if self.read_u16(REG_CLOCK_CONTROL) & CLOCK_INTERNAL_STABLE != 0 {
+                let stable = self.read_u16(REG_CLOCK_CONTROL) | CLOCK_SD_ENABLE;
+                self.write_u16(REG_CLOCK_CONTROL, stable);
+                return Ok(());
+            }
+            spin_loop();
+        }
+        Err(Error::Timeout(ErrorContext::new(Phase::Init)))
+    }
+
+    pub(crate) fn start_passthrough_clock(&mut self, target_hz: u32) {
+        self.write_u16(REG_CLOCK_CONTROL, 0);
+        if target_hz != 0 {
+            self.write_u16(REG_CLOCK_CONTROL, CLOCK_INTERNAL_ENABLE);
+        }
     }
 
     /// Disable the SD clock without reprogramming the divider. Use this
@@ -258,13 +415,13 @@ impl Sdhci {
         self.write_u8(REG_POWER_CONTROL, power_byte | POWER_ON);
     }
 
-    /// Enable normal + error interrupt status flags so command/data
-    /// completion is observable via the status registers (signal-level
-    /// IRQ delivery is NOT enabled — the driver polls).
-    pub fn enable_interrupts(&mut self) {
+    /// Enable normal and error status capture without unmasking CPU IRQ delivery.
+    ///
+    /// Recovery uses this before restoring the runtime-owned signal mask so a
+    /// subsequent IRQ cannot arrive without a corresponding latched status.
+    pub(crate) fn enable_interrupt_status_capture(&mut self) {
         self.write_u16(REG_NORMAL_INT_STATUS_ENABLE, NORMAL_INT_CLEAR_ALL);
         self.write_u16(REG_ERROR_INT_STATUS_ENABLE, ERROR_INT_CLEAR_ALL);
-        // Don't route to host CPU IRQ — leave Signal Enable cleared.
         self.write_u16(REG_NORMAL_INT_SIGNAL_ENABLE, 0);
         self.write_u16(REG_ERROR_INT_SIGNAL_ENABLE, 0);
     }
@@ -312,20 +469,44 @@ impl Sdhci {
         self.read_u32(REG_CAPABILITIES_LOW) & CAPS_LOW_ADMA2_SUPPORTED != 0
     }
 
-    /// Program the ADMA system address registers with the bus address of
-    /// the descriptor table. 32-bit ADMA2 only; the high half is zeroed
-    /// because controllers that don't implement v4 64-bit addressing
-    /// alias the high register to RO-zero anyway.
-    pub(crate) fn write_adma_addr(&self, addr: u32) {
-        self.write_u32(REG_ADMA_SYS_ADDR_LOW, addr);
-        self.write_u32(REG_ADMA_SYS_ADDR_HIGH, 0);
+    pub fn supports_64bit_system_addressing(&self) -> bool {
+        let capabilities = self.read_u32(REG_CAPABILITIES_LOW);
+        if self.v4_mode {
+            capabilities & CAPS_LOW_64BIT_SYSBUS_V4 != 0
+        } else {
+            capabilities & CAPS_LOW_64BIT_SYSBUS_V3 != 0
+        }
     }
 
-    /// Pick 32-bit ADMA2 in HOST_CONTROL1's DMA select field.
-    pub(crate) fn select_adma2_32(&mut self) {
+    /// Program the ADMA system address registers with the bus address of
+    /// the descriptor table.
+    pub(crate) fn write_adma_addr(&self, addr: u64, use_64bit: bool) {
+        self.write_u32(REG_ADMA_SYS_ADDR_LOW, addr as u32);
+        self.write_u32(
+            REG_ADMA_SYS_ADDR_HIGH,
+            if use_64bit { (addr >> 32) as u32 } else { 0 },
+        );
+    }
+
+    pub(crate) fn select_adma2(&mut self, use_64bit: bool) {
         let mut ctrl = self.read_u8(REG_HOST_CONTROL1);
-        ctrl = (ctrl & !HOST_CTRL1_DMA_SEL_MASK) | HOST_CTRL1_DMA_SEL_ADMA2_32;
+        let selection = if use_64bit && !self.v4_mode {
+            HOST_CTRL1_DMA_SEL_ADMA2_64
+        } else {
+            HOST_CTRL1_DMA_SEL_ADMA2_32
+        };
+        ctrl = (ctrl & !HOST_CTRL1_DMA_SEL_MASK) | selection;
         self.write_u8(REG_HOST_CONTROL1, ctrl);
+
+        if self.v4_mode {
+            let mut ctrl2 = self.read_u16(REG_HOST_CONTROL2);
+            if use_64bit {
+                ctrl2 |= HOST_CTRL2_64BIT_ADDR;
+            } else {
+                ctrl2 &= !HOST_CTRL2_64BIT_ADDR;
+            }
+            self.write_u16(REG_HOST_CONTROL2, ctrl2);
+        }
     }
 
     /// Read raw 32-bit response slot.
@@ -364,8 +545,45 @@ impl Sdhci {
 /// OS glue implements this boundary and installs it with
 /// [`Sdhci::set_external_clock`]. The driver core only knows that the
 /// callback retunes the controller input clock to the requested SD bus rate.
-pub trait HostClock: Sync {
+pub trait HostClock: Send {
     fn set_clock(&self, target_hz: u32) -> Result<(), Error>;
+
+    /// Effective bus clock to request from the platform for a protocol speed.
+    ///
+    /// Platforms may quantize requested rates before the clock controller sees
+    /// them. RK35xx, for example, uses 375 kHz for identification mode.
+    fn effective_clock_hz(&self, target_hz: u32) -> u32 {
+        target_hz
+    }
+
+    /// Whether SDHCI divider encoding zero is unusable for this integration.
+    fn clock_div_zero_broken(&self) -> bool {
+        false
+    }
+
+    /// Configure host-controller side clock glue after the platform input
+    /// clock has been retuned and while SD clock output is still gated off.
+    ///
+    /// DWCMSHC-style integrations use this for vendor DLL/bypass registers.
+    /// Plain SDHCI hosts can rely on the default no-op implementation.
+    fn prepare_host_clock(&self, _host: &mut Sdhci, _target_hz: u32) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+/// Platform hook for SDHCI integrations that need vendor register setup after
+/// controller ResetAll has completed.
+pub trait HostResetHook: Send + Sync {
+    fn before_reset_all(&self, _host: &mut Sdhci) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn after_reset(&self, host: &mut Sdhci) -> Result<(), Error>;
+}
+
+/// Platform monotonic-time capability used for specification-defined delays.
+pub trait HostTimer: Sync {
+    fn now_ms(&self) -> u64;
 }
 
 #[inline]
@@ -374,23 +592,5 @@ fn spin_loop() {
 }
 
 #[cfg(test)]
-mod tests {
-    use core::ptr::NonNull;
-
-    use super::*;
-
-    #[test]
-    fn constructs_from_mapped_mmio_pointer() {
-        let base = NonNull::new(0x1000_0000 as *mut u8).unwrap();
-        let host = unsafe { Sdhci::new(base) };
-
-        assert_eq!(host.base_addr, 0x1000_0000);
-    }
-
-    #[test]
-    fn legacy_addr_constructor_keeps_raw_mmio_boundary_explicit() {
-        let host = unsafe { Sdhci::new_from_addr(0x1000_0000) };
-
-        assert_eq!(host.base_addr, 0x1000_0000);
-    }
-}
+#[path = "host_tests.rs"]
+mod tests;

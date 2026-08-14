@@ -27,7 +27,7 @@ sidebar_label: "Backtrace Host 符号化"
 ## 前置条件
 
 1. **Host 工具**：`PATH` 中可执行 `llvm-addr2line` 或 `addr2line`。
-2. **ELF**：与产生日志的那次构建一致（例如 `target/x86_64-unknown-none/release/arceos-backtrace-raw-normal`），且含 debug 信息（测例通常通过 `[env] DWARF=y` 等打开帧指针与调试构建）。
+2. **ELF**：与产生日志的那次构建一致（例如 `target/x86_64-unknown-none/release/arceos-test-suit`），且含 debug 信息（测例通常通过 `[env] DWARF=y` 等打开帧指针与调试构建）。
 3. **日志**：串口或 QEMU 输出中已包含 target 打印的 raw 块（例如 `Backtrace::capture().kind("raw")`、panic 路径的 `.kind("panic")`、trap 的 `.kind("trap")`）。
 
 ## 命令
@@ -89,28 +89,28 @@ BT 0 ip=0x... fp=0x... <function> (<file>:<line>)
 
 ### 1. 在 target 上产生 raw 日志
 
-示例：ArceOS Rust QEMU 测例 `backtrace-raw-normal`：
+示例：ArceOS Rust QEMU 测例 `debug-backtrace`：
 
 ```bash
 cargo xtask arceos test qemu \
   --arch x86_64 \
   --test-group rust \
-  --test-case backtrace-raw-normal \
+  --test-case debug-backtrace \
   2>&1 | tee /tmp/arceos-backtrace.log
 ```
 
-确认日志中有 `BACKTRACE_BEGIN`、`BT n ip=... fp=...`、`test pass` 等。
+确认日志中有 `BACKTRACE_BEGIN`、`BT n ip=... fp=...`、`ARCEOS_TEST_END feature=debug-backtrace ... status=pass` 等。
 
 ### 2. 在 host 上符号化
 
 ```bash
 cargo xtask backtrace symbolize \
-  --elf target/x86_64-unknown-none/release/arceos-backtrace-raw-normal \
+  --elf target/x86_64-unknown-none/release/arceos-test-suit \
   --log /tmp/arceos-backtrace.log \
-  --kind raw
+  --kind arceos-test-suit
 ```
 
-Panic 路径若使用 `kind=panic` 的 raw 块，将 `--kind` 改为 `panic`，并确保 `--elf` 与产生该日志的构建一致。
+Panic 路径若使用 `kind=panic` 的 raw 块，将 `--kind` 改为 `panic`，并确保 `--elf` 与产生该日志的构建一致。会故意 panic 或 trap 的 raw 专项用例不再放在 ArceOS Rust 全测入口中；当前全测入口只保留能返回并继续执行后续用例的 backtrace smoke。
 
 ## ArceOS QEMU 测试：跑完自动 symbolize
 
@@ -119,15 +119,17 @@ Panic 路径若使用 `kind=panic` 的 raw 块，将 `--kind` 改为 `panic`，�
 1. 将本次串口输出 tee 到 `.axbuild/tmp/qemu-logs/<case>-<target>.log`；
 2. 用同次构建的 ELF 调用 host `backtrace symbolize`，在终端打印 `=== host backtrace symbolize ===` 段。
 
-未启用上述 env 的用例（如 `fs/shell`、`exception`）**不会** tee、也不会自动 symbolize；与合并前行为一致。backtrace E2E（如 `backtrace-raw-normal` 的 `DWARF=y`）通常 **一条命令** 即可看到符号化栈。
+当前统一 Rust suite 的四个 `build-<target>.toml` 均启用了 `BACKTRACE=y`
+和 `DWARF=y`，因此 Rust QEMU 用例默认都会 tee 串口日志并尝试自动
+symbolize。backtrace smoke（如 `debug-backtrace`）通常 **一条命令** 即可看到符号化栈。
 
 关闭自动符号化：
 
 ```bash
-cargo xtask arceos test qemu --arch x86_64 --test-group rust --test-case backtrace-raw-normal --no-symbolize
+cargo xtask arceos test qemu --arch x86_64 --test-group rust --test-case debug-backtrace --no-symbolize
 ```
 
-用例名按 `-` / `/` 分段匹配 `raw`、`panic`、`trap`（例如 `backtrace-raw-normal` → `--kind raw`；避免 `draw` 等误匹配）。仍可用上文「手动两步」对任意保存的日志做 symbolize。
+仍可用上文「手动两步」对任意保存的日志做 symbolize。
 
 ## 验证
 
@@ -141,7 +143,7 @@ cargo test -p axbuild backtrace::
 
 ## 相关文档与 PR
 
-- Target 回溯组件：[`axbacktrace`](../components/crates/axbacktrace.md)
+- Target 回溯组件：`components/axbacktrace`
 - Panic 路径与 backtrace 门控：[Panic 递归保护](./panic-recursion-guards.md)
 - Tracking issue：[#146](https://github.com/rcore-os/tgoskits/issues/146)
 - Host symbolize PR：[#635](https://github.com/rcore-os/tgoskits/pull/635)

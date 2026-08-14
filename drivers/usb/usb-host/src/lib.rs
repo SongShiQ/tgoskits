@@ -1,4 +1,4 @@
-#![cfg_attr(target_os = "none", no_std)]
+#![cfg_attr(not(feature = "umod"), no_std)]
 extern crate alloc;
 #[macro_use]
 extern crate log;
@@ -22,7 +22,7 @@ pub use host::*;
 #[allow(unused_imports)]
 #[cfg(kmod)]
 pub use crate::backend::kmod::*;
-pub use crate::backend::ty::{Event, ep::Endpoint};
+pub use crate::backend::ty::{Event, ep::EndpointHandle};
 
 define_int_type!(BusAddr, u64);
 

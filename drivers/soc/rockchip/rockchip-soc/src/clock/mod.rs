@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+
 use crate::{Mmio, RstId, SocType};
 
 mod error;
@@ -13,12 +15,13 @@ impl From<u32> for ClkId {
     }
 }
 
-#[enum_dispatch::enum_dispatch]
-pub trait CruOp {
+pub trait ResetOp {
     fn reset_assert(&mut self, id: RstId);
 
     fn reset_deassert(&mut self, id: RstId);
+}
 
+pub trait ClockOp {
     /// 使能时钟
     ///
     /// 清除时钟门控 bit，使时钟输出到外设
@@ -92,9 +95,29 @@ pub trait CruOp {
     fn clk_set_rate(&mut self, id: crate::clock::ClkId, rate_hz: u64) -> ClockResult<u64>;
 }
 
-#[enum_dispatch::enum_dispatch(CruOp)]
+/// One provider-register write restriction needed for a host-owned clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClockMmioWriteProtection {
+    /// Reject every write overlapping this byte range.
+    Deny { offset: usize, length: usize },
+    /// Strip protected value and write-enable bits from a 32-bit masked write.
+    MaskedWrite32 {
+        offset: usize,
+        value_mask: u32,
+        write_enable_mask: u32,
+    },
+}
+
+/// Describes immutable provider-MMIO restrictions for an assigned device.
+pub trait ClockAssignmentProtection {
+    /// Returns the complete provider-register restrictions required to keep
+    /// `id` under host ownership.
+    fn assignment_mmio_write_protection(&self, id: ClkId) -> Option<Vec<ClockMmioWriteProtection>>;
+}
+
 pub enum Cru {
     Rk3568(crate::variants::rk3568::cru::Cru),
+    Rk3576(crate::variants::rk3576::cru::Cru),
     Rk3588(crate::variants::rk3588::cru::Cru),
 }
 
@@ -104,7 +127,78 @@ impl Cru {
     pub fn new(ty: SocType, base: Mmio, sys_grf: Mmio) -> Self {
         match ty {
             SocType::Rk3568 => Cru::Rk3568(crate::variants::rk3568::cru::Cru::new(base, sys_grf)),
+            SocType::Rk3576 => Cru::Rk3576(crate::variants::rk3576::cru::Cru::new(base, sys_grf)),
             SocType::Rk3588 => Cru::Rk3588(crate::variants::rk3588::cru::Cru::new(base, sys_grf)),
+        }
+    }
+}
+
+impl ResetOp for Cru {
+    fn reset_assert(&mut self, id: RstId) {
+        match self {
+            Self::Rk3568(cru) => cru.reset_assert(id),
+            Self::Rk3576(cru) => cru.reset_assert(id),
+            Self::Rk3588(cru) => cru.reset_assert(id),
+        }
+    }
+
+    fn reset_deassert(&mut self, id: RstId) {
+        match self {
+            Self::Rk3568(cru) => cru.reset_deassert(id),
+            Self::Rk3576(cru) => cru.reset_deassert(id),
+            Self::Rk3588(cru) => cru.reset_deassert(id),
+        }
+    }
+}
+
+impl ClockOp for Cru {
+    fn clk_enable(&mut self, id: ClkId) -> ClockResult<()> {
+        match self {
+            Self::Rk3568(cru) => cru.clk_enable(id),
+            Self::Rk3576(cru) => cru.clk_enable(id),
+            Self::Rk3588(cru) => cru.clk_enable(id),
+        }
+    }
+
+    fn clk_disable(&mut self, id: ClkId) -> ClockResult<()> {
+        match self {
+            Self::Rk3568(cru) => cru.clk_disable(id),
+            Self::Rk3576(cru) => cru.clk_disable(id),
+            Self::Rk3588(cru) => cru.clk_disable(id),
+        }
+    }
+
+    fn clk_is_enabled(&self, id: ClkId) -> ClockResult<bool> {
+        match self {
+            Self::Rk3568(cru) => cru.clk_is_enabled(id),
+            Self::Rk3576(cru) => cru.clk_is_enabled(id),
+            Self::Rk3588(cru) => cru.clk_is_enabled(id),
+        }
+    }
+
+    fn clk_get_rate(&self, id: ClkId) -> ClockResult<u64> {
+        match self {
+            Self::Rk3568(cru) => cru.clk_get_rate(id),
+            Self::Rk3576(cru) => cru.clk_get_rate(id),
+            Self::Rk3588(cru) => cru.clk_get_rate(id),
+        }
+    }
+
+    fn clk_set_rate(&mut self, id: ClkId, rate_hz: u64) -> ClockResult<u64> {
+        match self {
+            Self::Rk3568(cru) => cru.clk_set_rate(id, rate_hz),
+            Self::Rk3576(cru) => cru.clk_set_rate(id, rate_hz),
+            Self::Rk3588(cru) => cru.clk_set_rate(id, rate_hz),
+        }
+    }
+}
+
+impl ClockAssignmentProtection for Cru {
+    fn assignment_mmio_write_protection(&self, id: ClkId) -> Option<Vec<ClockMmioWriteProtection>> {
+        match self {
+            Self::Rk3568(cru) => cru.assignment_mmio_write_protection(id),
+            Self::Rk3576(cru) => cru.assignment_mmio_write_protection(id),
+            Self::Rk3588(cru) => cru.assignment_mmio_write_protection(id),
         }
     }
 }

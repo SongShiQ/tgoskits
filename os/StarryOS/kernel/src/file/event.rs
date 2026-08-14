@@ -33,6 +33,13 @@ impl EventFd {
 }
 
 impl FileLike for EventFd {
+    fn validate_write_len(&self, len: usize) -> ax_io::Result {
+        if len != size_of::<u64>() {
+            return Err(AxError::InvalidInput);
+        }
+        Ok(())
+    }
+
     fn read(&self, dst: &mut IoDst) -> ax_io::Result<usize> {
         if dst.remaining_mut() < size_of::<u64>() {
             return Err(AxError::InvalidInput);
@@ -41,7 +48,7 @@ impl FileLike for EventFd {
         block_on(poll_io(self, IoEvents::IN, self.nonblocking(), || {
             let result = self
                 .count
-                .fetch_update(Ordering::Release, Ordering::Acquire, |count| {
+                .try_update(Ordering::Release, Ordering::Acquire, |count| {
                     if count > 0 {
                         let dec = if self.semaphore { 1 } else { count };
                         Some(count - dec)
@@ -53,7 +60,8 @@ impl FileLike for EventFd {
                 Ok(count) => {
                     let value = if self.semaphore { 1 } else { count };
                     dst.write(&value.to_ne_bytes())?;
-                    self.poll_tx.wake();
+                    // Counter space is visible before waking writers.
+                    unsafe { self.poll_tx.wake(IoEvents::OUT) };
                     Ok(size_of::<u64>())
                 }
                 Err(_) => Err(AxError::WouldBlock),
@@ -62,7 +70,7 @@ impl FileLike for EventFd {
     }
 
     fn write(&self, src: &mut IoSrc) -> ax_io::Result<usize> {
-        if src.remaining() != size_of::<u64>() {
+        if src.remaining() < size_of::<u64>() {
             return Err(AxError::InvalidInput);
         }
 
@@ -76,7 +84,7 @@ impl FileLike for EventFd {
         block_on(poll_io(self, IoEvents::OUT, self.nonblocking(), || {
             let result = self
                 .count
-                .fetch_update(Ordering::Release, Ordering::Acquire, |count| {
+                .try_update(Ordering::Release, Ordering::Acquire, |count| {
                     if u64::MAX - count > value {
                         Some(count + value)
                     } else {
@@ -85,7 +93,8 @@ impl FileLike for EventFd {
                 });
             match result {
                 Ok(_) => {
-                    self.poll_rx.wake();
+                    // Counter increment is visible before waking readers.
+                    unsafe { self.poll_rx.wake(IoEvents::IN) };
                     Ok(size_of::<u64>())
                 }
                 Err(_) => Err(AxError::WouldBlock),
@@ -118,10 +127,12 @@ impl Pollable for EventFd {
 
     fn register(&self, context: &mut Context<'_>, events: IoEvents) {
         if events.contains(IoEvents::IN) {
-            self.poll_rx.register(context.waker());
+            // Registration happens from file poll task context.
+            unsafe { self.poll_rx.register(context.waker(), IoEvents::IN) };
         }
         if events.contains(IoEvents::OUT) {
-            self.poll_tx.register(context.waker());
+            // Registration happens from file poll task context.
+            unsafe { self.poll_tx.register(context.waker(), IoEvents::OUT) };
         }
     }
 }

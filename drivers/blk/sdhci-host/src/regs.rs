@@ -46,6 +46,8 @@ pub(crate) const PRESENT_DAT_INHIBIT: u32 = 1 << 1;
 pub(crate) const PRESENT_BUFFER_WRITE_ENABLE: u32 = 1 << 10;
 pub(crate) const PRESENT_BUFFER_READ_ENABLE: u32 = 1 << 11;
 pub(crate) const PRESENT_CARD_INSERTED: u32 = 1 << 16;
+pub(crate) const PRESENT_DAT0_LINE_SIGNAL_LEVEL: u32 = 1 << 20;
+pub(crate) const PRESENT_DAT_3_0_LINE_SIGNAL_LEVEL: u32 = 0x0F << 20;
 
 // ── Software Reset ─────────────────────────────────────────────────────
 
@@ -104,6 +106,7 @@ pub(crate) const HOST_CTRL1_DMA_SEL_ADMA2_64: u8 = 0b11 << 3;
 // ── Capabilities ───────────────────────────────────────────────────────
 
 pub(crate) const CAPS_LOW_ADMA2_SUPPORTED: u32 = 1 << 19;
+pub(crate) const CAPS_LOW_64BIT_SYSBUS_V4: u32 = 1 << 27;
 pub(crate) const CAPS_LOW_64BIT_SYSBUS_V3: u32 = 1 << 28;
 
 // ── Power Control ──────────────────────────────────────────────────────
@@ -141,6 +144,8 @@ pub(crate) const HOST_CTRL2_EXECUTE_TUNING: u16 = 1 << 6;
 /// Sampling Clock Select — controller-set after tuning. 1 = tuning
 /// produced a stable phase, 0 = no stable phase / tuning failed.
 pub(crate) const HOST_CTRL2_SAMPLING_CLOCK_SELECT: u16 = 1 << 7;
+pub(crate) const HOST_CTRL2_V4_MODE: u16 = 1 << 12;
+pub(crate) const HOST_CTRL2_64BIT_ADDR: u16 = 1 << 13;
 
 // ── Transfer Mode ──────────────────────────────────────────────────────
 

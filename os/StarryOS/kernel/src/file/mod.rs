@@ -1,43 +1,99 @@
+// Shared contiguous dma-buf primitive + resolver used by every accelerator that
+// exchanges buffers (JPU / NPU / RGA).
+#[cfg(any(feature = "jpeg", feature = "rknpu", feature = "rga"))]
+pub mod dmabuf;
 pub mod epoll;
+#[cfg(axtest)]
+mod epoll_axtest;
+mod epoll_file;
+mod epoll_topology;
 pub mod event;
 mod fs;
+pub mod inotify;
+pub mod io_uring;
 #[cfg(feature = "sg2002")]
 pub mod ion;
 pub mod memfd;
+mod mount_table;
 mod net;
 pub mod netlink;
+mod nsfd;
 mod packet;
 mod pidfd;
 mod pipe;
 pub mod signalfd;
 pub mod timerfd;
+mod wext;
 
 use alloc::{borrow::Cow, sync::Arc};
 use core::{ffi::c_int, time::Duration};
 
 use ax_errno::{AxError, AxResult};
-use ax_fs::{FS_CONTEXT, FileBackend, FileFlags, OpenOptions};
+use ax_fs_ng::vfs::{FileBackend, FileFlags, OpenOptions};
 use ax_io::prelude::*;
-use ax_task::current;
+use ax_task::{TaskState, current};
 use axfs_ng_vfs::DeviceId;
 use axpoll::Pollable;
 use downcast_rs::{DowncastSync, impl_downcast};
 use flatten_objects::FlattenObjects;
 use linux_raw_sys::general::{
-    O_RDONLY, O_WRONLY, RLIMIT_NOFILE, STATX_BASIC_STATS, stat, statx, statx_timestamp,
+    O_ACCMODE, O_PATH, O_RDONLY, O_RDWR, O_WRONLY, RLIMIT_NOFILE, STATX_BASIC_STATS, stat, statx,
+    statx_timestamp,
 };
-use spin::RwLock;
+use starry_process::Pid;
 
+#[cfg(axtest)]
+pub(crate) use self::epoll::epoll_event_matching_rules_hold_for_test;
+#[cfg(axtest)]
+pub(crate) use self::epoll::epoll_hup_does_not_synthesize_readable_for_test;
+#[cfg(axtest)]
+pub(crate) use self::epoll_axtest::{
+    concurrent_reverse_add_is_serialized_for_test, edge_callback_does_not_reenter_target_for_test,
+    edge_readiness_requires_a_new_notification_for_test,
+    level_aliases_rotate_in_linux_callback_order_for_test,
+};
+#[cfg(axtest)]
+pub(crate) use self::epoll_topology::epoll_arc_operations_hold_for_test;
+#[cfg(axtest)]
+pub(crate) use self::epoll_topology::epoll_edge_id_and_constants_hold_for_test;
+#[cfg(axtest)]
+pub(crate) use self::epoll_topology::epoll_edge_id_clone_copy_partial_eq_hold_for_test;
+#[cfg(axtest)]
+pub(crate) use self::epoll_topology::epoll_topology_direction_and_scan_hold_for_test;
+#[cfg(axtest)]
+pub(crate) use self::epoll_topology::epoll_topology_link_clone_hold_for_test;
+#[cfg(axtest)]
+pub(crate) use self::epoll_topology::epoll_topology_static_constants_hold_for_test;
+#[cfg(axtest)]
+pub(crate) use self::epoll_topology::epoll_topology_struct_and_methods_hold_for_test;
+#[cfg(axtest)]
+pub(crate) use self::epoll_topology::epoll_topology_vec_and_reserve_hold_for_test;
+#[cfg(axtest)]
+pub(crate) use self::epoll_topology::push_topology_item_preserves_order_and_grows_capacity;
+#[cfg(axtest)]
+pub(crate) use self::fs::metadata_to_kstat_conversion_rules_hold_for_test;
+pub(crate) use self::mount_table::{MountTableFile, notify_mount_namespace_changed};
+#[cfg(axtest)]
+pub(crate) use self::pipe::{
+    interrupted_pipe_write_preserves_partial_progress_for_test,
+    peer_close_with_multiple_readers_is_visible_for_test, pipe_linux_io_semantics_hold_for_test,
+    pipe_resize_rounding_and_state_rules_hold_for_test, resize_rejects_oversized_pipe_for_test,
+};
+#[cfg(axtest)]
+pub(crate) use self::wext::is_wext_ioctl_validation_rules_hold_for_test;
 pub use self::{
-    fs::{Directory, File, resolve_at, with_fs},
+    fs::{Directory, File, ResolveAtResult, resolve_at, with_fs},
+    io_uring::IoUring,
     net::Socket,
+    nsfd::NsFd,
     packet::{PacketSocket, SockAddrLl},
     pidfd::PidFd,
     pipe::Pipe,
 };
 use crate::{
     pseudofs::DeviceMmap,
-    task::{AX_FILE_LIMIT, AsThread},
+    sync::RwLock,
+    task::{AX_FILE_LIMIT, AsThread, tasks},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -150,6 +206,15 @@ pub type IoSrc<'a> = dyn ReadBuf + 'a;
 
 #[allow(dead_code)]
 pub trait FileLike: Pollable + DowncastSync {
+    /// Validate a scalar write length before importing the user buffer.
+    ///
+    /// File types with count errors that take precedence over `EFAULT` can
+    /// override this hook. The full write operation must repeat any invariant
+    /// needed to remain correct for non-scalar callers.
+    fn validate_write_len(&self, _len: usize) -> AxResult {
+        Ok(())
+    }
+
     fn read(&self, _dst: &mut IoDst) -> AxResult<usize> {
         Err(AxError::InvalidInput)
     }
@@ -172,7 +237,7 @@ pub trait FileLike: Pollable + DowncastSync {
         Err(AxError::NoSuchDevice)
     }
 
-    fn device_mmap(&self, _offset: u64) -> AxResult<DeviceMmap> {
+    fn device_mmap(&self, _offset: u64, _length: u64) -> AxResult<DeviceMmap> {
         Err(AxError::BadFileDescriptor)
     }
 
@@ -190,6 +255,26 @@ pub trait FileLike: Pollable + DowncastSync {
 
     fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
         Ok(())
+    }
+
+    fn async_mode(&self) -> bool {
+        false
+    }
+
+    fn supports_async_mode(&self) -> bool {
+        false
+    }
+
+    fn set_async_mode(&self, _async_mode: bool) -> AxResult {
+        Err(AxError::NotATty)
+    }
+
+    fn owner(&self) -> AxResult<i32> {
+        Err(AxError::NotATty)
+    }
+
+    fn set_owner(&self, _owner: i32) -> AxResult {
+        Err(AxError::NotATty)
     }
 
     /// (device, inode) identity used as the key for advisory file locks
@@ -210,6 +295,16 @@ pub trait FileLike: Pollable + DowncastSync {
     fn set_append(&self, _append: bool) -> AxResult {
         Ok(())
     }
+
+    /// Per-close hook, invoked with the closing task's tgid whenever a file
+    /// descriptor referring to this object is dropped from an fd table -
+    /// explicit `close`, `close_range`, `dup2`/`dup3` replacement, exec
+    /// CLOEXEC, or process exit. This mirrors Linux `f_op->flush`
+    /// (`filp_flush`, fs/open.c:1470), which runs on every fd-closing path
+    /// rather than only on the last reference. The default is a no-op; POSIX
+    /// message-queue descriptors override it to drop a matching `mq_notify`
+    /// registration (`mqueue_flush_file`, ipc/mqueue.c:658).
+    fn on_close(&self, _owner: Pid) {}
 
     fn from_fd(fd: c_int) -> AxResult<Arc<Self>>
     where
@@ -240,19 +335,40 @@ scope_local::scope_local! {
     pub static FD_TABLE: Arc<RwLock<FlattenObjects<FileDescriptor, AX_FILE_LIMIT>>> = Arc::default();
 }
 
+/// Returns an owned reference to the file table of the active scope.
+///
+/// The CPU pin is released after cloning the `Arc`, before callers acquire the
+/// table lock or run descriptor destructors.
+pub fn current_fd_table() -> Arc<RwLock<FlattenObjects<FileDescriptor, AX_FILE_LIMIT>>> {
+    FD_TABLE.clone_current()
+}
+
 /// Get a file-like object by `fd`.
 pub fn get_file_like(fd: c_int) -> AxResult<Arc<dyn FileLike>> {
-    FD_TABLE
+    current_fd_table()
         .read()
         .get(fd as usize)
         .map(|fd| fd.inner.clone())
         .ok_or(AxError::BadFileDescriptor)
 }
 
+/// Returns true iff `fd` was opened with `O_PATH`.
+///
+/// Used by syscalls that man explicitly forbids on PATH file descriptors
+/// (fchmod / fchown / fsetxattr / ioctl / mmap / fallocate / ...). Per
+/// man 2 open §"O_PATH": "other file operations ... fail with the error
+/// EBADF."
+pub fn fd_is_path(fd: c_int) -> bool {
+    get_file_like(fd)
+        .map(|f| f.open_flags() & O_PATH != 0)
+        .unwrap_or(false)
+}
+
 /// Add a file to the file descriptor table.
 pub fn add_file_like(f: Arc<dyn FileLike>, cloexec: bool) -> AxResult<c_int> {
     let max_nofile = current().as_thread().proc_data.rlim.read()[RLIMIT_NOFILE].current;
-    let mut table = FD_TABLE.write();
+    let fd_table = current_fd_table();
+    let mut table = fd_table.write();
     if table.count() as u64 >= max_nofile {
         return Err(AxError::TooManyOpenFiles);
     }
@@ -262,13 +378,45 @@ pub fn add_file_like(f: Arc<dyn FileLike>, cloexec: bool) -> AxResult<c_int> {
 
 /// Close a file by `fd`.
 pub fn close_file_like(fd: c_int) -> AxResult {
-    let f = FD_TABLE
-        .write()
-        .remove(fd as usize)
-        .ok_or(AxError::BadFileDescriptor)?;
-    debug!("close_file_like <= count: {}", Arc::strong_count(&f.inner));
-    release_locks_on_close(f);
-    Ok(())
+    let removed = current_fd_table().write().remove(fd as usize);
+    if let Some(f) = removed {
+        debug!("close_file_like <= count: {}", Arc::strong_count(&f.inner));
+        release_locks_on_close(f);
+        return Ok(());
+    }
+    Err(AxError::BadFileDescriptor)
+}
+
+pub(crate) fn fd_tables_contain_file(file: &Arc<dyn FileLike>) -> bool {
+    !fd_table_file_refs(file).is_empty()
+}
+
+pub(crate) fn fd_table_file_refs(file: &Arc<dyn FileLike>) -> alloc::vec::Vec<(Pid, usize)> {
+    let mut refs = alloc::vec::Vec::new();
+    for task in tasks() {
+        if task.state() == TaskState::Exited {
+            continue;
+        }
+        let thread = task.as_thread();
+        let pid = thread.proc_data.proc.pid();
+        let scope = thread.scope.read();
+        let scoped_fd_table = FD_TABLE.scope(&scope);
+        let table = scoped_fd_table.read();
+        for id in table.ids() {
+            if table.get(id).is_some_and(|fd| Arc::ptr_eq(&fd.inner, file)) {
+                refs.push((pid, id));
+            }
+        }
+    }
+    refs
+}
+
+fn notify_close_write(fd: &FileDescriptor) {
+    let access = fd.inner.open_flags() & O_ACCMODE;
+    if (access == O_WRONLY || access == O_RDWR) && fd.inner.is::<File>() {
+        let path = fd.inner.path();
+        inotify::notify_close_write_path(path.as_ref());
+    }
 }
 
 /// Close-time advisory-lock cleanup (the kernel side of POSIX
@@ -288,9 +436,19 @@ pub fn close_file_like(fd: c_int) -> AxResult {
 /// `Weak` still alive, and sleep forever.
 pub fn release_locks_on_close(fd: FileDescriptor) {
     let key = fd.inner.inode_key();
+    // Linux `filp_flush` runs `f_op->flush` on every fd-closing path (explicit
+    // close, close_range, dup2/dup3 replacement, exec CLOEXEC, process exit),
+    // all of which funnel through here. This is where an mq descriptor drops a
+    // matching `mq_notify` registration (`mqueue_flush_file`).
+    fd.inner
+        .on_close(current().as_thread().proc_data.proc.pid());
+    notify_close_write(&fd);
     if let Some(k) = key {
         let pid = current().as_thread().proc_data.proc.pid();
         crate::syscall::release_inode_posix_locks(pid, k);
+        if !fd_tables_contain_file(&fd.inner) {
+            crate::syscall::release_flock_lock(k, &fd.inner);
+        }
     }
     drop(fd);
     if let Some(k) = key {
@@ -299,11 +457,12 @@ pub fn release_locks_on_close(fd: FileDescriptor) {
     }
 }
 
-/// Close all open file descriptors for the current process.
+/// Close all descriptors in the current thread's fd table when it is the last
+/// table sharer.
 ///
-/// This must be called when a process exits, so that pipe write ends and other
-/// resources are properly released. Without this, parent processes blocking on
-/// pipe reads will never receive EOF.
+/// This must be called whenever a thread exits because `unshare(CLONE_FILES)`
+/// can give one thread a private table. Shared tables are left intact until the
+/// final thread or process using them exits.
 pub fn close_all_fds() {
     // Acquire the write lock before checking strong_count. The clone(CLONE_FILES)
     // path in syscall/task/clone.rs also acquires FD_TABLE.read() before cloning
@@ -312,12 +471,14 @@ pub fn close_all_fds() {
     //   until we release, so strong_count cannot change during our check.
     // - If clone holds the read lock first, we block on write lock, and by the
     //   time we proceed strong_count already reflects the clone.
-    let mut table = FD_TABLE.write();
+    let fd_table = current_fd_table();
+    let mut table = fd_table.write();
 
     // CLONE_FILES may share the same fd table across multiple tasks/processes.
     // In that case, an exiting sharer must not clear the whole table, or other
     // live sharers (including the parent) will lose stdout/stderr unexpectedly.
-    if Arc::strong_count(&FD_TABLE) > 1 {
+    // One reference belongs to the scope slot and one is this owned snapshot.
+    if Arc::strong_count(&fd_table) > 2 {
         return;
     }
 
@@ -331,29 +492,15 @@ pub fn close_all_fds() {
     }
     drop(table);
 
-    // Snapshot inode keys before drop so we can wake F_SETLKW waiters
-    // afterwards: the Arc drops here may release OFD locks (their owner
-    // weak-refs go dead), and a parked waiter has no other way to learn
-    // about it. POSIX locks owned by this pid are released separately by
-    // `release_pid_locks`, which already wakes; the inode-key dedup
-    // means the per-inode wake is at most O(fds) and harmless when
-    // double-fired.
-    let lock_keys: alloc::vec::Vec<(u64, u64)> = removed
-        .iter()
-        .filter_map(|fd| fd.inner.inode_key())
-        .collect();
-    // Drop removed descriptors after releasing FD_TABLE lock to avoid
-    // lock re-entry or side effects from destructor paths.
-    drop(removed);
-    for key in lock_keys {
-        crate::syscall::wake_lock_waiters(key);
-        crate::syscall::wake_flock_waiters(key);
+    for fd in removed {
+        release_locks_on_close(fd);
     }
 }
 
 pub fn add_stdio(fd_table: &mut FlattenObjects<FileDescriptor, AX_FILE_LIMIT>) -> AxResult<()> {
     assert_eq!(fd_table.count(), 0);
-    let cx = FS_CONTEXT.lock();
+    let fs_context = ax_fs_ng::vfs::current_fs_context();
+    let cx = fs_context.lock();
     let open = |options: &mut OpenOptions, flags| {
         AxResult::Ok(Arc::new(File::new(
             options.open(&cx, "/dev/console")?.into_file()?,

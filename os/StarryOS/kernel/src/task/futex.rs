@@ -17,7 +17,6 @@ use core::{
 
 use ax_errno::AxResult;
 use ax_memory_addr::VirtAddr;
-use ax_sync::Mutex;
 use ax_task::{
     current,
     future::{self, block_on, interruptible},
@@ -26,8 +25,11 @@ use hashbrown::HashMap;
 
 use crate::{
     mm::{AddrSpace, Backend, SharedPages},
-    task::AsThread,
+    sync::{LockdepMutexExt, Mutex},
+    task::{AsThread, ProcessData},
 };
+
+const NESTED_WAIT_QUEUE_LOCK_SUBCLASS: u32 = 1;
 
 /// Wait queue used by futex.
 #[derive(Default)]
@@ -195,32 +197,82 @@ impl WaitQueue {
         )))??
     }
 
+    fn wake_locked(queue: &mut VecDeque<Waiter>, count: usize, mask: u32, wakers: &mut Vec<Waker>) {
+        let base = wakers.len();
+        queue.retain(|waiter| {
+            if waiter.state.cancelled.load(AtomicOrdering::SeqCst) {
+                false
+            } else if wakers.len() - base >= count || (waiter.bitset & mask) == 0 {
+                true
+            } else {
+                waiter.state.woken.store(true, AtomicOrdering::SeqCst);
+                wakers.push(waiter.waker.clone());
+                false
+            }
+        });
+    }
+
     /// Wakes up at most `count` tasks whose bitset intersects with the given
     /// bitmask.
     pub fn wake(&self, count: usize, mask: u32) -> usize {
-        let wakers = {
+        let mut wakers = Vec::new();
+        {
             let mut inner = self.inner.lock();
-            let mut wakers = Vec::new();
-
-            inner.queue.retain(|waiter| {
-                if waiter.state.cancelled.load(AtomicOrdering::SeqCst) {
-                    false
-                } else if wakers.len() >= count || (waiter.bitset & mask) == 0 {
-                    true
-                } else {
-                    waiter.state.woken.store(true, AtomicOrdering::SeqCst);
-                    wakers.push(waiter.waker.clone());
-                    false
-                }
-            });
-            wakers
-        };
+            Self::wake_locked(&mut inner.queue, count, mask, &mut wakers);
+        }
 
         let woke = wakers.len();
         for waker in wakers {
             waker.wake();
         }
         woke
+    }
+
+    /// Serializes a FUTEX_WAKE_OP user RMW with both futex wait queues.
+    pub fn wake_op(
+        &self,
+        wake_count: usize,
+        target: &WaitQueue,
+        wake2_count: usize,
+        condition: impl FnOnce() -> AxResult<bool>,
+    ) -> AxResult<usize> {
+        let mut condition = Some(condition);
+        let mut wakers = Vec::new();
+
+        match core::ptr::from_ref(self).cmp(&core::ptr::from_ref(target)) {
+            Ordering::Less => {
+                let mut src = self.inner.lock();
+                let mut dst = target.inner.lock_nested(NESTED_WAIT_QUEUE_LOCK_SUBCLASS);
+                let wake_second = condition.take().expect("condition used once")()?;
+                Self::wake_locked(&mut src.queue, wake_count, u32::MAX, &mut wakers);
+                if wake_second {
+                    Self::wake_locked(&mut dst.queue, wake2_count, u32::MAX, &mut wakers);
+                }
+            }
+            Ordering::Greater => {
+                let mut dst = target.inner.lock();
+                let mut src = self.inner.lock_nested(NESTED_WAIT_QUEUE_LOCK_SUBCLASS);
+                let wake_second = condition.take().expect("condition used once")()?;
+                Self::wake_locked(&mut src.queue, wake_count, u32::MAX, &mut wakers);
+                if wake_second {
+                    Self::wake_locked(&mut dst.queue, wake2_count, u32::MAX, &mut wakers);
+                }
+            }
+            Ordering::Equal => {
+                let mut src = self.inner.lock();
+                let wake_second = condition.take().expect("condition used once")()?;
+                Self::wake_locked(&mut src.queue, wake_count, u32::MAX, &mut wakers);
+                if wake_second {
+                    Self::wake_locked(&mut src.queue, wake2_count, u32::MAX, &mut wakers);
+                }
+            }
+        }
+
+        let woke = wakers.len();
+        for waker in wakers {
+            waker.wake();
+        }
+        Ok(woke)
     }
 
     fn wake_requeue_locked(
@@ -280,7 +332,7 @@ impl WaitQueue {
         let count = match core::ptr::from_ref(self).cmp(&core::ptr::from_ref(target)) {
             Ordering::Less => {
                 let mut src = self.inner.lock();
-                let mut dst = target.inner.lock();
+                let mut dst = target.inner.lock_nested(NESTED_WAIT_QUEUE_LOCK_SUBCLASS);
                 if !condition.take().expect("condition used once")()? {
                     return Ok(None);
                 }
@@ -296,7 +348,7 @@ impl WaitQueue {
             }
             Ordering::Greater => {
                 let mut dst = target.inner.lock();
-                let mut src = self.inner.lock();
+                let mut src = self.inner.lock_nested(NESTED_WAIT_QUEUE_LOCK_SUBCLASS);
                 if !condition.take().expect("condition used once")()? {
                     return Ok(None);
                 }
@@ -348,12 +400,16 @@ impl WaitQueue {
     }
 
     /// Checks if the wait queue is empty.
+    ///
+    /// O(1): reads the queue length only. This is called from `FutexGuard::Drop`
+    /// while holding the (per-process) futex-table lock on EVERY futex op, so it must
+    /// not scan — a prior `queue.retain(cancelled)` here made it O(n) under the table
+    /// lock, i.e. an O(N²) collapse of contended futex throughput (schbench's tail).
+    /// Cancelled waiters are already pruned by `wake` (its retain) and by each waiter's
+    /// own `WaitIfFuture::Drop`, so dropping the scan here only delays a benign
+    /// table-entry cleanup (also swept by the periodic `FutexTables` GC), never leaks.
     pub fn is_empty(&self) -> bool {
-        let mut inner = self.inner.lock();
-        inner
-            .queue
-            .retain(|waiter| !waiter.state.cancelled.load(AtomicOrdering::SeqCst));
-        inner.queue.is_empty()
+        self.inner.lock().queue.is_empty()
     }
 }
 
@@ -409,18 +465,27 @@ impl FutexKey {
     }
 
     /// Shortcut to create a `FutexKey` for the current task's address space.
+    ///
+    /// Private futex keys do not need the VMA walk — they resolve to the
+    /// process‑local futex table regardless of the backing VMA.  Skipping
+    /// the aspace lock for `Private` avoids contention with the mmap/munmap
+    /// paths that also hold the aspace lock across long page-table operations,
+    /// which could otherwise deadlock with concurrent CLONE_THREAD futex
+    /// wait/wake pairs.
     pub fn new_current(address: usize, mode: FutexKeyMode) -> Self {
+        if matches!(mode, FutexKeyMode::Private) {
+            return Self::Private { address };
+        }
         let curr = current();
         let aspace_arc = curr.as_thread().proc_data.aspace();
         let aspace = aspace_arc.lock();
         Self::new(&aspace, address, mode)
     }
 
-    /// Best-effort variant for teardown paths that may be reached after a
-    /// faultable user-memory access.
-    pub fn new_current_teardown(address: usize) -> Self {
-        let curr = current();
-        let aspace_arc = curr.as_thread().proc_data.aspace();
+    /// Teardown variant that is anchored to the exiting process instead of
+    /// whatever scheduler task is currently running on this CPU.
+    pub fn new_for_process_teardown(proc_data: &ProcessData, address: usize) -> Self {
+        let aspace_arc = proc_data.aspace();
         let Some(aspace) = aspace_arc.try_lock() else {
             return Self::Private { address };
         };
@@ -450,24 +515,43 @@ impl FutexEntry {
 }
 
 /// A table mapping memory addresses to futex wait queues.
-pub struct FutexTable(Mutex<HashMap<usize, Arc<FutexEntry>>>);
+/// Number of lock shards in a per-process futex table. Mirrors Linux's
+/// `futex_hash_bucket` array: futex ops on distinct addresses fall into distinct
+/// buckets, so contended-futex throughput scales toward `ncpu` instead of
+/// serializing all threads on one process-wide table lock.
+const FUTEX_SHARDS: usize = 64;
+
+pub struct FutexTable {
+    buckets: [Mutex<HashMap<usize, Arc<FutexEntry>>>; FUTEX_SHARDS],
+}
 
 impl FutexTable {
     /// Creates a new `FutexTable`.
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        Self(Mutex::new(HashMap::new()))
+        Self {
+            buckets: core::array::from_fn(|_| Mutex::new(HashMap::new())),
+        }
     }
 
-    /// Checks if the futex table is empty.
+    /// Selects the shard for a futex key via a Fibonacci hash (top bits after a
+    /// multiplicative mix) so 4-byte-aligned user addresses spread evenly.
+    #[inline]
+    fn bucket(&self, key: usize) -> &Mutex<HashMap<usize, Arc<FutexEntry>>> {
+        let h = (key as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        &self.buckets[(h >> (64 - 6)) as usize % FUTEX_SHARDS]
+    }
+
+    /// Checks if the futex table is empty (all shards). Only called by the
+    /// periodic table GC, not the hot path.
     pub fn is_empty(&self) -> bool {
-        self.0.lock().is_empty()
+        self.buckets.iter().all(|b| b.lock().is_empty())
     }
 
     /// Gets the wait queue associated with the given address.
     pub fn get(&self, key: &FutexKey) -> Option<FutexGuard<'_>> {
         let key = key.as_usize();
-        let entry = self.0.lock().get(&key).cloned()?;
+        let entry = self.bucket(key).lock().get(&key).cloned()?;
         Some(FutexGuard {
             table: self,
             key,
@@ -479,8 +563,8 @@ impl FutexTable {
     /// new one if it doesn't exist.
     pub fn get_or_insert(&self, key: &FutexKey) -> FutexGuard<'_> {
         let key = key.as_usize();
-        let mut table = self.0.lock();
-        let entry = table
+        let mut bucket = self.bucket(key).lock();
+        let entry = bucket
             .entry(key)
             .or_insert_with(|| Arc::new(FutexEntry::new()));
         FutexGuard {
@@ -499,14 +583,14 @@ impl FutexTable {
     }
 
     fn remove_waiter(&self, key: usize, state: &Arc<WaiterState>) {
-        let mut table = self.0.lock();
-        let should_remove = if let Some(entry) = table.get(&key) {
+        let mut bucket = self.bucket(key).lock();
+        let should_remove = if let Some(entry) = bucket.get(&key) {
             entry.wq.remove_waiter(state) && Arc::strong_count(entry) == 1
         } else {
             false
         };
         if should_remove {
-            table.remove(&key);
+            bucket.remove(&key);
         }
     }
 }
@@ -533,14 +617,14 @@ impl Drop for FutexGuard<'_> {
         // key between the count check and the remove() call, creating a new
         // reference that would be invalidated when we remove the entry.
         // Checking inside the lock makes check-and-remove atomic.
-        let mut table = self.table.0.lock();
+        let mut bucket = self.table.bucket(self.key).lock();
         // Re-check strong_count under lock — a concurrent get_or_insert may
         // have cloned the Arc in the meantime. The <= 2 threshold accounts
         // for the strong refs held by the table entry and this guard
         // (self.inner). If there are more refs, someone else is using the
         // entry, so we must not remove it from the table.
         if Arc::strong_count(&self.inner) <= 2 && self.inner.wq.is_empty() {
-            table.remove(&self.key);
+            bucket.remove(&self.key);
         }
     }
 }
@@ -575,8 +659,14 @@ static SHARED_FUTEX_TABLES: Mutex<FutexTables> = Mutex::new(FutexTables::new());
 
 /// Returns the futex table for the given key.
 pub fn futex_table_for(key: &FutexKey) -> Arc<FutexTable> {
+    let curr = current();
+    futex_table_for_process(curr.as_thread().proc_data.as_ref(), key)
+}
+
+/// Returns the futex table for a key in a known process context.
+pub fn futex_table_for_process(proc_data: &ProcessData, key: &FutexKey) -> Arc<FutexTable> {
     match key {
-        FutexKey::Private { .. } => current().as_thread().proc_data.futex_table.clone(),
+        FutexKey::Private { .. } => proc_data.futex_table.clone(),
         FutexKey::Shared { region, .. } => {
             let ptr = match region {
                 Ok(pages) => Weak::as_ptr(pages) as usize,

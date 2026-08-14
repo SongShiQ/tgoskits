@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.9](https://github.com/rcore-os/tgoskits/compare/ax-riscv-plic-v0.4.8...ax-riscv-plic-v0.4.9) - 2026-07-02
+
+### Other
+
+- *(rdif-intc)* accept controller irq domains from callers
+
+## [0.4.8](https://github.com/rcore-os/tgoskits/compare/ax-riscv-plic-v0.4.7...ax-riscv-plic-v0.4.8) - 2026-06-27
+
+### Other
+
+- *(serial)* align IRQ model with dev ([#1265](https://github.com/rcore-os/tgoskits/pull/1265))
+
+## [0.4.7](https://github.com/rcore-os/tgoskits/compare/ax-riscv-plic-v0.4.6...ax-riscv-plic-v0.4.7) - 2026-06-03
+
+### Added
+
+- *(riscv64)* support dynamic platform on QEMU and SG2002 ([#961](https://github.com/rcore-os/tgoskits/pull/961))
+
 ## [0.4.6](https://github.com/rcore-os/tgoskits/compare/ax-riscv-plic-v0.4.5...ax-riscv-plic-v0.4.6) - 2026-05-19
 
 ### Other

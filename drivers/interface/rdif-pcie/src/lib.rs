@@ -9,18 +9,21 @@ use pci_types::ConfigRegionAccess;
 pub use pci_types::PciAddress;
 pub use rdif_base::{DriverGeneric, KError};
 
-mod addr_alloc;
+pub mod addr_alloc;
 mod bar_alloc;
+
+#[cfg(all(axtest, feature = "axtest"))]
+pub mod axtest;
 
 pub use bar_alloc::SimpleBarAllocator;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PciMem32 {
     pub address: u32,
     pub size: u32,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PciMem64 {
     pub address: u64,
     pub size: u64,
