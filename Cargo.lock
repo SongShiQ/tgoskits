@@ -1621,6 +1621,7 @@ dependencies = [
  "axvm-types",
  "axvmconfig",
  "clap",
+ "libm",
  "log",
  "mmio-api",
  "prettyplease 0.3.0",
