@@ -6982,6 +6982,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rockchip-i2s-tdm"
+version = "0.5.14"
+dependencies = [
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "rockchip-jpeg"
 version = "0.1.5"
 dependencies = [
