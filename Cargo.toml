@@ -57,6 +57,7 @@ members = [
     "components/percpu/percpu_macros",
 
     "drivers/ax-driver",
+    "drivers/audio/*",
     "drivers/blk/*",
     "drivers/examples/*",
     "drivers/firmware/*",
