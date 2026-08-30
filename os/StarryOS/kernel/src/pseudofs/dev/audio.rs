@@ -18,11 +18,9 @@ use alloc::sync::Arc;
 use core::{any::Any, task::Context};
 
 use audio_capture::{AudioCaptureStream, MonoSource, OutputFormat, ReadOutcome};
-use ax_errno::AxError;
 use ax_memory_addr::PhysAddr;
 use ax_runtime::hal::irq::{self, AutoEnable, IrqHandle, IrqId, IrqRequest, IrqReturn, ShareMode};
-use ax_sync::spin::SpinNoIrq as Mutex;
-use axfs_ng_vfs::{DeviceId, NodeFlags, VfsResult};
+use axfs_ng_vfs::{DeviceId, NodeFlags, VfsError, VfsResult};
 use axpoll::{IoEvents, PollSet, Pollable};
 use mmio_api::{MmioAddr, MmioRaw};
 use rockchip_i2s_tdm::{
@@ -31,6 +29,7 @@ use rockchip_i2s_tdm::{
 };
 
 use crate::pseudofs::DeviceOps;
+use crate::sync::IrqMutex as Mutex;
 
 /// `/dev/audio0` device number. 241 is in the local/experimental major range
 /// (240 is already taken by the KPU node), minor 0 for the single controller.
@@ -93,7 +92,7 @@ pub struct AudioCaptureDev {
     inner: Mutex<Inner>,
     waiters: PollSet,
     irq: Option<IrqId>,
-    irq_handle: spin::Once<IrqHandle>,
+    irq_handle: ax_lazyinit::OnceLock<IrqHandle>,
 }
 
 impl AudioCaptureDev {
@@ -144,7 +143,7 @@ impl AudioCaptureDev {
             }),
             waiters: PollSet::new(),
             irq: resource.irq,
-            irq_handle: spin::Once::new(),
+            irq_handle: ax_lazyinit::OnceLock::new(),
         })
     }
 
@@ -217,14 +216,14 @@ impl DeviceOps for AudioCaptureDev {
         }
         match self.inner.lock().stream.read(buf) {
             ReadOutcome::Filled(read) => Ok(read),
-            ReadOutcome::WouldBlock => Err(AxError::WouldBlock),
-            ReadOutcome::Inactive => Err(AxError::BadState),
+            ReadOutcome::WouldBlock => Err(VfsError::WouldBlock),
+            ReadOutcome::Inactive => Err(VfsError::BadState),
         }
     }
 
     fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
         // Capture is read-only.
-        Err(AxError::InvalidInput)
+        Err(VfsError::InvalidInput)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -248,7 +247,7 @@ impl DeviceOps for AudioCaptureDev {
         let mut inner = self.inner.lock();
         if let Err(err) = inner.controller.configure_capture_pio(CAPTURE_CLOCK) {
             warn!("rk3588-audio: capture configuration rejected: {err:?}");
-            return Err(AxError::InvalidInput);
+            return Err(VfsError::InvalidInput);
         }
         inner.stream.start();
         // Start the RX transfer with the vendor RK3588 clock-discontinuity: gate

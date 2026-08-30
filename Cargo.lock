@@ -7841,6 +7841,7 @@ dependencies = [
 name = "starry-kernel"
 version = "0.8.3"
 dependencies = [
+ "audio-capture",
  "ax-alloc",
  "ax-cgroup",
  "ax-cpu",
@@ -7880,6 +7881,7 @@ dependencies = [
  "dma-api",
  "downcast-rs",
  "enum_dispatch",
+ "es8388",
  "event-listener",
  "extern-trait",
  "flatten_objects",
@@ -7896,6 +7898,7 @@ dependencies = [
  "linux-raw-sys 0.12.1",
  "lock_api",
  "lwprintf-rs",
+ "mmio-api",
  "num_enum",
  "ouroboros",
  "rand 0.10.2",
@@ -7906,6 +7909,8 @@ dependencies = [
  "rdrive",
  "ringbuf",
  "riscv",
+ "rockchip-i2s-tdm",
+ "rockchip-pm",
  "rockchip-rga",
  "scope-local",
  "sg2002-tpu",
