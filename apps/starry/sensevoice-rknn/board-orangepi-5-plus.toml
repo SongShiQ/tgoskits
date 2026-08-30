@@ -1,0 +1,19 @@
+board_type = "OrangePi-5-Plus"
+shell_prefix = "root@starry:/root #"
+# L0-L3 self-test from sensevoice-rknn-test.sh; prints SENSEVOICE_RKNN_TEST_PASSED.
+shell_init_cmd = '''
+/opt/sensevoice/sensevoice-rknn-test.sh
+'''
+success_regex = [
+  "(?m)^SENSEVOICE_RKNN_TEST_PASSED$",
+]
+fail_regex = [
+  "(?i)\\bpanic(?:ked)?\\b",
+  "(?m)^SENSEVOICE_RKNN_TEST_FAILED.*$",
+  "(?m)^rknn_init failed.*$",
+  "(?m)^model not found.*$",
+  "(?i)error while loading shared libraries",
+  "(?i)(sensevoice_rknn_npu|python3|sh): .*not found",
+  "(?i)Traceback \\(most recent call last\\)",
+]
+timeout = 180

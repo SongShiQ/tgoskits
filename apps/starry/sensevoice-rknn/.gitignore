@@ -1,0 +1,6 @@
+# downloaded model assets (large, reproducible from prebuild.sh)
+model/
+# mp3 sources (converted to wav, not needed at runtime)
+testwavs/*.mp3
+# python bytecode cache
+__pycache__/

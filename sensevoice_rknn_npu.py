@@ -11,8 +11,10 @@ am.mvn CMVN as (x + AddShift) * Rescale.
 Encoder input: [lang(1), event+emo(2), text_norm(1), speech(T)] frames on the
 time axis, zero-padded to the model's fixed input length (read from the input
 tensor attr). The speech frames are scaled by SENSEVOICE_INPUT_SCALE (fp16
-overflow guard; upstream uses 1/2 for its unscaled model, our fp16-scaled
-model defaults to 1.0).
+overflow guard; 1/2 both upstream and for our fp16-scaled model -- measured
+on a real RK3588 2026-08-29: 1.0 silently drops characters (开放时早九点...
+vs 开放时间早上九点... at 0.5), because the unscaled activations saturate
+fp16 inside the encoder).
 
 Output: [T, vocab] CTC logits (default layout; SENSEVOICE_OUT_LAYOUT=VT for
 the transposed happyme531 conversion) -> greedy CTC over the real (pre-pad)
@@ -64,7 +66,12 @@ VOICE_COMMANDS = (
     ("back", ("\u540e\u9000", "\u5411\u540e", "\u5f80\u540e", "\u5012\u9000")),
     ("left", ("\u5de6\u8f6c", "\u5411\u5de6", "\u5f80\u5de6")),
     ("right", ("\u53f3\u8f6c", "\u5411\u53f3", "\u5f80\u53f3")),
-    ("stop", ("\u505c\u6b62", "\u505c\u4e0b", "\u505c", "\u5239\u8f66")),
+    # voice_commands_from_text() matches raw substrings, so a bare 停 fires on
+    # any sentence containing the character (e.g. 我不想停在这里). Bare 停 never
+    # survives transcription anyway (always empty, 2026-08-29 eval), so it buys
+    # nothing here. Longer stop phrases (停止/停下) still match through 停's
+    # presence via their own entries.
+    ("stop", ("\u505c\u6b62", "\u505c\u4e0b", "\u5239\u8f66")),
 )
 
 
@@ -476,8 +483,7 @@ def load_tokens(path):
 # ---------------------------------------------------------------------------
 
 
-def transcribe(ctx, embedding, tokens, cmvn, wav_path, language, use_itn, scale):
-    samples = read_wav_mono(wav_path)
+def transcribe_samples(ctx, embedding, tokens, cmvn, samples, language, use_itn, scale):
     feats = fbank80(samples)
     speech = apply_cmvn(apply_lfr(feats), cmvn)
     # RKNN2 fp16 inference can overflow when intermediate activations exceed
@@ -525,6 +531,13 @@ def transcribe(ctx, embedding, tokens, cmvn, wav_path, language, use_itn, scale)
     return ids_to_text(ids, tokens)
 
 
+def transcribe(ctx, embedding, tokens, cmvn, wav_path, language, use_itn, scale):
+    """Offline path: read a 16 kHz mono s16 wav, return recognized text."""
+    samples = read_wav_mono(wav_path)
+    return transcribe_samples(ctx, embedding, tokens, cmvn, samples,
+                              language, use_itn, scale)
+
+
 def voice_commands_from_text(text):
     normalized = re.sub(r"\s+", "", text)
     matches = []
@@ -564,6 +577,135 @@ def run_voice_command_for_two_seconds(command):
         send_voice_command("stop")
 
 
+# ---------------------------------------------------------------------------
+# Live mode: read /dev/audio0 (48 kHz mono s16) -> resample to 16 kHz -> VAD
+# -> ASR -> voice command. Pure numpy, no extra deps.
+# ---------------------------------------------------------------------------
+
+AUDIO0_DEV = os.environ.get("SENSEVOICE_AUDIO_DEV", "/dev/audio0")
+# /dev/audio0 publishes mono S16 at the hardware rate (48 kHz); SenseVoice
+# needs 16 kHz. The ratio is exactly 3:1, so a simple decimation with a
+# light anti-aliasing average is enough (no polyphase filter needed).
+DECIMATE = 3
+# Chunk size read from /dev/audio0 per iteration: 0.5 s @ 48 kHz mono s16.
+LIVE_CHUNK_SAMPLES = 48000 // 2
+LIVE_CHUNK_BYTES = LIVE_CHUNK_SAMPLES * 2  # s16
+# VAD: RMS over 30 ms frames; speech starts above a threshold, ends after a
+# configurable silence. Tuned for the board mic (low sensitivity, see project).
+VAD_FRAME_MS = 30
+VAD_THRESHOLD = float(os.environ.get("SENSEVOICE_VAD_THRESHOLD", "0.012"))
+VAD_SILENCE_LIMIT_S = float(os.environ.get("SENSEVOICE_VAD_SILENCE", "1.0"))
+VAD_MIN_SPEECH_S = float(os.environ.get("SENSEVOICE_VAD_MIN_SPEECH", "0.3"))
+# Max utterance length so a fixed-frame model (t100 ~ 6 s) is not blown past.
+VAD_MAX_SPEECH_S = 6.0
+
+
+def resample_48k_to_16k(samples):
+    """Downsample 48 kHz float32 [-1,1) to 16 kHz by 3:1 decimation with a
+    3-tap box average (light anti-alias). Returns float32 [-1,1)."""
+    n = (len(samples) // DECIMATE) * DECIMATE
+    if n == 0:
+        return np.zeros(0, dtype=np.float32)
+    trimmed = samples[:n].reshape(-1, DECIMATE)
+    return trimmed.mean(axis=1).astype(np.float32)
+
+
+def _rms(frame):
+    return float(np.sqrt(np.mean(frame.astype(np.float64) ** 2)))
+
+
+def vad_segment(samples16k, fs=16000):
+    """Split a 16 kHz mono buffer into utterance chunks using RMS energy.
+
+    Yields float32 arrays (one per detected utterance). State machine:
+    silence -> speech (RMS above threshold) -> accumulate -> silence
+    (VAD_SILENCE_LIMIT_S of below-threshold frames ends an utterance).
+    """
+    frame_len = int(fs * VAD_FRAME_MS / 1000)
+    n_frames = len(samples16k) // frame_len
+    if n_frames == 0:
+        return
+    frames = samples16k[: n_frames * frame_len].reshape(n_frames, frame_len)
+    silence_limit_frames = int(VAD_SILENCE_LIMIT_S * 1000 / VAD_FRAME_MS)
+    min_speech_frames = int(VAD_MIN_SPEECH_S * 1000 / VAD_FRAME_MS)
+    max_speech_frames = int(VAD_MAX_SPEECH_S * 1000 / VAD_FRAME_MS)
+
+    in_speech = False
+    buf = []
+    silence_count = 0
+    speech_count = 0
+    for i in range(n_frames):
+        loud = _rms(frames[i]) > VAD_THRESHOLD
+        if not in_speech:
+            if loud:
+                in_speech = True
+                buf = [frames[i]]
+                silence_count = 0
+                speech_count = 1
+        else:
+            buf.append(frames[i])
+            speech_count += 1
+            if loud:
+                silence_count = 0
+            else:
+                silence_count += 1
+                if silence_count >= silence_limit_frames or speech_count >= max_speech_frames:
+                    if speech_count >= min_speech_frames:
+                        yield np.concatenate(buf).astype(np.float32)
+                    in_speech = False
+                    buf = []
+                    silence_count = 0
+                    speech_count = 0
+    if in_speech and speech_count >= min_speech_frames:
+        yield np.concatenate(buf).astype(np.float32)
+
+
+def read_audio0_chunk(dev=AUDIO0_DEV, nbytes=LIVE_CHUNK_BYTES):
+    """Read one PCM chunk from /dev/audio0. Returns float32 [-1,1) mono, or
+    None on EOF/error."""
+    try:
+        with open(dev, "rb") as handle:
+            raw = handle.read(nbytes)
+    except OSError as exc:
+        print(f"[live] cannot read {dev}: {exc}", file=sys.stderr)
+        return None
+    if not raw:
+        return None
+    return np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+
+
+def run_live(ctx, embedding, tokens, cmvn, language, use_itn, scale):
+    """Continuous listen loop: /dev/audio0 -> 16k -> VAD -> ASR -> command."""
+    print(f"[live] listening on {AUDIO0_DEV} (48k->16k, VAD thr={VAD_THRESHOLD})",
+          file=sys.stderr)
+    accum = np.zeros(0, dtype=np.float32)
+    while True:
+        chunk = read_audio0_chunk()
+        if chunk is None:
+            time.sleep(0.1)
+            continue
+        # /dev/audio0 may already publish mono (runtime downmix); if a stereo
+        # byte count comes back, take the left channel.
+        down16 = resample_48k_to_16k(chunk)
+        accum = np.concatenate([accum, down16]) if accum.size else down16
+        # Keep the rolling buffer bounded (last ~10 s of 16 kHz audio).
+        max_acc = 16000 * 10
+        if accum.size > max_acc:
+            accum = accum[-max_acc:]
+        for utt in vad_segment(accum):
+            started = time.time()
+            text = transcribe_samples(
+                ctx, embedding, tokens, cmvn, utt, language, use_itn, scale
+            )
+            elapsed = time.time() - started
+            print(json.dumps({"text": text, "seconds": elapsed}, ensure_ascii=False))
+            for command in voice_commands_from_text(text):
+                run_voice_command_for_two_seconds(command)
+            # Drop processed audio up to the end of the last utterance to avoid
+            # re-triggering on the same segment.
+            accum = np.zeros(0, dtype=np.float32)
+
+
 def main():
     parser = argparse.ArgumentParser(description="SenseVoice RK3588 NPU ASR")
     parser.add_argument("--model-dir", default="/opt/sensevoice/model")
@@ -579,11 +721,16 @@ def main():
     parser.add_argument(
         "--input-scale",
         type=float,
-        default=float(os.environ.get("SENSEVOICE_INPUT_SCALE", "1.0")),
-        help="speech feature scale (upstream uses 0.5 for its unscaled model)",
+        default=float(os.environ.get("SENSEVOICE_INPUT_SCALE", "0.5")),
+        help="speech feature scale; 0.5 measured best on RK3588 fp16 "
+             "(1.0 drops characters, 0.25 makes ITN incoherent)",
     )
     parser.add_argument("--selftest", action="store_true")
+    parser.add_argument("--live", action="store_true", help="continuous /dev/audio0 capture + VAD + ASR")
+    parser.add_argument("--audio-dev", default=None, help="capture device (default /dev/audio0)")
     args = parser.parse_args()
+    if args.audio_dev:
+        os.environ["SENSEVOICE_AUDIO_DEV"] = args.audio_dev
 
     model = os.path.join(args.model_dir, args.model)
     lib_paths = [
@@ -604,6 +751,10 @@ def main():
     ctx = RknnContext(model, lib_paths)
     print(f"[perf] model load: {time.time() - started:.2f}s")
     try:
+        if args.live:
+            run_live(ctx, embedding, tokens, cmvn, args.language,
+                     not args.no_itn, args.input_scale)
+            return 0
         for wav_path in args.wav:
             started = time.time()
             text = transcribe(

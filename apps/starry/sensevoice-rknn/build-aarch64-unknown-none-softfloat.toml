@@ -1,0 +1,11 @@
+target = "aarch64-unknown-none-softfloat"
+log = "Info"
+features = [
+  "ax-driver/nvme",
+  "ax-driver/rockchip-sdhci",
+  "ax-driver/rockchip-dwc-xhci",
+  "ax-driver/realtek-rtl8125",
+  "ax-driver/rockchip-soc",
+  "starry-kernel/rknpu",
+  "starry-kernel/rk3588-audio",
+]
