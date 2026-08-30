@@ -36,14 +36,13 @@ use crate::pseudofs::DeviceOps;
 /// (240 is already taken by the KPU node), minor 0 for the single controller.
 pub const AUDIO_DEVICE_ID: DeviceId = DeviceId::new(241, 0);
 
-/// Published PCM ring capacity in mono samples. 16 Ki samples (~0.34 s at
-/// 48 kHz) overran within the first second of every ASR inference: a
-/// fixed-frame SenseVoice pass takes 5-6 s during which the only reader is
-/// idle, so the live mode lost everything not already drained. 512 Ki
-/// samples (1 MiB, ~10.7 s) absorbs a full max-length utterance pass; the
-/// 2026-08-30 --live run transcribed nothing but empty utterances before
-/// this bump and the driver ring was the only unbounded gap.
-const AUDIO_RING_SAMPLES: usize = 512 * 1024;
+/// Published PCM ring capacity in mono samples (~0.34 s at 48 kHz). A 512 Ki
+/// bump (1 MiB inline `[i16; N]` in the device struct) HUNG the board at
+/// pseudofs init on 2026-08-30 -- the allocation happens inside device
+/// registration and does not complete at that size on the current heap.
+/// Before re-bumping for --live (an ASR pass idles the reader for 5-6 s),
+/// move the ring to an explicit heap allocation and debug the boot in QEMU.
+const AUDIO_RING_SAMPLES: usize = 16 * 1024;
 
 /// Scratch depth for a single FIFO drain. The RX FIFO level field is 6 bits
 /// (`RXFIFOLR & 0x3f`, max 63), so a 64-sample buffer empties it in one pass.
