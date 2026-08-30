@@ -85,6 +85,7 @@ rk3588-audio = [
     "dep:audio-capture",
     "dep:rockchip-i2s-tdm",
     "dep:es8388",
+    "dep:mmio-api",
     "dep:rdif-pinctrl",
     "dep:rockchip-pm",
 ]
@@ -155,6 +156,7 @@ rockchip-rga = { workspace = true, optional = true }
 sg2002-tpu = { workspace = true, optional = true }
 k230-kpu = { workspace = true, optional = true }
 audio-capture = { workspace = true, optional = true }
+mmio-api = { workspace = true, optional = true }
 rockchip-i2s-tdm = { workspace = true, optional = true }
 es8388 = { workspace = true, optional = true }
 rockchip-pm = { workspace = true, optional = true }
