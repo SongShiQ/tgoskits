@@ -24,6 +24,7 @@ use ax_runtime::hal::irq::{self, AutoEnable, IrqHandle, IrqId, IrqRequest, IrqRe
 use ax_sync::spin::SpinNoIrq as Mutex;
 use axfs_ng_vfs::{DeviceId, NodeFlags, VfsResult};
 use axpoll::{IoEvents, PollSet, Pollable};
+use mmio_api::{MmioAddr, MmioRaw};
 use rockchip_i2s_tdm::{
     CaptureFormat, ClockDividers, I2sTdmController, IrqEvent, MmioRegisters,
     RK3588_I2S_TDM_REGISTER_SIZE,
@@ -113,8 +114,16 @@ impl AudioCaptureDev {
         // bytes covering the whole RK3588 I2S/TDM register file. The controller
         // owns this mapping for its lifetime (the node is never dropped), and
         // the only accessor is serialized behind `inner`.
+        let raw = unsafe {
+            MmioRaw::new(
+                MmioAddr::from(resource.base_paddr),
+                core::ptr::NonNull::new(base_vaddr as *mut u8)
+                    .expect("rk3588-audio: iomap returned a null base"),
+                resource.size,
+            )
+        };
         let controller =
-            match unsafe { I2sTdmController::from_mmio(base_vaddr as *mut u8, HARDWARE_FORMAT) } {
+            match I2sTdmController::from_mmio(raw, HARDWARE_FORMAT) {
                 Ok(controller) => controller,
                 Err(err) => {
                     warn!("rk3588-audio: unsupported capture format: {err:?}");
