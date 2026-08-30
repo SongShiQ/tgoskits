@@ -6999,6 +6999,7 @@ dependencies = [
 name = "rockchip-i2s-tdm"
 version = "0.5.14"
 dependencies = [
+ "mmio-api",
  "thiserror 2.0.20",
 ]
 

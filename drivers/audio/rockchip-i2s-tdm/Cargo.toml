@@ -10,5 +10,6 @@ keywords = ["rk3588", "i2s", "tdm", "audio", "no-std"]
 categories = ["embedded", "hardware-support", "no-std"]
 
 [dependencies]
+mmio-api = { workspace = true }
 thiserror = { workspace = true }
 
