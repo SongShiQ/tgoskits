@@ -35,6 +35,16 @@ static void *raw_mremap(void *old_addr, size_t old_size, size_t new_size,
     return (void *)ret;
 }
 
+static int all_bytes_equal(const unsigned char *b, size_t n, unsigned char v) {
+    for (size_t i = 0; i < n; i++)
+        if (b[i] != v) return 0;
+    return 1;
+}
+
+static int all_zero(const unsigned char *b, size_t n) {
+    return all_bytes_equal(b, n, 0);
+}
+
 int main(void)
 {
     const size_t PAGE = (size_t)sysconf(_SC_PAGE_SIZE);
@@ -406,6 +416,157 @@ int main(void)
                 if (r != MAP_FAILED) munmap(r, PAGE);
                 munmap(dst, PAGE);
                 munmap(src, PAGE);
+            }
+        }
+    }
+
+    /* 24. 多页链式 grow + 全量内容校验
+     * 板上 glibc 崩溃点是 mremap_chunk 断言，真实路径就是 mmapped chunk
+     * 反复 grow。每轮 grow 后必须逐字节核对全部旧内容；步长 1→4→16→33
+     * 覆盖原地扩、跨 VA 搬迁和奇数页尾。 */
+    {
+        const size_t steps[] = { 1, 4, 16, 33 };
+        const size_t nsteps = sizeof(steps) / sizeof(steps[0]);
+        size_t live = steps[0];
+        const unsigned char pat = 0xA0;
+        void *p = mmap(NULL, live * PAGE, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        CHECK(p != MAP_FAILED, "mmap for chained grow");
+        if (p != MAP_FAILED) {
+            memset(p, pat, live * PAGE);
+            int moved_ok = 1;
+            for (size_t i = 1; i < nsteps; i++) {
+                size_t old = live;
+                void *p2 = mremap(p, live * PAGE, steps[i] * PAGE,
+                                  MREMAP_MAYMOVE);
+                CHECK(p2 != MAP_FAILED, "chained grow step");
+                if (p2 == MAP_FAILED) {
+                    moved_ok = 0;
+                    break;
+                }
+                p = p2;
+                live = steps[i];
+                if (!all_bytes_equal((unsigned char *)p, old * PAGE, pat)) {
+                    CHECK(0, "chained grow keeps ALL old bytes");
+                    moved_ok = 0;
+                    break;
+                }
+                memset((unsigned char *)p + old * PAGE, pat,
+                       (live - old) * PAGE);
+            }
+            if (moved_ok)
+                CHECK(1, "chained multi-page grow preserved content");
+            munmap(p, live * PAGE);
+        }
+    }
+
+    /* 25. 邻居映射完整性：一侧 grow 搬迁不得波及另一侧
+     * 若内核原地扩时吞掉相邻 VMA，或搬迁时写错源，B 的内容会坏。 */
+    {
+        void *a = mmap(NULL, 2 * PAGE, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        void *b = mmap(NULL, 2 * PAGE, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        CHECK(a != MAP_FAILED && b != MAP_FAILED, "mmap for neighbor case");
+        if (a != MAP_FAILED && b != MAP_FAILED) {
+            memset(a, 0x11, 2 * PAGE);
+            memset(b, 0x22, 2 * PAGE);
+            void *a2 = mremap(a, 2 * PAGE, 16 * PAGE, MREMAP_MAYMOVE);
+            CHECK(a2 != MAP_FAILED, "neighbor A grows with MAYMOVE");
+            if (a2 != MAP_FAILED) {
+                CHECK(all_bytes_equal((unsigned char *)a2, 2 * PAGE, 0x11),
+                      "grown A keeps old content");
+                CHECK(all_bytes_equal((unsigned char *)b, 2 * PAGE, 0x22),
+                      "neighbor B is untouched after A moved");
+                ((unsigned char *)a2)[15 * PAGE] = 0x33;
+                ((unsigned char *)b)[0] = 0x44;
+                CHECK(((unsigned char *)b)[0] == 0x44,
+                      "B stays writable after A moved");
+                munmap(a2, 16 * PAGE);
+            } else {
+                munmap(a, 2 * PAGE);
+            }
+            munmap(b, 2 * PAGE);
+        } else {
+            if (a != MAP_FAILED) munmap(a, 2 * PAGE);
+            if (b != MAP_FAILED) munmap(b, 2 * PAGE);
+        }
+    }
+
+    /* 26. grow→shrink→grow 循环（realloc 收缩再扩张的真实节奏） */
+    {
+        void *p = mmap(NULL, 8 * PAGE, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        CHECK(p != MAP_FAILED, "mmap for cycle case");
+        if (p != MAP_FAILED) {
+            size_t live = 8 * PAGE;
+            int ok = 1;
+            memset(p, 0x33, live);
+            for (int round = 0; round < 4; round++) {
+                void *p2 = mremap(p, live, 2 * PAGE, 0);
+                CHECK(p2 == p, "cycle shrink stays in place");
+                if (p2 != p) {
+                    ok = 0;
+                    break;
+                }
+                live = 2 * PAGE;
+                if (!all_bytes_equal((unsigned char *)p, live, 0x33)) {
+                    CHECK(0, "cycle shrink keeps head intact");
+                    ok = 0;
+                    break;
+                }
+                void *p3 = mremap(p, live, 8 * PAGE, MREMAP_MAYMOVE);
+                CHECK(p3 != MAP_FAILED, "cycle grow back");
+                if (p3 == MAP_FAILED) {
+                    ok = 0;
+                    break;
+                }
+                p = p3;
+                live = 8 * PAGE;
+                if (!all_bytes_equal((unsigned char *)p, 2 * PAGE, 0x33)) {
+                    CHECK(0, "cycle regrown head intact");
+                    ok = 0;
+                    break;
+                }
+                if (!all_zero((unsigned char *)p + 2 * PAGE,
+                              6 * PAGE)) {
+                    CHECK(0, "cycle regrown tail zeroed");
+                    ok = 0;
+                    break;
+                }
+            }
+            if (ok)
+                CHECK(1, "grow/shrink cycles stable over 4 rounds");
+            munmap(p, live);
+        }
+    }
+
+    /* 27. 大跨度 grow（64 页→256 页）逐字节校验
+     * 256KiB 旧内容跨整页搬迁，比对必须全量而非抽查首尾。 */
+    {
+        void *p = mmap(NULL, 64 * PAGE, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        CHECK(p != MAP_FAILED, "mmap for large grow");
+        if (p != MAP_FAILED) {
+            unsigned char *b = (unsigned char *)p;
+            for (size_t i = 0; i < 64 * PAGE; i++)
+                b[i] = (unsigned char)(i & 0xFF);
+            void *p2 = mremap(p, 64 * PAGE, 256 * PAGE, MREMAP_MAYMOVE);
+            CHECK(p2 != MAP_FAILED, "large grow 64->256 pages");
+            if (p2 != MAP_FAILED) {
+                b = (unsigned char *)p2;
+                int ok = 1;
+                for (size_t i = 0; i < 64 * PAGE; i++)
+                    if (b[i] != (unsigned char)(i & 0xFF)) {
+                        ok = 0;
+                        break;
+                    }
+                CHECK(ok, "large grow keeps byte-exact pattern");
+                CHECK(all_zero(b + 64 * PAGE, 192 * PAGE),
+                      "large grow tail is zeroed");
+                munmap(p2, 256 * PAGE);
+            } else {
+                munmap(p, 64 * PAGE);
             }
         }
     }
