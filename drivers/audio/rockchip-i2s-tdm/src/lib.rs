@@ -22,11 +22,56 @@ const INTCR: usize = 0x014;
 const INTSR: usize = 0x018;
 const XFER: usize = 0x01c;
 const CLR: usize = 0x020;
-
-const XFER_RX_START: u32 = 1 << 1;
+const RXDR: usize = 0x028;
 const RXFIFOLR: usize = 0x02c;
+const TDM_TXCR: usize = 0x030;
+const TDM_RXCR: usize = 0x034;
+const CLKDIV: usize = 0x038;
+
+// XFER transfer-start bits. In the board's TX-common-clock mode (see
+// `CKR_TRCM_TX`) the shared BCLK/LRCK is generated on the TX timing engine, so
+// RX only clocks in data when TX is started too — capture must set BOTH.
+const XFER_TXS_START: u32 = 1 << 0;
+const XFER_RXS_START: u32 = 1 << 1;
+
+/// RX FIFO level field in `RXFIFOLR` (samples currently buffered on the lane).
+/// The exact width is confirmed against the board TRM during gate 4; a 6-bit
+/// field covers the RK3588 32-entry RX FIFO.
+const RXFIFOLR_LEVEL_MASK: u32 = 0x3f;
+
+// TXCR/RXCR valid-data-width field (`VDW`, encoded `bits - 1`) and the RXCR
+// channel-select (`CSR`) for two interleaved slots (stereo). From Linux
+// `rockchip_i2s_tdm.h`.
 const RXCR_VDW_16_BIT: u32 = 15;
-const RXCR_CSR_TWO_SLOTS: u32 = 0;
+const RXCR_VDW_24_BIT: u32 = 23;
+const RXCR_CSR_TWO_SLOTS: u32 = 0 << 15;
+
+// TXCR/RXCR high bits: the reset-default lane→path routing (path0..3 = 0,1,2,3)
+// plus I2S mode. Written explicitly on every configure so a different framing
+// left by a prior (Linux) boot cannot leak into StarryOS capture. These match
+// the Linux `reg_default` high bits (TXCR 0x72000000, RXCR 0x01c80000); OR in
+// the format's VDW/CSR to get the full word (16-bit → 0x7200000f / 0x01c8000f).
+const TXCR_PATH_DEFAULT: u32 = 0x7200_0000;
+const RXCR_PATH_DEFAULT: u32 = 0x01c8_0000;
+
+// TDM control registers are unused in plain I2S mode; write their reset default
+// (Linux `reg_default` 0x00003eff) so they are deterministic under capture.
+const TDM_CTRL_DEFAULT: u32 = 0x0000_3eff;
+
+// CKR (clock) fields, from Linux `rockchip_i2s_tdm.h`.
+// TRCM = TX common mode (bit 28): RX shares the frame/bit clock generated on the
+// TX engine. The Orange Pi 5 Plus sound card declares `rockchip,trcm-sync-tx-only`,
+// so the SoC runs in this mode. `MSS_MASTER` (0) = RK3588 generates BCLK/LRCK.
+// `RSD`/`TSD` are the SCLK-per-frame (BCLK→LRCK) dividers, encoded `n - 1`.
+const CKR_TRCM_TX: u32 = 1 << 28;
+const CKR_MSS_MASTER: u32 = 0 << 27;
+const CKR_RSD_SHIFT: u32 = 8;
+const CKR_TSD_SHIFT: u32 = 0;
+
+// CLKDIV (MCLK→BCLK) TX/RX divider fields, encoded `n - 1`.
+const CLKDIV_TXM_SHIFT: u32 = 0;
+const CLKDIV_RXM_SHIFT: u32 = 8;
+
 const INT_RX_READY: u32 = 1 << 16;
 const INT_RX_OVERFLOW: u32 = 1 << 17;
 const INT_RX_OVERFLOW_CLEAR: u32 = 1 << 18;
@@ -38,11 +83,11 @@ const INT_RX_OVERFLOW_ENABLE: u32 = 1 << 17;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum AudioConfigError {
-    #[error("only mono capture is supported in the first implementation")]
+    #[error("the RK3588 capture path only supports interleaved stereo")]
     UnsupportedChannels,
-    #[error("only 16-bit PCM is supported in the first implementation")]
+    #[error("only 16-bit and 24-bit PCM capture is supported")]
     UnsupportedSampleWidth,
-    #[error("only 16 kHz and 48 kHz capture are supported in the first implementation")]
+    #[error("only 16 kHz and 48 kHz capture are supported")]
     UnsupportedSampleRate,
     #[error("I2S clock dividers must be non-zero")]
     InvalidClockDividers,
@@ -55,49 +100,92 @@ pub struct CaptureFormat {
     pub sample_width_bits: u8,
 }
 
+/// I2S bit/frame clock ratios from MCLK. The board runs MCLK = 12.288 MHz
+/// (mclk-fs = 256 @ 48 kHz). `bclk_div` is MCLK→BCLK (4 → 3.072 MHz SCLK);
+/// `lrck_div` is BCLK→LRCK, i.e. SCLK-per-frame (64 = two 32-bit slots → 48 kHz).
+///
+/// These map onto two distinct RK3588 registers: `bclk_div` drives
+/// `CLKDIV.{TXM,RXM}` (MCLK divider) and `lrck_div` drives `CKR.{TSD,RSD}`
+/// (SCLK-per-frame). Both hardware fields are encoded `n - 1`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClockDividers {
-    pub mclk_div: u8,
-    pub rx_bclk_div: u8,
-    pub tx_bclk_div: u8,
+    pub bclk_div: u8,
+    pub lrck_div: u16,
 }
 
 impl ClockDividers {
     pub const fn validate(self) -> bool {
-        self.mclk_div != 0 && self.rx_bclk_div != 0 && self.tx_bclk_div != 0
+        self.bclk_div != 0 && self.lrck_div != 0
     }
 
-    const fn register_value(self) -> u32 {
-        (((self.mclk_div - 1) as u32) << 16)
-            | (((self.rx_bclk_div - 1) as u32) << 8)
-            | (self.tx_bclk_div - 1) as u32
+    /// `CKR` word: TX-common-mode (shared clock on the TX engine, matching the
+    /// board's `rockchip,trcm-sync-tx-only`), RK3588 as clock master, and the
+    /// SCLK-per-frame divider replicated into both TSD and RSD. For the 48 kHz
+    /// stereo format this yields the Linux ground-truth `0x10003f3f`.
+    const fn ckr_value(self) -> u32 {
+        let sd = (self.lrck_div - 1) as u32;
+        CKR_TRCM_TX | CKR_MSS_MASTER | (sd << CKR_RSD_SHIFT) | (sd << CKR_TSD_SHIFT)
+    }
+
+    /// `CLKDIV` word: the MCLK→BCLK divider replicated into TXM and RXM. For the
+    /// 48 kHz stereo format (bclk_div = 4) this yields the Linux ground-truth
+    /// `0x0303`.
+    const fn clkdiv_value(self) -> u32 {
+        let m = (self.bclk_div - 1) as u32;
+        (m << CLKDIV_TXM_SHIFT) | (m << CLKDIV_RXM_SHIFT)
     }
 }
 
 impl CaptureFormat {
-    pub const MONO_16K: Self = Self {
-        sample_rate_hz: 16_000,
-        channels: 1,
+    /// The board's DAI forces interleaved stereo; this is the native RX shape and
+    /// the format the runtime downmixes to logical mono for consumers.
+    pub const STEREO_S16_48K: Self = Self {
+        sample_rate_hz: 48_000,
+        channels: 2,
         sample_width_bits: 16,
     };
 
-    pub const MONO_48K: Self = Self {
+    /// The wider capture width the hardware accepts, still interleaved stereo.
+    pub const STEREO_S24_48K: Self = Self {
         sample_rate_hz: 48_000,
-        channels: 1,
-        sample_width_bits: 16,
+        channels: 2,
+        sample_width_bits: 24,
     };
 
     pub const fn validate(self) -> Result<Self, AudioConfigError> {
-        if self.channels != 1 {
+        if self.channels != 2 {
             return Err(AudioConfigError::UnsupportedChannels);
         }
-        if self.sample_width_bits != 16 {
+        if self.sample_width_bits != 16 && self.sample_width_bits != 24 {
             return Err(AudioConfigError::UnsupportedSampleWidth);
         }
         if self.sample_rate_hz != 16_000 && self.sample_rate_hz != 48_000 {
             return Err(AudioConfigError::UnsupportedSampleRate);
         }
         Ok(self)
+    }
+
+    /// Valid-data-width field for this format. The controller encodes it as
+    /// `width - 1` (16-bit → 15, 24-bit → 23); only the two widths accepted by
+    /// [`validate`](Self::validate) are reachable here. Shared by TXCR and RXCR.
+    const fn valid_data_width(self) -> u32 {
+        match self.sample_width_bits {
+            24 => RXCR_VDW_24_BIT,
+            _ => RXCR_VDW_16_BIT,
+        }
+    }
+
+    /// `TXCR` word: the reset-default lane routing / I2S mode plus this format's
+    /// valid-data width. TX is configured (not just RX) because the shared clock
+    /// runs on the TX engine in TX-common mode. 16-bit → `0x7200000f`.
+    const fn txcr_value(self) -> u32 {
+        TXCR_PATH_DEFAULT | self.valid_data_width()
+    }
+
+    /// `RXCR` word: reset-default routing / I2S mode, two interleaved slots
+    /// (stereo), plus this format's valid-data width. 16-bit → `0x01c8000f`.
+    const fn rxcr_value(self) -> u32 {
+        RXCR_PATH_DEFAULT | RXCR_CSR_TWO_SLOTS | self.valid_data_width()
     }
 }
 
@@ -108,19 +196,45 @@ pub enum IrqEvent {
     RxOverflow,
 }
 
-/// Register-level controller. The caller owns the MMIO mapping for its whole
-/// lifetime and must serialize task-context register access against IRQ code.
-pub struct I2sTdmController {
+/// Access to the controller register file. Hardware uses [`MmioRegisters`];
+/// tests supply a recording bank so the register sequence and interrupt
+/// acknowledgement can be verified without a board.
+pub trait RegisterBank {
+    fn read(&self, offset: usize) -> u32;
+    fn write(&mut self, offset: usize, value: u32);
+}
+
+/// Volatile MMIO access to a caller-owned register mapping.
+pub struct MmioRegisters {
     base: *mut u8,
+}
+
+// SAFETY: the value exclusively owns the MMIO mapping; writes take `&mut self`,
+// so the portable core never aliases the register file concurrently.
+unsafe impl Send for MmioRegisters {}
+
+impl RegisterBank for MmioRegisters {
+    fn read(&self, offset: usize) -> u32 {
+        // SAFETY: construction requires a valid MMIO mapping; offsets are within
+        // the RK3588 register file and accesses are volatile by definition.
+        unsafe { read_volatile(self.base.add(offset).cast::<u32>()) }
+    }
+
+    fn write(&mut self, offset: usize, value: u32) {
+        // SAFETY: construction requires a valid MMIO mapping; offsets are within
+        // the RK3588 register file and accesses are volatile by definition.
+        unsafe { write_volatile(self.base.add(offset).cast::<u32>(), value) }
+    }
+}
+
+/// Register-level controller. The register bank owns the MMIO mapping for its
+/// whole lifetime and task-context access must be serialized against IRQ code.
+pub struct I2sTdmController<R: RegisterBank = MmioRegisters> {
+    regs: R,
     format: CaptureFormat,
 }
 
-// SAFETY: moving the controller transfers exclusive ownership of the MMIO
-// mapping; all register methods require `&mut self`, so this type does not
-// permit concurrent access through the portable core.
-unsafe impl Send for I2sTdmController {}
-
-impl I2sTdmController {
+impl I2sTdmController<MmioRegisters> {
     /// # Safety
     /// `base` must be a valid, aligned mapping of the RK3588 register file and
     /// remain valid until this controller is dropped.
@@ -128,33 +242,100 @@ impl I2sTdmController {
         base: *mut u8,
         format: CaptureFormat,
     ) -> Result<Self, AudioConfigError> {
-        let format = format.validate()?;
-        Ok(Self { base, format })
+        // SAFETY: forwarded to the caller's `base` contract above.
+        Ok(Self {
+            regs: MmioRegisters { base },
+            format: format.validate()?,
+        })
+    }
+}
+
+impl<R: RegisterBank> I2sTdmController<R> {
+    /// Build a controller over an arbitrary register bank. The bank must map the
+    /// RK3588 register file; this is the seam mock-MMIO tests use.
+    pub fn with_registers(regs: R, format: CaptureFormat) -> Result<Self, AudioConfigError> {
+        Ok(Self {
+            regs,
+            format: format.validate()?,
+        })
     }
 
     pub const fn format(&self) -> CaptureFormat {
         self.format
     }
 
+    /// DMA capture: the RX FIFO is drained by an external DMA controller. The
+    /// FIFO-ready threshold routes to DMA (`DMACR.RDE`) while the FIFO-ready and
+    /// overflow interrupts stay enabled for status.
     pub fn configure_capture(&mut self, clock: ClockDividers) -> Result<(), AudioConfigError> {
-        if !clock.validate() {
-            return Err(AudioConfigError::InvalidClockDividers);
-        }
-        self.write(TXCR, 0);
-        self.write(RXCR, RXCR_CSR_TWO_SLOTS | RXCR_VDW_16_BIT);
-        self.write(CKR, clock.register_value());
-        self.write(RXFIFOLR, 0);
+        self.configure_rx_common(clock)?;
         self.write(DMACR, DMACR_RX_ENABLE | DMACR_RX_LEVEL);
         self.write(
             INTCR,
-            INT_RX_THRESHOLD | INT_RX_ENABLE | INT_RX_OVERFLOW_ENABLE | INT_RX_OVERFLOW_CLEAR,
+            INT_RX_THRESHOLD | INT_RX_ENABLE | INT_RX_OVERFLOW_ENABLE,
         );
         self.write(CLR, 1 << 1);
         Ok(())
     }
 
+    /// PIO capture: no DMA controller is involved. `DMACR` is explicitly cleared
+    /// so a stale `RDE` left by a prior (Linux) boot cannot route the FIFO to a
+    /// DMA engine StarryOS does not drive and starve the CPU drain. The RX
+    /// FIFO-ready interrupt signals task context to drain the FIFO through
+    /// [`read_fifo`](Self::read_fifo); overflow is reported the same way as the
+    /// DMA path.
+    pub fn configure_capture_pio(&mut self, clock: ClockDividers) -> Result<(), AudioConfigError> {
+        self.configure_rx_common(clock)?;
+        self.write(DMACR, 0);
+        self.write(
+            INTCR,
+            INT_RX_THRESHOLD | INT_RX_ENABLE | INT_RX_OVERFLOW_ENABLE,
+        );
+        self.write(CLR, 1 << 1);
+        Ok(())
+    }
+
+    /// Register writes shared by the DMA and PIO capture paths. Programs the full
+    /// ground-truth I2S RX framing so the RX FIFO advances: TX and RX lane/format
+    /// (TX is configured because the shared clock runs on the TX engine in
+    /// TX-common mode), the CKR clock word (TRCM_TX + master + SCLK-per-frame),
+    /// the TDM control registers (reset default — unused in plain I2S), and the
+    /// MCLK→BCLK divider. The data-path-specific `DMACR`/`INTCR`/`CLR` writes
+    /// follow in the caller.
+    fn configure_rx_common(&mut self, clock: ClockDividers) -> Result<(), AudioConfigError> {
+        if !clock.validate() {
+            return Err(AudioConfigError::InvalidClockDividers);
+        }
+        self.write(TXCR, self.format.txcr_value());
+        self.write(RXCR, self.format.rxcr_value());
+        self.write(CKR, clock.ckr_value());
+        self.write(TDM_TXCR, TDM_CTRL_DEFAULT);
+        self.write(TDM_RXCR, TDM_CTRL_DEFAULT);
+        self.write(CLKDIV, clock.clkdiv_value());
+        Ok(())
+    }
+
+    /// PIO drain: pop up to `out.len()` samples from the RX FIFO into `out`,
+    /// returning how many were read. Task context calls this after an
+    /// [`IrqEvent::RxReady`]; draining the FIFO clears the level interrupt. The
+    /// current FIFO depth is read from `RXFIFOLR` and that many samples (bounded
+    /// by `out`) are popped from the RX data register, each read yielding one
+    /// 16-bit sample in the low half of the 32-bit register. The exact
+    /// stereo-S16 FIFO packing is confirmed on the board in gate 4.
+    pub fn read_fifo(&mut self, out: &mut [i16]) -> usize {
+        let level = (self.read(RXFIFOLR) & RXFIFOLR_LEVEL_MASK) as usize;
+        let count = level.min(out.len());
+        for slot in out.iter_mut().take(count) {
+            *slot = self.read(RXDR) as i16;
+        }
+        count
+    }
+
+    /// Start capture. In TX-common mode the shared BCLK/LRCK is generated on the
+    /// TX timing engine, so RX only receives data when TX is started too — both
+    /// `TXS` and `RXS` are set (XFER = 0x3).
     pub fn start_capture(&mut self) {
-        self.write(XFER, XFER_RX_START);
+        self.write(XFER, XFER_TXS_START | XFER_RXS_START);
     }
 
     pub fn stop_capture(&mut self) {
@@ -163,10 +344,14 @@ impl I2sTdmController {
 
     pub fn handle_irq(&mut self) -> IrqEvent {
         let status = self.read(INTSR);
-        self.write(CLR, status);
         if status & INT_RX_OVERFLOW != 0 {
+            // Acknowledge the overflow with the write-1-to-clear bit while
+            // preserving the RX interrupt enables already programmed in INTCR.
+            let intcr = self.read(INTCR);
+            self.write(INTCR, intcr | INT_RX_OVERFLOW_CLEAR);
             IrqEvent::RxOverflow
         } else if status & INT_RX_READY != 0 {
+            // Level interrupt: cleared by draining the RX FIFO in task context.
             IrqEvent::RxReady
         } else {
             IrqEvent::None
@@ -174,15 +359,11 @@ impl I2sTdmController {
     }
 
     fn read(&self, offset: usize) -> u32 {
-        // SAFETY: construction requires a valid MMIO mapping; offsets are in
-        // the RK3588 register file and accesses are volatile by definition.
-        unsafe { read_volatile(self.base.add(offset).cast::<u32>()) }
+        self.regs.read(offset)
     }
 
     fn write(&mut self, offset: usize, value: u32) {
-        // SAFETY: construction requires a valid MMIO mapping; offsets are in
-        // the RK3588 register file and accesses are volatile by definition.
-        unsafe { write_volatile(self.base.add(offset).cast::<u32>(), value) }
+        self.regs.write(offset, value)
     }
 }
 
@@ -235,6 +416,20 @@ impl<const CAPACITY: usize> PcmRing<CAPACITY> {
         Ok(())
     }
 
+    /// Ingest a freshly DMA'd, cache-invalidated block of samples in one call.
+    /// Returns how many were accepted; samples that do not fit are dropped and
+    /// counted as overruns, matching [`push`](Self::push). This is the producer
+    /// path board glue calls on an RX period after invalidating the DMA buffer.
+    pub fn push_slice(&mut self, samples: &[i16]) -> usize {
+        let mut accepted = 0;
+        for &sample in samples {
+            if self.push(sample).is_ok() {
+                accepted += 1;
+            }
+        }
+        accepted
+    }
+
     pub fn pop(&mut self) -> Result<i16, RingError> {
         if self.len == 0 {
             return Err(RingError::Empty);
@@ -254,6 +449,15 @@ impl<const CAPACITY: usize> PcmRing<CAPACITY> {
         }
         count
     }
+
+    /// Drop every buffered sample without disturbing the lifetime overrun count.
+    /// The capture runtime calls this when a stream (re)starts so stale samples
+    /// captured before the reader was ready are not delivered.
+    pub fn clear(&mut self) {
+        self.read = 0;
+        self.write = 0;
+        self.len = 0;
+    }
 }
 
 impl<const CAPACITY: usize> Default for PcmRing<CAPACITY> {
@@ -266,27 +470,97 @@ impl<const CAPACITY: usize> Default for PcmRing<CAPACITY> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn format_validation_rejects_unimplemented_shapes() {
-        assert_eq!(
-            CaptureFormat::MONO_48K.validate(),
-            Ok(CaptureFormat::MONO_48K)
-        );
-        assert_eq!(
-            CaptureFormat {
-                channels: 2,
-                ..CaptureFormat::MONO_48K
+    /// Recording register bank: writes update the backing store and append to an
+    /// ordered log; reads return the store, so tests can preset hardware status
+    /// registers (`INTSR`) and then assert what the controller wrote and when.
+    struct FakeRegs {
+        store: [u32; 0x40],
+        log: [(usize, u32); 32],
+        entries: usize,
+    }
+
+    impl FakeRegs {
+        const fn new() -> Self {
+            Self {
+                store: [0; 0x40],
+                log: [(0, 0); 32],
+                entries: 0,
             }
-            .validate(),
-            Err(AudioConfigError::UnsupportedChannels)
-        );
+        }
+
+        /// Preset a value the hardware would present, e.g. an `INTSR` status.
+        fn preset(&mut self, offset: usize, value: u32) {
+            self.store[offset / 4] = value;
+        }
+    }
+
+    impl RegisterBank for FakeRegs {
+        fn read(&self, offset: usize) -> u32 {
+            self.store[offset / 4]
+        }
+
+        fn write(&mut self, offset: usize, value: u32) {
+            self.store[offset / 4] = value;
+            if self.entries < self.log.len() {
+                self.log[self.entries] = (offset, value);
+                self.entries += 1;
+            }
+        }
+    }
+
+    const TEST_CLOCK: ClockDividers = ClockDividers {
+        bclk_div: 4,
+        lrck_div: 64,
+    };
+
+    fn configured() -> I2sTdmController<FakeRegs> {
+        let mut controller =
+            I2sTdmController::with_registers(FakeRegs::new(), CaptureFormat::STEREO_S16_48K)
+                .unwrap();
+        controller.configure_capture(TEST_CLOCK).unwrap();
+        controller
+    }
+
+    #[test]
+    fn hardware_capture_format_is_stereo_s16_or_s24() {
+        // The board forces interleaved stereo; S16 @ 48 kHz is the native shape.
+        let stereo_s16 = CaptureFormat {
+            sample_rate_hz: 48_000,
+            channels: 2,
+            sample_width_bits: 16,
+        };
+        assert_eq!(stereo_s16.validate(), Ok(stereo_s16));
+        // 24-bit stereo is the other width the hardware capture path accepts.
+        let stereo_s24 = CaptureFormat {
+            sample_rate_hz: 48_000,
+            channels: 2,
+            sample_width_bits: 24,
+        };
+        assert_eq!(stereo_s24.validate(), Ok(stereo_s24));
+        // Mono is not a hardware capture format: the runtime extracts it from the
+        // stereo stream, so the register core rejects a mono request.
+        let mono = CaptureFormat {
+            sample_rate_hz: 48_000,
+            channels: 1,
+            sample_width_bits: 16,
+        };
+        assert_eq!(mono.validate(), Err(AudioConfigError::UnsupportedChannels));
+        // 32-bit and off-list rates stay rejected.
         assert_eq!(
             CaptureFormat {
-                sample_width_bits: 24,
-                ..CaptureFormat::MONO_48K
+                sample_width_bits: 32,
+                ..stereo_s16
             }
             .validate(),
             Err(AudioConfigError::UnsupportedSampleWidth)
+        );
+        assert_eq!(
+            CaptureFormat {
+                sample_rate_hz: 44_100,
+                ..stereo_s16
+            }
+            .validate(),
+            Err(AudioConfigError::UnsupportedSampleRate)
         );
     }
 
@@ -300,5 +574,209 @@ mod tests {
         assert_eq!(ring.pop(), Ok(10));
         assert_eq!(ring.pop(), Ok(20));
         assert_eq!(ring.pop(), Err(RingError::Empty));
+    }
+
+    #[test]
+    fn push_slice_ingests_block_and_counts_dropped_samples() {
+        let mut ring = PcmRing::<4>::new();
+
+        // A block that fits is ingested whole with no overruns.
+        assert_eq!(ring.push_slice(&[1, 2, 3]), 3);
+        assert_eq!(ring.available(), 3);
+        assert_eq!(ring.overruns(), 0);
+
+        // A block that overflows the remaining space accepts what fits and
+        // counts every dropped sample as an overrun.
+        assert_eq!(ring.push_slice(&[4, 5, 6]), 1);
+        assert_eq!(ring.available(), 4);
+        assert_eq!(ring.overruns(), 2);
+
+        // FIFO order is preserved across the bulk ingest.
+        let mut out = [0i16; 4];
+        assert_eq!(ring.pop_slice(&mut out), 4);
+        assert_eq!(out, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn clear_drops_buffered_samples_but_keeps_overrun_count() {
+        let mut ring = PcmRing::<2>::new();
+        ring.push(1).unwrap();
+        ring.push(2).unwrap();
+        assert_eq!(ring.push(3), Err(RingError::Full)); // records one overrun
+
+        ring.clear();
+        assert_eq!(ring.available(), 0);
+        assert_eq!(ring.pop(), Err(RingError::Empty));
+        assert_eq!(ring.overruns(), 1);
+
+        // The ring is usable again after clearing.
+        assert_eq!(ring.push(9), Ok(()));
+        assert_eq!(ring.pop(), Ok(9));
+    }
+
+    #[test]
+    fn configure_capture_writes_expected_register_sequence() {
+        let controller = configured();
+
+        let expected = [TXCR, RXCR, CKR, TDM_TXCR, TDM_RXCR, CLKDIV, DMACR, INTCR, CLR];
+        assert_eq!(controller.regs.entries, expected.len());
+        for (entry, &offset) in controller.regs.log[..controller.regs.entries]
+            .iter()
+            .zip(expected.iter())
+        {
+            assert_eq!(entry.0, offset);
+        }
+
+        // Ground-truth framing words (Linux `arecord hw:3,0` register dump).
+        assert_eq!(controller.regs.store[TXCR / 4], 0x7200_000f);
+        assert_eq!(controller.regs.store[RXCR / 4], 0x01c8_000f);
+        assert_eq!(controller.regs.store[CKR / 4], 0x1000_3f3f);
+        assert_eq!(controller.regs.store[CKR / 4], TEST_CLOCK.ckr_value());
+        assert_eq!(controller.regs.store[CLKDIV / 4], 0x0303);
+        assert_eq!(controller.regs.store[CLKDIV / 4], TEST_CLOCK.clkdiv_value());
+        assert_eq!(controller.regs.store[TDM_TXCR / 4], TDM_CTRL_DEFAULT);
+        assert_eq!(controller.regs.store[TDM_RXCR / 4], TDM_CTRL_DEFAULT);
+        assert_eq!(
+            controller.regs.store[DMACR / 4],
+            DMACR_RX_ENABLE | DMACR_RX_LEVEL
+        );
+        assert_eq!(
+            controller.regs.store[INTCR / 4],
+            INT_RX_THRESHOLD | INT_RX_ENABLE | INT_RX_OVERFLOW_ENABLE
+        );
+    }
+
+    #[test]
+    fn configure_capture_encodes_valid_data_width_from_format() {
+        // S16 stereo programs the 16-bit VDW field in both TXCR and RXCR...
+        let s16 = configured();
+        assert_eq!(s16.regs.store[TXCR / 4], TXCR_PATH_DEFAULT | RXCR_VDW_16_BIT);
+        assert_eq!(
+            s16.regs.store[RXCR / 4],
+            RXCR_PATH_DEFAULT | RXCR_CSR_TWO_SLOTS | RXCR_VDW_16_BIT
+        );
+
+        // ...and a 24-bit stereo format widens the VDW field, still two slots,
+        // without touching the rest of the sequence.
+        let mut s24 =
+            I2sTdmController::with_registers(FakeRegs::new(), CaptureFormat::STEREO_S24_48K)
+                .unwrap();
+        s24.configure_capture(TEST_CLOCK).unwrap();
+        assert_eq!(s24.regs.store[TXCR / 4], TXCR_PATH_DEFAULT | RXCR_VDW_24_BIT);
+        assert_eq!(
+            s24.regs.store[RXCR / 4],
+            RXCR_PATH_DEFAULT | RXCR_CSR_TWO_SLOTS | RXCR_VDW_24_BIT
+        );
+    }
+
+    #[test]
+    fn configure_capture_pio_clears_dma_and_enables_fifo_irq() {
+        let mut controller =
+            I2sTdmController::with_registers(FakeRegs::new(), CaptureFormat::STEREO_S16_48K)
+                .unwrap();
+        controller.configure_capture_pio(TEST_CLOCK).unwrap();
+
+        // Same register sequence as the DMA path so the ordering guarantees hold,
+        // but DMACR is programmed to zero rather than enabling RDE.
+        let expected = [TXCR, RXCR, CKR, TDM_TXCR, TDM_RXCR, CLKDIV, DMACR, INTCR, CLR];
+        assert_eq!(controller.regs.entries, expected.len());
+        for (entry, &offset) in controller.regs.log[..controller.regs.entries]
+            .iter()
+            .zip(expected.iter())
+        {
+            assert_eq!(entry.0, offset);
+        }
+
+        // No DMA routing: a stale RDE left by a prior boot must be cleared.
+        assert_eq!(controller.regs.store[DMACR / 4], 0);
+        // The RX format is still programmed like the DMA path.
+        assert_eq!(
+            controller.regs.store[RXCR / 4],
+            RXCR_PATH_DEFAULT | RXCR_CSR_TWO_SLOTS | RXCR_VDW_16_BIT
+        );
+        // FIFO-ready and overflow interrupts drive the CPU drain.
+        assert_ne!(controller.regs.store[INTCR / 4] & INT_RX_ENABLE, 0);
+        assert_ne!(controller.regs.store[INTCR / 4] & INT_RX_OVERFLOW_ENABLE, 0);
+    }
+
+    #[test]
+    fn read_fifo_pops_reported_level_bounded_by_output() {
+        let mut controller =
+            I2sTdmController::with_registers(FakeRegs::new(), CaptureFormat::STEREO_S16_48K)
+                .unwrap();
+
+        // The FIFO reports three buffered samples; the data register presents the
+        // sample value. read_fifo pops exactly the reported level.
+        controller.regs.preset(RXFIFOLR, 3);
+        controller.regs.preset(RXDR, 0x1234);
+        let mut out = [0i16; 8];
+        assert_eq!(controller.read_fifo(&mut out), 3);
+        assert_eq!(&out[..3], &[0x1234, 0x1234, 0x1234]);
+
+        // A shallow output buffer bounds the drain below the reported level.
+        controller.regs.preset(RXFIFOLR, 5);
+        let mut small = [0i16; 2];
+        assert_eq!(controller.read_fifo(&mut small), 2);
+
+        // A masked-off high bit in RXFIFOLR does not inflate the level.
+        controller.regs.preset(RXFIFOLR, RXFIFOLR_LEVEL_MASK + 1);
+        let mut none = [0i16; 4];
+        assert_eq!(controller.read_fifo(&mut none), 0);
+    }
+
+    #[test]
+    fn start_and_stop_toggle_rx_transfer() {
+        let mut controller = configured();
+        controller.start_capture();
+        // TX-common mode: both TXS and RXS start so the shared clock runs.
+        assert_eq!(
+            controller.regs.store[XFER / 4],
+            XFER_TXS_START | XFER_RXS_START
+        );
+        controller.stop_capture();
+        assert_eq!(controller.regs.store[XFER / 4], 0);
+    }
+
+    #[test]
+    fn irq_overflow_is_acknowledged_via_intcr_clear_bit() {
+        let mut controller = configured();
+        controller.regs.preset(INTSR, INT_RX_OVERFLOW);
+        let before = controller.regs.entries;
+
+        assert_eq!(controller.handle_irq(), IrqEvent::RxOverflow);
+
+        // Overflow is acknowledged by the write-1-to-clear bit in INTCR, and the
+        // RX interrupt enables must survive the acknowledgement.
+        assert_ne!(controller.regs.store[INTCR / 4] & INT_RX_OVERFLOW_CLEAR, 0);
+        assert_ne!(controller.regs.store[INTCR / 4] & INT_RX_ENABLE, 0);
+        // The transfer-state CLR register is not the overflow acknowledgement path.
+        for entry in &controller.regs.log[before..controller.regs.entries] {
+            assert_ne!(entry.0, CLR);
+        }
+    }
+
+    #[test]
+    fn irq_ready_is_a_level_event_with_no_clear_write() {
+        let mut controller = configured();
+        controller.regs.preset(INTSR, INT_RX_READY);
+        let before = controller.regs.entries;
+
+        assert_eq!(controller.handle_irq(), IrqEvent::RxReady);
+
+        // FIFO-ready is cleared by draining the RX FIFO in task context, so the
+        // handler must not touch INTCR here.
+        for entry in &controller.regs.log[before..controller.regs.entries] {
+            assert_ne!(entry.0, INTCR);
+        }
+    }
+
+    #[test]
+    fn irq_idle_reports_none_without_writes() {
+        let mut controller = configured();
+        controller.regs.preset(INTSR, 0);
+        let before = controller.regs.entries;
+
+        assert_eq!(controller.handle_irq(), IrqEvent::None);
+        assert_eq!(controller.regs.entries, before);
     }
 }
