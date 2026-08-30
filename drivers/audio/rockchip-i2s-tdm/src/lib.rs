@@ -6,8 +6,7 @@
 //! MMIO mapping, clock/reset/pinctrl setup, DMA allocation, IRQ registration,
 //! and StarryOS VFS integration intentionally remain outside this crate.
 
-use core::ptr::{read_volatile, write_volatile};
-
+use mmio_api::MmioRaw;
 use thiserror::Error;
 
 pub const RK3588_I2S_TDM_BASE: usize = 0xfe47_0000;
@@ -204,26 +203,20 @@ pub trait RegisterBank {
     fn write(&mut self, offset: usize, value: u32);
 }
 
-/// Volatile MMIO access to a caller-owned register mapping.
+/// Volatile access to a caller-mapped register file. OS glue constructs the
+/// [`MmioRaw`] over its `iomap` result; offsets are byte addresses of whole
+/// `u32` register words within the RK3588 register file.
 pub struct MmioRegisters {
-    base: *mut u8,
+    raw: MmioRaw,
 }
-
-// SAFETY: the value exclusively owns the MMIO mapping; writes take `&mut self`,
-// so the portable core never aliases the register file concurrently.
-unsafe impl Send for MmioRegisters {}
 
 impl RegisterBank for MmioRegisters {
     fn read(&self, offset: usize) -> u32 {
-        // SAFETY: construction requires a valid MMIO mapping; offsets are within
-        // the RK3588 register file and accesses are volatile by definition.
-        unsafe { read_volatile(self.base.add(offset).cast::<u32>()) }
+        self.raw.read::<u32>(offset)
     }
 
     fn write(&mut self, offset: usize, value: u32) {
-        // SAFETY: construction requires a valid MMIO mapping; offsets are within
-        // the RK3588 register file and accesses are volatile by definition.
-        unsafe { write_volatile(self.base.add(offset).cast::<u32>(), value) }
+        self.raw.write::<u32>(offset, value)
     }
 }
 
@@ -235,16 +228,13 @@ pub struct I2sTdmController<R: RegisterBank = MmioRegisters> {
 }
 
 impl I2sTdmController<MmioRegisters> {
-    /// # Safety
-    /// `base` must be a valid, aligned mapping of the RK3588 register file and
-    /// remain valid until this controller is dropped.
-    pub unsafe fn from_mmio(
-        base: *mut u8,
-        format: CaptureFormat,
-    ) -> Result<Self, AudioConfigError> {
-        // SAFETY: forwarded to the caller's `base` contract above.
+    /// Build a controller over a glue-mapped register file. The mapping must
+    /// cover [`RK3588_I2S_TDM_REGISTER_SIZE`] bytes and remain valid for this
+    /// controller's lifetime; constructing [`MmioRaw`] over the `iomap` result
+    /// is OS glue's unsafe edge, not this crate's.
+    pub fn from_mmio(raw: MmioRaw, format: CaptureFormat) -> Result<Self, AudioConfigError> {
         Ok(Self {
-            regs: MmioRegisters { base },
+            regs: MmioRegisters { raw },
             format: format.validate()?,
         })
     }
@@ -470,6 +460,30 @@ impl<const CAPACITY: usize> Default for PcmRing<CAPACITY> {
 mod tests {
     use super::*;
 
+    /// The hardware `MmioRegisters` bank over a mock mapping: exercises the
+    /// glue-side construction path (`MmioRaw` over a fake register file) that
+    /// the real board takes through `iomap`.
+    #[test]
+    fn mmio_registers_roundtrip_over_raw_mapping() {
+        const WORDS: usize = RK3588_I2S_TDM_REGISTER_SIZE / 4;
+        let mut store = [0u32; WORDS];
+        // SAFETY: `store` outlives the bank in this test and is a valid,
+        // aligned mapping of `size_of_val(&store)` bytes by construction.
+        let raw = unsafe {
+            MmioRaw::new(
+                0usize.into(),
+                core::ptr::NonNull::new(store.as_mut_ptr().cast())
+                    .expect("test register storage is non-null"),
+                core::mem::size_of_val(&store),
+            )
+        };
+        let mut regs = MmioRegisters { raw };
+
+        regs.write(0x10, 0xC0C0_C0C0);
+        assert_eq!(regs.read(0x10), 0xC0C0_C0C0);
+        assert_eq!(store[0x10 / 4], 0xC0C0_C0C0);
+    }
+
     /// Recording register bank: writes update the backing store and append to an
     /// ordered log; reads return the store, so tests can preset hardware status
     /// registers (`INTSR`) and then assert what the controller wrote and when.
@@ -618,7 +632,9 @@ mod tests {
     fn configure_capture_writes_expected_register_sequence() {
         let controller = configured();
 
-        let expected = [TXCR, RXCR, CKR, TDM_TXCR, TDM_RXCR, CLKDIV, DMACR, INTCR, CLR];
+        let expected = [
+            TXCR, RXCR, CKR, TDM_TXCR, TDM_RXCR, CLKDIV, DMACR, INTCR, CLR,
+        ];
         assert_eq!(controller.regs.entries, expected.len());
         for (entry, &offset) in controller.regs.log[..controller.regs.entries]
             .iter()
@@ -650,7 +666,10 @@ mod tests {
     fn configure_capture_encodes_valid_data_width_from_format() {
         // S16 stereo programs the 16-bit VDW field in both TXCR and RXCR...
         let s16 = configured();
-        assert_eq!(s16.regs.store[TXCR / 4], TXCR_PATH_DEFAULT | RXCR_VDW_16_BIT);
+        assert_eq!(
+            s16.regs.store[TXCR / 4],
+            TXCR_PATH_DEFAULT | RXCR_VDW_16_BIT
+        );
         assert_eq!(
             s16.regs.store[RXCR / 4],
             RXCR_PATH_DEFAULT | RXCR_CSR_TWO_SLOTS | RXCR_VDW_16_BIT
@@ -662,7 +681,10 @@ mod tests {
             I2sTdmController::with_registers(FakeRegs::new(), CaptureFormat::STEREO_S24_48K)
                 .unwrap();
         s24.configure_capture(TEST_CLOCK).unwrap();
-        assert_eq!(s24.regs.store[TXCR / 4], TXCR_PATH_DEFAULT | RXCR_VDW_24_BIT);
+        assert_eq!(
+            s24.regs.store[TXCR / 4],
+            TXCR_PATH_DEFAULT | RXCR_VDW_24_BIT
+        );
         assert_eq!(
             s24.regs.store[RXCR / 4],
             RXCR_PATH_DEFAULT | RXCR_CSR_TWO_SLOTS | RXCR_VDW_24_BIT
@@ -678,7 +700,9 @@ mod tests {
 
         // Same register sequence as the DMA path so the ordering guarantees hold,
         // but DMACR is programmed to zero rather than enabling RDE.
-        let expected = [TXCR, RXCR, CKR, TDM_TXCR, TDM_RXCR, CLKDIV, DMACR, INTCR, CLR];
+        let expected = [
+            TXCR, RXCR, CKR, TDM_TXCR, TDM_RXCR, CLKDIV, DMACR, INTCR, CLR,
+        ];
         assert_eq!(controller.regs.entries, expected.len());
         for (entry, &offset) in controller.regs.log[..controller.regs.entries]
             .iter()
