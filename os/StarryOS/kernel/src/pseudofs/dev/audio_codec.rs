@@ -441,35 +441,39 @@ const ES8388_CAPTURE_REPLAY: &[(u8, u8)] = &[
     (0x08, 0x00),
     (0x02, 0x00),
     (0x0b, 0x02),
-    // PGA L/R = 24 dB (0x88). The Linux arecord dump had 0x00 (0 dB), which is
-    // fine for a line-level jack source but leaves the onboard electret Main
-    // Mic under the ADC noise floor -- 2026-08-30 probe: 60 s of loud speech
-    // sat flat at RMS 3.9. 0 dB -> 24 dB is the single-variable fix; revisit
-    // with the schematic before touching input select or mic-bias bits.
-    (0x09, 0x88),
-    (0x0a, 0x00),
+    // 2026-08-30 evening: align the analog front end with the vendor's
+    // official onboard-mic configuration (test_record.sh main on the OPi
+    // 5 Plus official image, cross-checked against the vendor es8323.c
+    // enum encodings):
+    //   'Left/Right PGA Mux' = 1  -> ADCCONTROL2 sel=1 "Line 2" both channels
+    //   'Differential Mux'   = 1  -> ADCCONTROL3 bit7 set ("Line 2" source)
+    //   'Left/Right Channel Capture Volume' = 4 -> ADCCONTROL1 nibbles 0x4
+    //   'Capture Digital Volume' = 192 -> ADCCONTROL8/9 = 0xC0 (0 dB; our
+    //     replay had 0x00, which on this register map is near-mute)
+    // The arecord dump we replayed captured a state that never recorded the
+    // onboard mic successfully (08-26: noise only), so replaying it exactly
+    // reproduced the breakage.
+    (0x09, 0x44),
+    (0x0a, 0x50),
+    (0x0b, 0x82),
     (0x0c, 0x4c),
     (0x0d, 0x02),
     (0x0e, 0x30),
-    (0x10, 0x00),
-    (0x11, 0x00),
+    (0x10, 0xC0),
+    (0x11, 0xC0),
     (0x12, 0xea),
     (0x13, 0xc0),
     (0x14, 0x05),
     (0x15, 0x06),
     (0x16, 0x53),
     (0x0f, 0x20),
-    // ADCPOWER=0x09 as in the Linux arecord dump (ADC L+R on, AIN on, INT1
-    // low-power; per the crate's datasheet-derived layout the register's
-    // power bits are active-high OFF: bit4=ADCR, bit6=AINR). Two bias
-    // experiments on 2026-08-30 both failed to unlock the onboard mic:
-    // 0xC9 set what are power-DOWN bits and killed the ADC outright; 0x01
-    // (bit3 clear, i.e. the "mic-bias off" bit enabled) left the input as
-    // pure broadband noise. Without the datasheet R3 table plus the OPi 5
-    // Plus schematic, do not touch this register again -- the missing
-    // "Mic Bias routing" fix that the Armbian thread used was a DAPM/DTS
-    // change in the vendor es8388.c, whose exact reg/bit is still unverified.
-    (0x03, 0x09),
+    // ADCPOWER=0x01: ADC L+R on, AIN on, MICBIAS ON (bit3 clear -- vendor
+    // es8323.c: SND_SOC_DAPM_MICBIAS("Mic Bias", ES8323_ADCPOWER, 3, 1), so
+    // enabling the bias CLEARS bit3; the Linux dump's 0x09 had it OFF). The
+    // vendor amixer script never touches this register, so the official DAPM
+    // graph presumably clears bit3 when the Main Mic route is live; we set
+    // it statically.
+    (0x03, 0x01),
 ];
 
 /// Bring the ES8388 up for capture: power the i2c7 bus (clocks + reset + pinmux),
