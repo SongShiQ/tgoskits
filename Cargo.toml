@@ -193,6 +193,7 @@ axvm = { version = "0.6", path = "virtualization/axvm", default-features = false
 axvm-types = { version = "0.7", path = "virtualization/axvm-types" }
 axvmconfig = { version = "0.8", path = "virtualization/axvmconfig", default-features = false }
 ahci-driver = { version = "0.2", path = "drivers/blk/ahci-driver" }
+audio-capture = { version = "0.5.15", path = "drivers/audio/audio-capture" }
 
 bwbench-client = { version = "0.3", path = "os/arceos/tools/bwbench_client" }
 define-simple-traits = { version = "0.3", path = "components/crate_interface/test_crates/define-simple-traits" }
@@ -206,6 +207,7 @@ arm-gic-driver = { version = "0.17", path = "drivers/intc/arm-gic-driver" }
 loongarch-intc-driver = { version = "0.1", path = "drivers/intc/loongarch-intc-driver" }
 x86-apic-driver = { version = "0.1", path = "drivers/intc/x86-apic-driver" }
 enumerate = { version = "0.1", path = "drivers/examples/enumerate" }
+es8388 = { version = "0.5.15", path = "drivers/audio/es8388" }
 eth-intel = { version = "0.2", path = "drivers/net/eth-intel" }
 loongarch_vcpu = { version = "0.5", path = "virtualization/loongarch_vcpu" }
 mingo = { version = "0.8", path = "os/arceos/tools/raspi4/chainloader" }
@@ -241,6 +243,7 @@ rockchip-jpeg = { version = "0.1", path = "drivers/vpu/rockchip-jpeg" }
 rockchip-pwm = { version = "0.1", path = "drivers/pwm/rockchip-pwm" }
 k230-kpu = { version = "0.1", path = "drivers/npu/k230-kpu" }
 realtek-rtl8125 = { version = "0.3", path = "drivers/net/realtek-rtl8125" }
+rockchip-i2s-tdm = { version = "0.5.15", path = "drivers/audio/rockchip-i2s-tdm" }
 rockchip-pm = { version = "0.4", path = "drivers/soc/rockchip/rockchip-pm" }
 rockchip-soc = { version = "0.4", path = "drivers/soc/rockchip/rockchip-soc" }
 sg2002-tpu = { version = "0.4", path = "drivers/tpu/sg2002-tpu" }

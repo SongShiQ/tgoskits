@@ -663,6 +663,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
+name = "audio-capture"
+version = "0.5.14"
+dependencies = [
+ "rockchip-i2s-tdm",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3253,6 +3260,13 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "es8388"
+version = "0.5.14"
+dependencies = [
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -7826,6 +7840,7 @@ dependencies = [
 name = "starry-kernel"
 version = "0.8.3"
 dependencies = [
+ "audio-capture",
  "ax-alloc",
  "ax-cgroup",
  "ax-cpu",
@@ -7867,6 +7882,7 @@ dependencies = [
  "dma-api",
  "downcast-rs",
  "enum_dispatch",
+ "es8388",
  "event-listener",
  "extern-trait",
  "flatten_objects",
@@ -7893,6 +7909,8 @@ dependencies = [
  "rdrive",
  "ringbuf",
  "riscv",
+ "rockchip-i2s-tdm",
+ "rockchip-pm",
  "rockchip-rga",
  "scope-local",
  "sg2002-tpu",
