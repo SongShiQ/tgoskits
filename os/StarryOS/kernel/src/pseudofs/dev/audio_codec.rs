@@ -461,7 +461,11 @@ const ES8388_CAPTURE_REPLAY: &[(u8, u8)] = &[
     (0x0e, 0x30),
     (0x10, 0xC0),
     (0x11, 0xC0),
-    (0x12, 0xea),
+    // ADCCONTROL10 = 0xE2: ALC stereo on (bits[7:6] kept from the dump) with
+    // the vendor main-mic clamps 'ALC Capture Max PGA'=4 / 'Min PGA'=2 ->
+    // bits[5:3]=100, bits[2:0]=010. Without the clamp the ALC pumped the
+    // noise floor up to a constant RMS ~700 (2026-08-30 spectrograms).
+    (0x12, 0xE2),
     (0x13, 0xc0),
     (0x14, 0x05),
     (0x15, 0x06),
