@@ -433,14 +433,20 @@ fn apply_i2s0_audio_pinmux() {
 ///   0x15 ADCCONTROL13=0x06 ALC mode
 ///   0x16 ADCCONTROL14=0x53 ALC noise gate
 ///   0x0f ADCCONTROL7=0x20 soft-ramp on, ADC unmuted
-///   0x03 ADCPOWER=0x09 ADC L+R on, AIN on, mic-bias off, INT1 low-power (LAST)
+///   0x03 ADCPOWER=0x09 ADC L+R on, AIN on, INT1 low-power (LAST; mic-bias
+///   bit unresolved -- see the note on the entry)
 const ES8388_CAPTURE_REPLAY: &[(u8, u8)] = &[
     (0x00, 0x36),
     (0x01, 0x60),
     (0x08, 0x00),
     (0x02, 0x00),
     (0x0b, 0x02),
-    (0x09, 0x00),
+    // PGA L/R = 24 dB (0x88). The Linux arecord dump had 0x00 (0 dB), which is
+    // fine for a line-level jack source but leaves the onboard electret Main
+    // Mic under the ADC noise floor -- 2026-08-30 probe: 60 s of loud speech
+    // sat flat at RMS 3.9. 0 dB -> 24 dB is the single-variable fix; revisit
+    // with the schematic before touching input select or mic-bias bits.
+    (0x09, 0x88),
     (0x0a, 0x00),
     (0x0c, 0x4c),
     (0x0d, 0x02),
@@ -453,6 +459,16 @@ const ES8388_CAPTURE_REPLAY: &[(u8, u8)] = &[
     (0x15, 0x06),
     (0x16, 0x53),
     (0x0f, 0x20),
+    // ADCPOWER=0x09 as in the Linux arecord dump (ADC L+R on, AIN on, INT1
+    // low-power; per the crate's datasheet-derived layout the register's
+    // power bits are active-high OFF: bit4=ADCR, bit6=AINR). Two bias
+    // experiments on 2026-08-30 both failed to unlock the onboard mic:
+    // 0xC9 set what are power-DOWN bits and killed the ADC outright; 0x01
+    // (bit3 clear, i.e. the "mic-bias off" bit enabled) left the input as
+    // pure broadband noise. Without the datasheet R3 table plus the OPi 5
+    // Plus schematic, do not touch this register again -- the missing
+    // "Mic Bias routing" fix that the Armbian thread used was a DAPM/DTS
+    // change in the vendor es8388.c, whose exact reg/bit is still unverified.
     (0x03, 0x09),
 ];
 
